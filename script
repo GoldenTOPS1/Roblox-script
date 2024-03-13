@@ -26,7 +26,7 @@ MainSection:NewButton("treasure packs", "dup pack", function()
     end
 end)
 MainSection:NewButton("Soul", "dup soul", function()
-    local chest = game:GetService("Workspace").Replicators.NonPassive["Wood Storage Chest"]
+    local chest = game:GetService("Workspace").Replicators.NonPassive["Moonstone Storage Chest"]
     local putIn = true
     local itemIDs = {204, 202, 201, 203, 218, 216} -- IDs for Max Soul
     local Event = game:GetService("ReplicatedStorage").References.Comm.Events.UpdateStorageChest
