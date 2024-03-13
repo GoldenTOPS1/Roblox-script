@@ -15,18 +15,17 @@ MainSection:NewButton("dupe", "save stuff", function()
     game:GetService("ReplicatedStorage").References.Comm.Events.SetSettings:FireServer(getgenv().olddata)
 end)
 
-MainSection:NewButton("Treasure Pack Dupe", "dup soul", function()
+MainSection:NewButton("treasure packs", "dup pack", function()
     local chest = game:GetService("Workspace").Replicators.NonPassive["Wood Storage Chest"]
     local putIn = true
-    local itemIDs = {382, 382, 382, 382, 382, 382} -- IDs for chest 
+    local itemIDs = {384, 384, 384, 384, 384, 384} -- IDs for Max Soul
     local Event = game:GetService("ReplicatedStorage").References.Comm.Events.UpdateStorageChest
 
     for _, itemID in ipairs(itemIDs) do
         Event:FireServer(chest, putIn, itemID)
     end
 end)
-
-MainSection:NewButton("Soul Set Dupe", "dup soul", function()
+MainSection:NewButton("Soul", "dup soul", function()
     local chest = game:GetService("Workspace").Replicators.NonPassive["Wood Storage Chest"]
     local putIn = true
     local itemIDs = {204, 202, 201, 203, 218, 216} -- IDs for Max Soul
