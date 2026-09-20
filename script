@@ -360,19 +360,18 @@ end
 --  AUTO QUEUE SYSTEM
 -- ============================================================
 local function TryQueueDungeon()
+    local function TryQueueDungeon()
     if not CONFIG.AutoRunDungeon then return end
     local mapName = CONFIG.TargetDungeon
     print("[DQR] Looking for dungeon button: " .. mapName)
 
-    -- Keep trying until we find it (lobby may take time to load)
+    -- ── STEP 1: find & click the dungeon tile ──────────────────
     local attempts = 0
     local btn = nil
     repeat
         btn = FindDungeonButton(mapName)
-        if not btn then
-            task.wait(2)
-            attempts = attempts + 1
-        end
+        if not btn then task.wait(2) end
+        attempts = attempts + 1
     until btn or attempts > 15
 
     if not btn then
@@ -380,16 +379,24 @@ local function TryQueueDungeon()
         return
     end
 
-    print("[DQR] Found button, clicking...")
+    print("[DQR] Found dungeon tile, clicking...")
     ClickButton(btn)
     task.wait(1.5)
 
-    -- Look for a "Start" / "Play" / "Vote" confirmation button
-    local function FindConfirmBtn(parent)
+    -- ── STEP 2: find & click ANY Start / Play button ───────────
+    -- Keeps retrying for up to 10s because DQR's lobby screen
+    -- sometimes takes a moment to slide in after tile click
+    local function FindStartBtn(parent)
         for _, obj in ipairs(parent:GetDescendants()) do
-            if obj:IsA("TextButton") then
-                local t = obj.Text:lower()
-                if t:find("start") or t:find("play") or t:find("vote") or t:find("confirm") then
+            if obj:IsA("TextButton") and obj.Visible then
+                local t = obj.Text:lower():gsub("%s+", "")
+                if t == "start"
+                or t == "play"
+                or t == "startgame"
+                or t == "playgame"
+                or t == "vote"
+                or t == "ready"
+                or t == "begin" then
                     return obj
                 end
             end
@@ -397,14 +404,39 @@ local function TryQueueDungeon()
         return nil
     end
 
-    task.wait(0.8)
-    local confirm = FindConfirmBtn(LP:WaitForChild("PlayerGui"))
-    if confirm then
-        print("[DQR] Clicking confirm/start...")
-        ClickButton(confirm)
+    local startBtn  = nil
+    local startWait = 0
+    repeat
+        task.wait(0.6)
+        startWait = startWait + 0.6
+        startBtn  = FindStartBtn(LP:WaitForChild("PlayerGui"))
+        if not startBtn then
+            pcall(function()
+                startBtn = FindStartBtn(game:GetService("CoreGui"))
+            end)
+        end
+    until startBtn or startWait > 10
+
+    if startBtn then
+        print("[DQR] Found start button — pressing it.")
+        ClickButton(startBtn)
+        task.wait(1)
+
+        -- ── STEP 3: spam it a couple more times ────────────────
+        -- Some DQR lobbies need a vote from every player,
+        -- or the button stays up and needs re-clicking
+        for i = 1, 3 do
+            task.wait(0.8)
+            local again = FindStartBtn(LP:WaitForChild("PlayerGui"))
+            if again then
+                print("[DQR] Re-pressing start (" .. i .. ")")
+                ClickButton(again)
+            end
+        end
+    else
+        print("[DQR] No start button found — dungeon may auto-start.")
     end
 end
-
 -- ============================================================
 --  MAIN AUTO FARM STATE
 -- ============================================================
