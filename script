@@ -1,44 +1,38 @@
 -- ============================================================
---  DQR AUTO FARM — FULL SYSTEM
---  No GUI. Drop into executor and run.
---  Configure the CONFIG block below.
+--  DQR AUTO FARM — FULL REWRITE v3
+--  Smooth circular kiting, always face mob, full speed,
+--  attacks while moving, obstacle awareness, no shaking
 -- ============================================================
 
 -- ============================================================
---  USER CONFIG — EDIT THIS BLOCK
+--  USER CONFIG
 -- ============================================================
 local CONFIG = {
-    -- Which dungeon to auto-queue (exact name below)
-    -- "Desert Temple" | "Winter Outpost" | "Pirate Island"
-    -- "King's Castle" | "Underworld"     | "Samurai Palace"
-    -- "Ghastly Harbor"| "Enchanted Forest"
-    TargetDungeon = "Desert Temple",
-
-    -- Set true  → script will auto-queue / auto-start the dungeon
-    -- Set false → only farms if you're already inside a map
+    TargetDungeon  = "Desert Temple",
     AutoRunDungeon = true,
+    LowerGraphics  = true,
 
-    -- Combat tuning
-    AttackRange   = 22,    -- cast range (studs)
-    BackupDist    = 12,    -- back up if mob is closer than this
-    KiteRange     = 16,    -- ideal "safe" kiting distance from mob
-    DodgeRange    = 45,    -- radius to scan for incoming projectiles
-    DodgeStep     = 24,    -- studs to strafe when dodging
-    DodgeCooldown = 0.9,   -- min seconds between dodge moves
-    AttackRate    = 0.3,   -- seconds between Q/E casts
-    ScanRate      = 0.08,  -- main loop tick rate
+    -- Combat
+    IdealRange     = 20,     -- try to stay this far from mob
+    MinRange       = 12,     -- back off if closer than this
+    MaxRange       = 28,     -- close in if farther than this
+    DodgeRange     = 45,     -- projectile scan radius
+    DodgeCooldown  = 0.8,
+    DodgeStep      = 20,
+    AttackRate     = 0.28,   -- seconds between spell casts
 
-    -- Graphics
-    LowerGraphics = true,  -- slam graphics to minimum on start
+    -- Movement
+    WalkSpeed      = 16,     -- humanoid walkspeed (set to your actual speed)
+    CircleRadius   = 20,     -- radius of orbit around mob
+    CircleSpeed    = 0.9,    -- how fast angle advances per second (radians)
+    ScanRate       = 0.05,   -- main loop hz (20hz)
 }
 -- ============================================================
 
-local Players          = game:GetService("Players")
-local RunService       = game:GetService("RunService")
-local TweenService     = game:GetService("TweenService")
-local UserInputService = game:GetService("UserInputService")
-local PathfindingService = game:GetService("PathfindingService")
-local LP               = Players.LocalPlayer
+local Players            = game:GetService("Players")
+local RunService         = game:GetService("RunService")
+local UserInputService   = game:GetService("UserInputService")
+local LP                 = Players.LocalPlayer
 
 -- ============================================================
 --  GRAPHICS NUKE
@@ -46,29 +40,19 @@ local LP               = Players.LocalPlayer
 local function NukeGraphics()
     if not CONFIG.LowerGraphics then return end
     local Lighting = game:GetService("Lighting")
-    local Settings = settings()
-
-    -- Rendering quality floor
-    pcall(function() Settings.Rendering.QualityLevel = 1 end)
+    pcall(function() settings().Rendering.QualityLevel = 1 end)
     pcall(function()
         game:GetService("UserGameSettings").SavedQualityLevel =
             Enum.SavedQualitySetting.QualityLevel01
     end)
-
-    -- Lighting kills
-    Lighting.GlobalShadows    = false
-    Lighting.FogEnd           = 9e8
-    Lighting.Brightness       = 0
-    Lighting.EnvironmentDiffuseScale = 0
-    Lighting.EnvironmentSpecularScale = 0
-
-    -- Nuke all post-processing effects
+    Lighting.GlobalShadows             = false
+    Lighting.FogEnd                    = 9e8
+    Lighting.Brightness                = 0
+    Lighting.EnvironmentDiffuseScale   = 0
+    Lighting.EnvironmentSpecularScale  = 0
     for _, fx in ipairs(Lighting:GetChildren()) do
         if fx:IsA("PostEffect") then fx.Enabled = false end
     end
-
-    -- Kill decorative particles / beams NOT used for combat detection
-    -- (we preserve Neon + Beam on mob parts for threat detection)
     for _, obj in ipairs(workspace:GetDescendants()) do
         pcall(function()
             if obj:IsA("ParticleEmitter") then obj.Enabled = false end
@@ -78,7 +62,6 @@ local function NukeGraphics()
             if obj:IsA("Sparkles")        then obj.Enabled = false end
         end)
     end
-
     print("[DQR] Graphics nuked.")
 end
 
@@ -95,68 +78,152 @@ local function GetHuman()
     return c and c:FindFirstChildOfClass("Humanoid")
 end
 
-local function FireSpell(slot)
-    local kc = slot == "Q" and Enum.KeyCode.Q or Enum.KeyCode.E
+-- ============================================================
+--  SPELL CASTING
+--  Uses VirtualInputManager — most reliable method in Delta
+-- ============================================================
+local VIM = game:GetService("VirtualInputManager")
+
+local function FireKey(kc)
     pcall(function()
-        game:GetService("VirtualInputManager"):SendKeyEvent(true,  kc, false, game)
-        task.wait(0.06)
-        game:GetService("VirtualInputManager"):SendKeyEvent(false, kc, false, game)
+        VIM:SendKeyEvent(true,  kc, false, game)
+    end)
+    task.wait(0.05)
+    pcall(function()
+        VIM:SendKeyEvent(false, kc, false, game)
     end)
 end
 
--- Always face a world position, even while moving
-local function FacePosition(pos)
-    local root = GetRoot()
-    if not root then return end
-    local dir = Vector3.new(pos.X - root.Position.X, 0, pos.Z - root.Position.Z)
-    if dir.Magnitude < 0.1 then return end
-    root.CFrame = CFrame.new(root.Position, root.Position + dir)
-end
+local spellSlot  = false
+local lastAttack = 0
 
-local function WalkTo(pos)
-    local hum = GetHuman()
-    if hum then hum:MoveTo(pos) end
-end
-
-local function StopWalk()
-    local root = GetRoot()
-    local hum  = GetHuman()
-    if hum and root then hum:MoveTo(root.Position) end
+local function TryCast()
+    local now = tick()
+    if now - lastAttack < CONFIG.AttackRate then return end
+    lastAttack = now
+    spellSlot  = not spellSlot
+    -- Fire on separate thread so it never blocks movement
+    task.spawn(function()
+        FireKey(spellSlot and Enum.KeyCode.Q or Enum.KeyCode.E)
+    end)
 end
 
 -- ============================================================
---  VISUAL LINE — shows where AI is walking
+--  FORCE FACE MOB — CFrame lock toward target every frame
+--  Bypasses camera shift-lock, works regardless of controls
 -- ============================================================
-local WalkLine = nil
+local FaceLock = {
+    Active    = false,
+    TargetPos = nil,
+    Thread    = nil,
+}
 
-local function ShowWalkLine(fromPos, toPos)
-    -- Remove old
-    if WalkLine and WalkLine.Parent then WalkLine:Destroy() end
+local function StartFaceLock(getTargetPos)
+    FaceLock.Active = true
+    if FaceLock.Thread then
+        task.cancel(FaceLock.Thread)
+    end
+    FaceLock.Thread = task.spawn(function()
+        while FaceLock.Active do
+            local root = GetRoot()
+            local pos  = getTargetPos()
+            if root and pos then
+                local dir = Vector3.new(
+                    pos.X - root.Position.X,
+                    0,
+                    pos.Z - root.Position.Z
+                )
+                if dir.Magnitude > 0.5 then
+                    -- Only rotate Y axis — don't flip the character over
+                    local cf = root.CFrame
+                    root.CFrame = CFrame.new(cf.Position)
+                        * CFrame.Angles(0, math.atan2(dir.X, dir.Z) + math.pi, 0)
+                end
+            end
+            RunService.Heartbeat:Wait()
+        end
+    end)
+end
 
-    local mid    = (fromPos + toPos) / 2
-    local length = (toPos - fromPos).Magnitude
-    if length < 1 then return end
+local function StopFaceLock()
+    FaceLock.Active = false
+    if FaceLock.Thread then
+        task.cancel(FaceLock.Thread)
+        FaceLock.Thread = nil
+    end
+end
 
+-- ============================================================
+--  VISUAL WALK LINE
+-- ============================================================
+local WalkLinePart = nil
+
+local function ShowWalkLine(from, to)
+    if WalkLinePart and WalkLinePart.Parent then
+        WalkLinePart:Destroy()
+    end
+    local len = (to - from).Magnitude
+    if len < 0.5 then return end
+    local mid  = (from + to) / 2
     local part = Instance.new("Part")
-    part.Name             = "DQR_WalkLine"
-    part.Anchored         = true
-    part.CanCollide       = false
-    part.CastShadow       = false
-    part.Material         = Enum.Material.Neon
-    part.Color            = Color3.fromRGB(100, 220, 255)
-    part.Transparency     = 0.35
-    part.Size             = Vector3.new(0.12, 0.12, length)
-    part.CFrame           = CFrame.lookAt(mid, toPos)
-    part.Parent           = workspace
-
-    WalkLine = part
+    part.Name          = "DQR_WalkLine"
+    part.Anchored      = true
+    part.CanCollide    = false
+    part.CastShadow    = false
+    part.Material      = Enum.Material.Neon
+    part.Color         = Color3.fromRGB(80, 200, 255)
+    part.Transparency  = 0.3
+    part.Size          = Vector3.new(0.1, 0.1, len)
+    part.CFrame        = CFrame.lookAt(mid, to)
+    part.Parent        = workspace
+    WalkLinePart       = part
 end
 
 local function ClearWalkLine()
-    if WalkLine and WalkLine.Parent then
-        WalkLine:Destroy()
-        WalkLine = nil
+    if WalkLinePart and WalkLinePart.Parent then
+        WalkLinePart:Destroy()
+        WalkLinePart = nil
     end
+end
+
+-- ============================================================
+--  OBSTACLE DETECTION
+--  Raycasts in movement direction — finds walls/floors
+-- ============================================================
+local RayParams = RaycastParams.new()
+RayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function GetObstacleAwareTarget(from, to)
+    local root = GetRoot()
+    if not root then return to end
+
+    -- Exclude character parts from raycast
+    local char = GetChar()
+    if char then
+        RayParams.FilterDescendantsInstances = {char}
+    end
+
+    local dir    = (to - from)
+    local dist   = dir.Magnitude
+    if dist < 0.1 then return to end
+
+    -- Cast ray from chest height
+    local origin = from + Vector3.new(0, 2, 0)
+    local result = workspace:Raycast(origin, dir.Unit * math.min(dist, 8), RayParams)
+
+    if result then
+        -- Wall detected — slide along it instead of stopping
+        local normal    = result.Normal
+        local slideDir  = dir - normal * dir:Dot(normal)
+        if slideDir.Magnitude > 0.1 then
+            return from + slideDir.Unit * math.min(dist, 12)
+        end
+        -- Can't slide — step perpendicular
+        local perp = Vector3.new(-dir.Unit.Z, 0, dir.Unit.X)
+        return from + perp * 8
+    end
+
+    return to
 end
 
 -- ============================================================
@@ -174,63 +241,59 @@ local function IsMob(model)
     return true
 end
 
-local function GetAllMobs()
+local function GetNearestMob()
     local root = GetRoot()
-    if not root then return {} end
-    local mobs = {}
+    if not root then return nil end
+    local best, bestDist = nil, math.huge
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("Model") and IsMob(obj) then
             local mobRoot = obj:FindFirstChild("HumanoidRootPart")
             if mobRoot then
-                table.insert(mobs, {
-                    Model    = obj,
-                    Root     = mobRoot,
-                    Humanoid = obj:FindFirstChildOfClass("Humanoid"),
-                    Distance = (mobRoot.Position - root.Position).Magnitude,
-                })
+                local d = (mobRoot.Position - root.Position).Magnitude
+                if d < bestDist then
+                    bestDist = d
+                    best     = {
+                        Model    = obj,
+                        Root     = mobRoot,
+                        Humanoid = obj:FindFirstChildOfClass("Humanoid"),
+                        Distance = d,
+                    }
+                end
             end
         end
     end
-    table.sort(mobs, function(a, b) return a.Distance < b.Distance end)
-    return mobs
+    return best
 end
 
 -- ============================================================
 --  THREAT DETECTION
---  Detects red/neon beams or fast projectiles aimed at player
 -- ============================================================
 local function ColorIsThreat(c)
-    -- Bias toward red spectrum + purple boss beams
-    return (c.R > 0.6 and c.G < 0.35 and c.B < 0.35)    -- reds
-        or (c.R > 0.6 and c.G < 0.35 and c.B > 0.5)     -- purples
-        or (c.R > 0.7 and c.G > 0.3  and c.B < 0.1)     -- orange
-end
-
-local function IsHeadingToUs(part)
-    local root = GetRoot()
-    if not root then return false end
-    local dist = (part.Position - root.Position).Magnitude
-    if dist > CONFIG.DodgeRange then return false end
-    local vel = part.AssemblyLinearVelocity
-    if vel.Magnitude < 8 then return false end
-    local dot = vel.Unit:Dot((root.Position - part.Position).Unit)
-    return dot > 0.55
+    return (c.R > 0.6 and c.G < 0.35 and c.B < 0.35)
+        or (c.R > 0.6 and c.G < 0.35 and c.B > 0.5)
+        or (c.R > 0.7 and c.G > 0.3  and c.B < 0.1)
 end
 
 local function ScanThreats()
     local root = GetRoot()
     if not root then return false, nil end
+    local char = GetChar()
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("BasePart")
-        and (not LP.Character or not obj:IsDescendantOf(LP.Character)) then
-            local neon    = obj.Material == Enum.Material.Neon
-            local threat  = ColorIsThreat(obj.Color)
+        if obj:IsA("BasePart") and (not char or not obj:IsDescendantOf(char)) then
+            local neon   = obj.Material == Enum.Material.Neon
+            local threat = ColorIsThreat(obj.Color)
             if neon or threat then
-                if IsHeadingToUs(obj) then
-                    return true, obj.Position
+                local dist = (obj.Position - root.Position).Magnitude
+                if dist < CONFIG.DodgeRange then
+                    local vel = obj.AssemblyLinearVelocity
+                    if vel.Magnitude > 8 then
+                        local dot = vel.Unit:Dot((root.Position - obj.Position).Unit)
+                        if dot > 0.55 then
+                            return true, obj.Position
+                        end
+                    end
                 end
             end
-            -- Beam check — beam on a nearby part = telegraph
             for _, child in ipairs(obj:GetChildren()) do
                 if child:IsA("Beam") then
                     local dist = (obj.Position - root.Position).Magnitude
@@ -244,332 +307,178 @@ local function ScanThreats()
     return false, nil
 end
 
-local function GetStrafePos(threatOrigin)
+-- ============================================================
+--  CIRCULAR KITE MOVEMENT
+--  Orbits the mob at IdealRange, no back-and-forth shaking
+--  Angle advances continuously so player circles like a pro
+-- ============================================================
+local orbitAngle = 0
+local lastDodge  = 0
+
+local function GetOrbitPosition(mobPos, radius, angle)
+    return Vector3.new(
+        mobPos.X + math.cos(angle) * radius,
+        mobPos.Y,                              -- snap to mob Y, humanoid handles ground
+        mobPos.Z + math.sin(angle) * radius
+    )
+end
+
+local function AdvanceOrbit(dt)
+    orbitAngle = orbitAngle + CONFIG.CircleSpeed * dt
+    if orbitAngle > math.pi * 2 then
+        orbitAngle = orbitAngle - math.pi * 2
+    end
+end
+
+-- Seed orbit angle to current player position relative to mob
+local function SeedOrbitAngle(mobPos)
     local root = GetRoot()
-    if not root then return nil end
-    local toward = (threatOrigin - root.Position)
-    toward = Vector3.new(toward.X, 0, toward.Z).Unit
-    local perp  = Vector3.new(-toward.Z, 0, toward.X)
-    local sign  = math.random() > 0.5 and 1 or -1
-    return root.Position
-        + perp  * sign * CONFIG.DodgeStep
-        + toward * -CONFIG.DodgeStep * 0.4
+    if not root then return end
+    local rel  = root.Position - mobPos
+    orbitAngle = math.atan2(rel.Z, rel.X)
 end
 
 -- ============================================================
---  DUNGEON MAP DATA
---  GUI object names grabbed from DQR's lobby UI
--- ============================================================
-local DUNGEON_DATA = {
-    ["Desert Temple"]    = { Keywords = {"Desert",  "Temple"},    MinLevel = 1   },
-    ["Winter Outpost"]   = { Keywords = {"Winter",  "Outpost"},   MinLevel = 50  },
-    ["Pirate Island"]    = { Keywords = {"Pirate",  "Island"},    MinLevel = 100 },
-    ["King's Castle"]    = { Keywords = {"King",    "Castle"},    MinLevel = 150 },
-    ["Underworld"]       = { Keywords = {"Under",   "world"},     MinLevel = 200 },
-    ["Samurai Palace"]   = { Keywords = {"Samurai", "Palace"},    MinLevel = 250 },
-    ["Ghastly Harbor"]   = { Keywords = {"Ghastly", "Harbor"},    MinLevel = 300 },
-    ["Enchanted Forest"] = { Keywords = {"Enchant", "Forest"},    MinLevel = 350 },
-}
-
--- ============================================================
---  IN-MAP DETECTION
---  DQR separates lobby from dungeon — we detect by checking
---  if mob models exist in workspace (they only spawn in dungeons)
--- ============================================================
-local function IsInDungeon()
-    -- If mobs exist we're inside a dungeon instance
-    local mobs = GetAllMobs()
-    if #mobs > 0 then return true end
-
-    -- Fallback: check workspace name or map-specific folders
-    local wsName = workspace.Name:lower()
-    for mapName, _ in pairs(DUNGEON_DATA) do
-        for _, kw in ipairs(DUNGEON_DATA[mapName].Keywords) do
-            if wsName:find(kw:lower()) then return true end
-        end
-    end
-
-    -- Check for a folder named after map keywords
-    for _, obj in ipairs(workspace:GetChildren()) do
-        for mapName, data in pairs(DUNGEON_DATA) do
-            for _, kw in ipairs(data.Keywords) do
-                if obj.Name:lower():find(kw:lower()) then return true end
-            end
-        end
-    end
-
-    return false
-end
-
--- ============================================================
---  LOBBY NAVIGATOR — finds and clicks the dungeon button
--- ============================================================
-local function FindDungeonButton(mapName)
-    local data = DUNGEON_DATA[mapName]
-    if not data then return nil end
-
-    -- DQR lobby has a ScreenGui with dungeon selection frames
-    -- Try PlayerGui first then CoreGui
-    local function SearchGui(parent)
-        for _, obj in ipairs(parent:GetDescendants()) do
-            if obj:IsA("TextButton") or obj:IsA("TextLabel") or obj:IsA("Frame") then
-                local txt = (obj:IsA("TextButton") or obj:IsA("TextLabel"))
-                    and obj.Text:lower() or obj.Name:lower()
-                local matchCount = 0
-                for _, kw in ipairs(data.Keywords) do
-                    if txt:find(kw:lower()) then
-                        matchCount = matchCount + 1
-                    end
-                end
-                if matchCount >= 1 and obj:IsA("TextButton") then
-                    return obj
-                end
-            end
-        end
-        return nil
-    end
-
-    local btn = SearchGui(LP:WaitForChild("PlayerGui"))
-    if not btn then
-        pcall(function()
-            btn = SearchGui(game:GetService("CoreGui"))
-        end)
-    end
-    return btn
-end
-
-local function ClickButton(btn)
-    if not btn then return false end
-    pcall(function()
-        local ms = game:GetService("VirtualInputManager")
-        local pos = btn.AbsolutePosition + btn.AbsoluteSize / 2
-        ms:SendMouseButtonEvent(pos.X, pos.Y, 0, true,  game, 0)
-        task.wait(0.08)
-        ms:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-    end)
-    -- Fallback: fire MouseButton1Click directly
-    pcall(function() btn:FireClientSignal() end)
-    pcall(function()
-        local event = btn.MouseButton1Click
-        if event then event:Fire() end
-    end)
-    return true
-end
-
--- ============================================================
---  AUTO QUEUE SYSTEM
--- ============================================================
-local function TryQueueDungeon()
-    local function TryQueueDungeon()
-    if not CONFIG.AutoRunDungeon then return end
-    local mapName = CONFIG.TargetDungeon
-    print("[DQR] Looking for dungeon button: " .. mapName)
-
-    -- ── STEP 1: find & click the dungeon tile ──────────────────
-    local attempts = 0
-    local btn = nil
-    repeat
-        btn = FindDungeonButton(mapName)
-        if not btn then task.wait(2) end
-        attempts = attempts + 1
-    until btn or attempts > 15
-
-    if not btn then
-        print("[DQR] Could not find dungeon button for: " .. mapName)
-        return
-    end
-
-    print("[DQR] Found dungeon tile, clicking...")
-    ClickButton(btn)
-    task.wait(1.5)
-
-    -- ── STEP 2: find & click ANY Start / Play button ───────────
-    -- Keeps retrying for up to 10s because DQR's lobby screen
-    -- sometimes takes a moment to slide in after tile click
-    local function FindStartBtn(parent)
-        for _, obj in ipairs(parent:GetDescendants()) do
-            if obj:IsA("TextButton") and obj.Visible then
-                local t = obj.Text:lower():gsub("%s+", "")
-                if t == "start"
-                or t == "play"
-                or t == "startgame"
-                or t == "playgame"
-                or t == "vote"
-                or t == "ready"
-                or t == "begin" then
-                    return obj
-                end
-            end
-        end
-        return nil
-    end
-
-    local startBtn  = nil
-    local startWait = 0
-    repeat
-        task.wait(0.6)
-        startWait = startWait + 0.6
-        startBtn  = FindStartBtn(LP:WaitForChild("PlayerGui"))
-        if not startBtn then
-            pcall(function()
-                startBtn = FindStartBtn(game:GetService("CoreGui"))
-            end)
-        end
-    until startBtn or startWait > 10
-
-    if startBtn then
-        print("[DQR] Found start button — pressing it.")
-        ClickButton(startBtn)
-        task.wait(1)
-
-        -- ── STEP 3: spam it a couple more times ────────────────
-        -- Some DQR lobbies need a vote from every player,
-        -- or the button stays up and needs re-clicking
-        for i = 1, 3 do
-            task.wait(0.8)
-            local again = FindStartBtn(LP:WaitForChild("PlayerGui"))
-            if again then
-                print("[DQR] Re-pressing start (" .. i .. ")")
-                ClickButton(again)
-            end
-        end
-    else
-        print("[DQR] No start button found — dungeon may auto-start.")
-    end
-end
--- ============================================================
---  MAIN AUTO FARM STATE
+--  MAIN FARM LOOP
 -- ============================================================
 local Farm = {
-    Running      = false,
-    MainThread   = nil,
-    DodgeThread  = nil,
+    Running    = false,
+    MainThread = nil,
+    DodgeThread = nil,
 }
 
--- ============================================================
---  COMBAT LOOP
---  - Always faces the mob
---  - Attacks while kiting / running
---  - Backs up if too close
---  - Dodges beams / projectiles
--- ============================================================
-local lastAttack = 0
-local spellSlot  = false
-
-local function TryCast()
-    local now = tick()
-    if now - lastAttack < CONFIG.AttackRate then return end
-    lastAttack  = now
-    spellSlot   = not spellSlot
-    FireSpell(spellSlot and "Q" or "E")
-end
-
-local lastDodge = 0
+local lastFrameTime = tick()
 
 local function MainLoop()
+    local hum = GetHuman()
+    if hum then
+        hum.WalkSpeed = CONFIG.WalkSpeed
+    end
+
+    local seeded = false
+
     while Farm.Running do
-        task.wait(CONFIG.ScanRate)
+        local now = tick()
+        local dt  = now - lastFrameTime
+        lastFrameTime = now
 
         local root  = GetRoot()
-        local hum   = GetHuman()
-        if not root or not hum or hum.Health <= 0 then
+        local human = GetHuman()
+
+        if not root or not human or human.Health <= 0 then
             ClearWalkLine()
+            StopFaceLock()
             task.wait(0.5)
             continue
         end
 
-        -- Always try to cast regardless of movement state
-        local mobs = GetAllMobs()
+        -- Ensure full speed every tick
+        if human.WalkSpeed < CONFIG.WalkSpeed then
+            human.WalkSpeed = CONFIG.WalkSpeed
+        end
 
-        if #mobs == 0 then
-            StopWalk()
+        local target = GetNearestMob()
+
+        if not target then
             ClearWalkLine()
+            StopFaceLock()
+            human:MoveTo(root.Position)
+            task.wait(CONFIG.ScanRate)
             continue
         end
 
-        local target = mobs[1]
-        local dist   = target.Distance
         local mobPos = target.Root.Position
+        local dist   = target.Distance
 
-        -- ALWAYS face the mob, every tick
-        FacePosition(mobPos)
+        -- Lock face to mob every frame via dedicated thread
+        if not FaceLock.Active then
+            StartFaceLock(function()
+                local t = GetNearestMob()
+                return t and t.Root.Position or nil
+            end)
+        end
 
-        -- ALWAYS try to attack
+        -- Always try to cast — happens regardless of move state
         TryCast()
 
-        -- Check for dodge (highest movement priority)
-        local threatened, threatOrigin = ScanThreats()
-        local now = tick()
+        -- Seed orbit angle once per target acquisition
+        if not seeded then
+            SeedOrbitAngle(mobPos)
+            seeded = true
+        end
 
+        -- Check dodge
+        local threatened, threatOrigin = ScanThreats()
         if threatened and (now - lastDodge) > CONFIG.DodgeCooldown then
             lastDodge = now
-            local strafePos = GetStrafePos(threatOrigin)
-            if strafePos then
-                ShowWalkLine(root.Position, strafePos)
-                WalkTo(strafePos)
-                -- Still face mob while strafing
-                FacePosition(mobPos)
-            end
+            -- Dodge perpendicular to threat, keep circling direction
+            local toward = (threatOrigin - root.Position)
+            toward       = Vector3.new(toward.X, 0, toward.Z).Unit
+            local perp   = Vector3.new(-toward.Z, 0, toward.X)
+            local sign   = math.cos(orbitAngle) > 0 and 1 or -1
+            local dodge  = root.Position + perp * sign * CONFIG.DodgeStep
+            dodge        = GetObstacleAwareTarget(root.Position, dodge)
+            ShowWalkLine(root.Position, dodge)
+            human:MoveTo(dodge)
+            -- Advance orbit angle to match dodge direction
+            orbitAngle = orbitAngle + (sign * 0.6)
+            task.wait(CONFIG.ScanRate)
             continue
         end
 
-        -- Maintain kite distance
-        if dist < CONFIG.BackupDist then
-            -- Too close — run directly away while still facing mob
-            local away = root.Position + (root.Position - mobPos).Unit * CONFIG.KiteRange
-            away = Vector3.new(away.X, root.Position.Y, away.Z)
-            ShowWalkLine(root.Position, away)
-            WalkTo(away)
-            -- FacePosition already called above — mob stays in sight
+        -- Advance orbit angle
+        AdvanceOrbit(dt)
 
-        elseif dist < CONFIG.KiteRange then
-            -- In backup zone but not critical — shuffle back slightly
-            local backDir = (root.Position - mobPos).Unit
-            local backPos = root.Position + backDir * 6
-            ShowWalkLine(root.Position, backPos)
-            WalkTo(backPos)
+        -- Compute next orbit position
+        local targetRadius = CONFIG.CircleRadius
 
-        elseif dist > CONFIG.AttackRange then
-            -- Too far — walk toward mob to attack range edge
-            local dir    = (mobPos - root.Position).Unit
-            local walkTo = mobPos - dir * (CONFIG.AttackRange - 3)
-            ShowWalkLine(root.Position, walkTo)
-            WalkTo(walkTo)
-
-        else
-            -- Perfect range — stand still, just attack and face
-            StopWalk()
-            ClearWalkLine()
+        if dist < CONFIG.MinRange then
+            -- Inside min range — increase radius to push out faster
+            targetRadius = CONFIG.CircleRadius * 1.5
+        elseif dist > CONFIG.MaxRange then
+            -- Too far — decrease radius to pull in
+            targetRadius = CONFIG.CircleRadius * 0.6
         end
+
+        local orbitPos = GetOrbitPosition(mobPos, targetRadius, orbitAngle)
+
+        -- Obstacle check on orbit destination
+        orbitPos = GetObstacleAwareTarget(root.Position, orbitPos)
+
+        -- Clamp Y to root Y — let Roblox humanoid handle elevation
+        orbitPos = Vector3.new(orbitPos.X, root.Position.Y, orbitPos.Z)
+
+        ShowWalkLine(root.Position, orbitPos)
+        human:MoveTo(orbitPos)
+
+        task.wait(CONFIG.ScanRate)
     end
 
     ClearWalkLine()
+    StopFaceLock()
 end
 
 -- ============================================================
---  DEDICATED DODGE WATCHER — 20hz, independent of main loop
+--  DEDICATED DODGE WATCHER — 20hz
 -- ============================================================
 local function DodgeWatcher()
-    local lastDodgeW = 0
+    local lastDW = 0
     while Farm.Running do
         task.wait(0.05)
-        local root = GetRoot()
-        if not root then continue end
-
-        local mobs = GetAllMobs()
-        local mobPos = mobs[1] and mobs[1].Root.Position or nil
+        local root  = GetRoot()
+        local human = GetHuman()
+        if not root or not human then continue end
 
         local threatened, origin = ScanThreats()
         local now = tick()
-
-        if threatened and (now - lastDodgeW) > CONFIG.DodgeCooldown then
-            lastDodgeW = now
-            local s = GetStrafePos(origin)
-            if s then
-                ShowWalkLine(root.Position, s)
-                WalkTo(s)
-                if mobPos then FacePosition(mobPos) end
-            end
+        if threatened and (now - lastDW) > CONFIG.DodgeCooldown then
+            lastDW = now
+            local toward = (origin - root.Position)
+            toward       = Vector3.new(toward.X, 0, toward.Z).Unit
+            local perp   = Vector3.new(-toward.Z, 0, toward.X)
+            local sign   = math.cos(orbitAngle) > 0 and 1 or -1
+            local dodge  = root.Position + perp * sign * CONFIG.DodgeStep
+            human:MoveTo(dodge)
         end
     end
 end
@@ -579,22 +488,22 @@ end
 -- ============================================================
 function Farm.Start()
     if Farm.Running then return end
-    Farm.Running     = true
-    Farm.MainThread  = task.spawn(MainLoop)
-    Farm.DodgeThread = task.spawn(DodgeWatcher)
-    print("[DQR] Auto Farm started.")
+    Farm.Running      = true
+    lastFrameTime     = tick()
+    Farm.MainThread   = task.spawn(MainLoop)
+    Farm.DodgeThread  = task.spawn(DodgeWatcher)
+    print("[DQR] Farm started.")
 end
 
 function Farm.Stop()
     Farm.Running = false
     ClearWalkLine()
-    StopWalk()
-    print("[DQR] Auto Farm stopped.")
+    StopFaceLock()
+    local hum = GetHuman()
+    if hum then hum:MoveTo(GetRoot() and GetRoot().Position or Vector3.new()) end
+    print("[DQR] Farm stopped.")
 end
 
--- ============================================================
---  CHARACTER RESPAWN HANDLER
--- ============================================================
 LP.CharacterAdded:Connect(function()
     task.wait(2)
     if Farm.Running then
@@ -605,30 +514,145 @@ LP.CharacterAdded:Connect(function()
 end)
 
 -- ============================================================
+--  DUNGEON DETECTION
+-- ============================================================
+local function IsInDungeon()
+    return GetNearestMob() ~= nil
+end
+
+-- ============================================================
+--  DUNGEON DATA
+-- ============================================================
+local DUNGEON_DATA = {
+    ["Desert Temple"]    = {Keywords = {"Desert",  "Temple"}},
+    ["Winter Outpost"]   = {Keywords = {"Winter",  "Outpost"}},
+    ["Pirate Island"]    = {Keywords = {"Pirate",  "Island"}},
+    ["King's Castle"]    = {Keywords = {"King",    "Castle"}},
+    ["Underworld"]       = {Keywords = {"Under",   "world"}},
+    ["Samurai Palace"]   = {Keywords = {"Samurai", "Palace"}},
+    ["Ghastly Harbor"]   = {Keywords = {"Ghastly", "Harbor"}},
+    ["Enchanted Forest"] = {Keywords = {"Enchant", "Forest"}},
+}
+
+local function FindDungeonButton(mapName)
+    local data = DUNGEON_DATA[mapName]
+    if not data then return nil end
+    local function Search(parent)
+        for _, obj in ipairs(parent:GetDescendants()) do
+            if obj:IsA("TextButton") and obj.Visible then
+                local txt = obj.Text:lower()
+                local nm  = obj.Name:lower()
+                for _, kw in ipairs(data.Keywords) do
+                    if txt:find(kw:lower()) or nm:find(kw:lower()) then
+                        return obj
+                    end
+                end
+            end
+        end
+        return nil
+    end
+    local btn = Search(LP:WaitForChild("PlayerGui"))
+    if not btn then pcall(function()
+        btn = Search(game:GetService("CoreGui"))
+    end) end
+    return btn
+end
+
+local function ClickButton(btn)
+    if not btn then return false end
+    pcall(function()
+        local pos = btn.AbsolutePosition + btn.AbsoluteSize / 2
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true,  game, 0)
+        task.wait(0.08)
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+    end)
+    return true
+end
+
+local function FindPlayBtn(parent)
+    for _, obj in ipairs(parent:GetDescendants()) do
+        if obj:IsA("TextButton") and obj.Visible then
+            local t = obj.Text:lower():gsub("%s+", "")
+            if t == "play" or t == "start" or t == "ready"
+            or t == "vote" or t == "begin" or t == "playgame" then
+                return obj
+            end
+        end
+    end
+    return nil
+end
+
+local function TryQueueDungeon()
+    if not CONFIG.AutoRunDungeon then return end
+    print("[DQR] Queuing: " .. CONFIG.TargetDungeon)
+
+    -- Find dungeon tile
+    local btn, tries = nil, 0
+    repeat
+        btn   = FindDungeonButton(CONFIG.TargetDungeon)
+        tries = tries + 1
+        if not btn then task.wait(2) end
+    until btn or tries > 15
+
+    if not btn then
+        print("[DQR] Dungeon tile not found.")
+        return
+    end
+
+    print("[DQR] Clicking dungeon tile...")
+    ClickButton(btn)
+    task.wait(1.5)
+
+    -- Wait for Play button and click it
+    local playBtn, waited = nil, 0
+    repeat
+        task.wait(0.6)
+        waited  = waited + 0.6
+        playBtn = FindPlayBtn(LP:WaitForChild("PlayerGui"))
+        if not playBtn then pcall(function()
+            playBtn = FindPlayBtn(game:GetService("CoreGui"))
+        end) end
+    until playBtn or waited > 10
+
+    if playBtn then
+        print("[DQR] Clicking Play...")
+        ClickButton(playBtn)
+        task.wait(0.8)
+        -- Re-click in case it needs vote confirmation
+        for i = 1, 3 do
+            task.wait(0.8)
+            local again = FindPlayBtn(LP:WaitForChild("PlayerGui"))
+            if again then
+                print("[DQR] Re-clicking Play (" .. i .. ")")
+                ClickButton(again)
+            end
+        end
+    else
+        print("[DQR] No Play button found — may auto-start.")
+    end
+end
+
+-- ============================================================
 --  DUNGEON COMPLETE WATCHER
---  When all mobs are dead and no new ones spawn → re-queue
 -- ============================================================
 local function DungeonWatcher()
     local emptyTicks = 0
     while true do
         task.wait(3)
         if not Farm.Running then continue end
-
-        local mobs = GetAllMobs()
-        if #mobs == 0 then
+        if GetNearestMob() == nil then
             emptyTicks = emptyTicks + 1
-            -- If no mobs for 9 seconds straight → dungeon cleared
             if emptyTicks >= 3 then
                 emptyTicks = 0
                 print("[DQR] Dungeon cleared. Re-queuing...")
                 Farm.Stop()
-                task.wait(5)   -- wait for results screen / lobby return
+                task.wait(6)
                 if CONFIG.AutoRunDungeon then
                     TryQueueDungeon()
-                    -- Wait for next dungeon to load
-                    task.wait(8)
+                    local w = 0
+                    repeat task.wait(2) w = w + 2 until IsInDungeon() or w > 60
                 end
-                Farm.Start()
+                if IsInDungeon() then Farm.Start() end
             end
         else
             emptyTicks = 0
@@ -637,54 +661,37 @@ local function DungeonWatcher()
 end
 
 -- ============================================================
---  BOOT SEQUENCE
+--  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] Script loaded.")
-
-    -- 1. Nuke graphics
+    print("[DQR] Loaded.")
     NukeGraphics()
-
-    -- 2. Check if already in a dungeon
     task.wait(1.5)
+
     if IsInDungeon() then
-        print("[DQR] Already in dungeon — starting farm.")
+        print("[DQR] Already in dungeon — starting.")
         Farm.Start()
     elseif CONFIG.AutoRunDungeon then
-        print("[DQR] In lobby — queuing " .. CONFIG.TargetDungeon)
         TryQueueDungeon()
-        -- Wait for dungeon to load in
-        local waited = 0
-        repeat
-            task.wait(2)
-            waited = waited + 2
-        until IsInDungeon() or waited > 60
-        if IsInDungeon() then
-            Farm.Start()
-        else
-            print("[DQR] Timed out waiting for dungeon. Start manually.")
-        end
+        local w = 0
+        repeat task.wait(2) w = w + 2 until IsInDungeon() or w > 60
+        if IsInDungeon() then Farm.Start()
+        else print("[DQR] Timed out. Enter dungeon manually.") end
     else
-        print("[DQR] AutoRunDungeon = false. Waiting for dungeon...")
-        -- Poll until inside
+        print("[DQR] Waiting for dungeon...")
         repeat task.wait(3) until IsInDungeon()
         Farm.Start()
     end
 
-    -- 3. Dungeon loop watcher
     task.spawn(DungeonWatcher)
 end)
 
 -- ============================================================
---  TOGGLE KEY — F5 to kill / restart
+--  F5 — kill / restart
 -- ============================================================
 UserInputService.InputBegan:Connect(function(inp, gpe)
     if gpe then return end
     if inp.KeyCode == Enum.KeyCode.F5 then
-        if Farm.Running then
-            Farm.Stop()
-        else
-            Farm.Start()
-        end
+        if Farm.Running then Farm.Stop() else Farm.Start() end
     end
 end)
