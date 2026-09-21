@@ -15,7 +15,7 @@ local CONFIG = {
     Class          = "Warrior",
 
     TargetDungeon  = "Winter Outpost",
-    Difficulty     = "Hard",
+    Difficulty     = "Medium",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
     UseRemotes     = false,  -- blind-firing guessed remotes; off by default
