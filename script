@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v6.6
+--  DQR AUTO FARM v6.7
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -101,8 +101,9 @@ local CONFIG = {
     -- Performance. Scanners use the physics broadphase over a radius
     -- instead of walking the whole map, and cache their verdicts so the
     -- two 20Hz threads share one scan instead of doing two each.
-    MobScanRadius  = 300,    -- studs to look for mobs in
-    MaxQueryParts  = 500,    -- cap on parts returned by one query
+    MobScanRadius  = 300,    -- outermost ring when nothing is near
+    MaxQueryParts  = 2000,   -- cap per query; low values TRUNCATE results
+                             -- non-deterministically and hide near mobs
     HazardTTL      = 0.1,    -- telegraph/beam scan at most 10x a second
     ThreatTTL      = 0.1,    -- projectile scan at most 10x a second
     PathGiveUp     = 6,      -- failed paths before abandoning a mob
@@ -1056,15 +1057,22 @@ local function StartMoving(getDestFn)
 
         -- Aim the camera at the mob too - DQR resolves attacks from the
         -- camera/mouse ray, not from the character's own facing.
-        if CONFIG.AimCamera and fp and look then
-            local cam = workspace.CurrentCamera
-            if cam then
+        local cam = workspace.CurrentCamera
+        if cam then
+            if CONFIG.AimCamera and fp and look then
                 if cam.CameraType ~= Enum.CameraType.Scriptable then
                     cam.CameraType = Enum.CameraType.Scriptable
                 end
                 local back = Vector3.new(-look.X, 0, -look.Z) * CONFIG.CameraBack
                 cam.CFrame = CFrame.lookAt(
                     pos + back + Vector3.new(0, CONFIG.CameraHeight, 0), fp)
+            elseif cam.CameraType == Enum.CameraType.Scriptable then
+                -- No target to aim at. Without this the camera stayed
+                -- Scriptable at whatever CFrame it last had and simply
+                -- stopped following the character - it only got restored
+                -- when the farm stopped entirely.
+                cam.CameraType = Enum.CameraType.Custom
+                pcall(function() cam.CameraSubject = human end)
             end
         end
     end)
@@ -1746,7 +1754,33 @@ local function GetNearestMob()
 
     -- Find mobs by their HumanoidRootPart through the broadphase rather
     -- than walking every instance in the map.
-    for _, prt in ipairs(NearbyParts(root.Position, CONFIG.MobScanRadius)) do
+    --
+    -- Search outward in rings, stopping at the first that finds
+    -- anything. A single 300-stud query returns far more than MaxParts
+    -- in a dungeon and gets TRUNCATED - and not by distance, so the mob
+    -- standing next to you could simply be missing from the results
+    -- while one across the room was included. That is why it kept
+    -- walking past near groups to reach far ones.
+    local parts = {}
+    for _, r in ipairs({60, 140, CONFIG.MobScanRadius}) do
+        parts = NearbyParts(root.Position, r)
+        local any = false
+        for _, prt in ipairs(parts) do
+            if prt.Name == "HumanoidRootPart" then
+                local m = prt.Parent
+                if m and m:IsA("Model") and mobShape[m] ~= false then
+                    local isP = false
+                    for _, p in ipairs(Players:GetPlayers()) do
+                        if p.Character == m then isP = true break end
+                    end
+                    if not isP then any = true break end
+                end
+            end
+        end
+        if any then break end
+    end
+
+    for _, prt in ipairs(parts) do
         local obj = prt.Name == "HumanoidRootPart" and prt.Parent or nil
         if obj and obj:IsA("Model") and not seen[obj] then
             seen[obj] = true
@@ -2809,7 +2843,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v6.6 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v6.7 loaded.  F5 farm  F6 dump  F7 show/hide log")
     ApplyClass()
     NukeGraphics()
     S(2.5)
