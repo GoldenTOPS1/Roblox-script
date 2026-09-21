@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v6.7
+--  DQR AUTO FARM v6.8
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -132,12 +132,12 @@ local CONFIG = {
 --  MinRange with it).
 local CLASS_RANGES = {
     Warrior = {
-        CircleRadius = 12, MeleeRange = 18, MinRange = 10,
-        MaxRange     = 22, AttackRange = 30,
+        CircleRadius = 9,  MeleeRange = 16, MinRange = 6,
+        MaxRange     = 20, AttackRange = 30,
     },
     Tank = {
-        CircleRadius = 10, MeleeRange = 18, MinRange = 8,
-        MaxRange     = 20, AttackRange = 30,
+        CircleRadius = 8,  MeleeRange = 16, MinRange = 5,
+        MaxRange     = 19, AttackRange = 30,
     },
     Mage = {
         CircleRadius = 24, MeleeRange = 10, MinRange = 18,
@@ -2837,13 +2837,30 @@ local function ApplyClass()
     for k, v in pairs(prof) do CONFIG[k] = v end
     print(("[DQR] Class %s: orbit %d, melee under %d, spells under %d.")
         :format(name, prof.CircleRadius, prof.MeleeRange, prof.AttackRange))
+
+    -- These have an ordering requirement that is easy to break by hand,
+    -- and both failure modes look like "the bot is behaving oddly"
+    -- rather than pointing at the numbers.
+    if CONFIG.MinRange >= CONFIG.CircleRadius then
+        print(("[DQR] WARNING: MinRange (%d) >= CircleRadius (%d) - the bot "
+            .. "will think it is too close the moment it arrives and "
+            .. "retreat forever."):format(CONFIG.MinRange, CONFIG.CircleRadius))
+    end
+    if CONFIG.CircleRadius >= CONFIG.MeleeRange then
+        print(("[DQR] WARNING: CircleRadius (%d) >= MeleeRange (%d) - it will "
+            .. "hold station outside its own swing and never melee.")
+            :format(CONFIG.CircleRadius, CONFIG.MeleeRange))
+    end
+    if CONFIG.MaxRange <= CONFIG.CircleRadius then
+        print("[DQR] WARNING: MaxRange should be well above CircleRadius.")
+    end
 end
 
 -- ============================================================
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v6.7 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v6.8 loaded.  F5 farm  F6 dump  F7 show/hide log")
     ApplyClass()
     NukeGraphics()
     S(2.5)
