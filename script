@@ -65,7 +65,7 @@ local CONFIG = {
                              -- foot level, else it is floor decoration
     FootOffset     = 3,      -- studs from HumanoidRootPart down to feet
     RecentWindow   = 8,      -- a part this new counts as an attack
-    HazardDebug    = true,  -- log what the hazard scanner reacts to AND
+    HazardDebug    = false,  -- log what the hazard scanner reacts to AND
                              -- draw every footprint it sees as a red
                              -- slab on the floor (F9 dumps the details)
 
