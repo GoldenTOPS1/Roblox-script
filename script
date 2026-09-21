@@ -1,5 +1,6 @@
 -- ============================================================
---  DQR AUTO FARM v8.6
+--  DQR AUTO FARM v8.7
+--  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log
 --  (F5 farm / F6 dump / F7 log / F8 mob diag / F9 hazard diag)
@@ -14,7 +15,7 @@ local CONFIG = {
     Class          = "Warrior",
 
     TargetDungeon  = "Winter Outpost",
-    Difficulty     = "Easy",
+    Difficulty     = "Insane",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
     UseRemotes     = false,  -- blind-firing guessed remotes; off by default
