@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v7.3
+--  DQR AUTO FARM v7.4
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -59,6 +59,9 @@ local CONFIG = {
     BeamMinLen     = 12,     -- a laser is long in exactly one axis...
     BeamMaxThick   = 3,      -- ...and thin in the other two
     BeamPad        = 5,      -- clearance to keep from the line
+    BeamMinHeight  = 1.5,    -- must sit this far above foot level, or it
+                             -- is floor decoration rather than an attack
+    FootOffset     = 3,      -- studs from HumanoidRootPart down to feet
 
     -- Ground telegraphs (the red strips a boss paints before it hits)
     DodgeTelegraph = true,
@@ -2224,6 +2227,18 @@ local function ColorIsBeam(c)
     return false
 end
 
+-- A real beam passes through your body; painted floor markings lie flat
+-- on the ground. Without this, the cyan path stripes in Winter Outpost
+-- match the beam test exactly - long in one axis, thin in the other
+-- two, cyan - and the bot spends the whole dungeon dodging the scenery.
+local function AtBodyHeight(o)
+    local root = GetRoot()
+    if not root then return true end
+    local top  = o.Position.Y + o.Size.Y / 2
+    local foot = root.Position.Y - CONFIG.FootOffset
+    return top > foot + CONFIG.BeamMinHeight
+end
+
 local function IsBeamPart(o)
     if not o:IsA("BasePart") then return false end
     if IsOurs(o) then return false end
@@ -2236,6 +2251,7 @@ local function IsBeamPart(o)
         if d <= CONFIG.BeamMaxThick then thin = thin + 1 end
     end
     if long ~= 1 or thin < 2 then return false end
+    if not AtBodyHeight(o) then return false end
 
     return o.Material == Enum.Material.Neon or ColorIsBeam(o.Color)
 end
@@ -2287,7 +2303,12 @@ local function ScanBeams()
                 local a = beam.Attachment0.WorldPosition
                 local b = beam.Attachment1.WorldPosition
                 local seg = b - a
-                if seg.Magnitude > 1 then
+                -- Same rule as the part test: if the whole span sits at
+                -- or below foot level it is floor decoration, not an
+                -- attack that can hit us.
+                local foot = pos.Y - CONFIG.FootOffset
+                local high = math.max(a.Y, b.Y) > foot + CONFIG.BeamMinHeight
+                if seg.Magnitude > 1 and high then
                     local esc = EscapeFromLine(pos, (a + b) / 2,
                         seg.Unit, seg.Magnitude / 2, CONFIG.BeamPad)
                     if esc then return esc end
@@ -3055,7 +3076,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v7.3 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v7.4 loaded.  F5 farm  F6 dump  F7 show/hide log")
     ApplyClass()
     NukeGraphics()
     S(2.5)
