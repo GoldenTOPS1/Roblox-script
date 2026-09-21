@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v8.7
+--  DQR AUTO FARM v8.6
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log
 --  (F5 farm / F6 dump / F7 log / F8 mob diag / F9 hazard diag)
@@ -502,14 +502,15 @@ local recentParts = setmetatable({}, {__mode = "k"})  -- BasePart -> born
 -- off so they stay out of the game's own raycasts. A pooled one is not
 -- "recent" either, so it was invisible to the scanner twice over.
 local hiddenBeams = setmetatable({}, {__mode = "k"})  -- BasePart -> true
-local IsBeamShape   -- assigned with the beam scanner far below
+local IsBeamShape, BeamShaped   -- assigned with the beam scanner far below
 
 workspace.DescendantAdded:Connect(function(o)
     if o:IsA("Beam") then
         beamObjects[o] = true
     elseif o:IsA("BasePart") then
         recentParts[o] = tick()
-        if not o.CanQuery and IsBeamShape and IsBeamShape(o) then
+        -- Shape only: a parked spoke is any colour and invisible.
+        if not o.CanQuery and BeamShaped and BeamShaped(o) then
             hiddenBeams[o] = true
         end
     end
@@ -530,7 +531,7 @@ task.spawn(function()
         if o:IsA("Beam") then
             beamObjects[o] = true
         elseif o:IsA("BasePart") and not o.CanQuery
-        and IsBeamShape and IsBeamShape(o) then
+        and BeamShaped and BeamShaped(o) then
             hiddenBeams[o] = true
         end
     end
@@ -541,29 +542,70 @@ end)
 -- never "new", so DescendantAdded never sees it and the recent-spawn
 -- test misses it entirely. Movement is the giveaway - scenery never
 -- moves, a pooled effect gets CFramed into place the moment it fires.
-local effectSeen = setmetatable({}, {__mode = "k"})
+local PartSize, LooksActive
+do
 
-local function LooksActive(o)
-    local now = tick()
+local effectSeen = setmetatable({}, {__mode = "k"})
+local meshOf     = setmetatable({}, {__mode = "k"})  -- part -> mesh|false
+
+-- A part's size as drawn. Older games size an effect with a
+-- SpecialMesh's Scale and leave the Part itself at 1x1x1, which no
+-- shape test would ever call long or flat.
+function PartSize(o)
+    local m = meshOf[o]
+    if m == nil then
+        m = o:IsA("Part") and o:FindFirstChildOfClass("SpecialMesh") or false
+        meshOf[o] = m
+    end
+    if m and m.Parent then return o.Size * m.Scale end
+    return o.Size
+end
+
+-- `fresh` is the caller saying "this part was first seen well inside
+-- the scan radius, not at its edge". A part we have never seen before
+-- normally means WE walked into range of some scenery, and scenery
+-- always enters at the edge; one that appears deep inside the radius
+-- is a pooled effect just brought in from wherever it is parked. The
+-- beam and ring pools sit far under the map between casts, so there
+-- is no "parked" reading on record to compare against, and first
+-- sight is the only chance to notice them. Anything solid is exempt:
+-- a damage effect never blocks movement, floor decoration often does.
+function LooksActive(o, fresh)
+    local now  = tick()
     local born = recentParts[o]
-    if born and now - born < CONFIG.RecentWindow then return true end
+    local new  = born ~= nil and now - born < CONFIG.RecentWindow
 
     local rec = effectSeen[o]
+    -- Out of sight for a while and now back? As good as never seen: a
+    -- pooled spoke fired at the same angle as last time lands on
+    -- exactly the position we have on record, and would read as
+    -- "never moved". Scenery in range is seen every sweep, so its
+    -- record never goes stale.
+    if rec and now - rec.seen > 3 then rec = nil end
     if not rec then
+        local hit = new or (fresh == true and not o.CanCollide)
         effectSeen[o] = {pos = o.Position, tr = o.Transparency,
-                         size = o.Size, moved = 0}
-        return false
+                         size = PartSize(o), moved = hit and now or 0,
+                         seen = now}
+        if hit and not new and CONFIG.HazardDebug then
+            print("[DQR] Turned up beside us: " .. o:GetFullName())
+        end
+        return hit
     end
+    rec.seen = now
     -- Movement - or a pooled effect being faded in, or stretched out
     -- from nothing. Scenery does none of these.
+    local size = PartSize(o)
     if (o.Position - rec.pos).Magnitude > 1
     or math.abs(o.Transparency - rec.tr) > 0.3
-    or (o.Size - rec.size).Magnitude > 1 then
-        rec.pos, rec.tr, rec.size = o.Position, o.Transparency, o.Size
+    or (size - rec.size).Magnitude > 1 then
+        rec.pos, rec.tr, rec.size = o.Position, o.Transparency, size
         rec.moved = now
     end
-    return (now - rec.moved) < CONFIG.RecentWindow
+    return new or (now - rec.moved) < CONFIG.RecentWindow
 end
+
+end -- of the LooksActive block
 
 -- ============================================================
 --  ARMOUR / COSMETIC STRIPPING
@@ -2435,11 +2477,16 @@ end
 -- so its two dozen helpers stop counting against Luau's limit of 200
 -- live locals in the main chunk. v8.6 crossed that limit, and an
 -- executor reports it as "attempt to call a nil value" on line 1 -
--- loadstring returned nil and the loader called it. Only these four
--- names, plus the forward-declared HazardAt and IsBeamShape, are
--- visible outside the block.
-local BeamShaped, hazardCache, ScanHazards, HazardDiag
+-- loadstring returned nil and the loader called it. Only these three
+-- names, plus the forward-declared HazardAt, IsBeamShape and
+-- BeamShaped, are visible outside the block.
+local hazardCache, ScanHazards, HazardDiag
 do
+
+-- Set once per sweep by ScanHazards: is the scanner settled enough
+-- that a part first seen well inside its radius must have come to us?
+local sweepFresh = false
+local settledPos, settledAt = nil, 0
 
 -- A part's shape in WORLD terms: how tall it stands, and its two
 -- horizontal extents with their directions. Reading Size.Y for the
@@ -2448,7 +2495,7 @@ do
 -- its Size.Y is the ring's diameter. The old test threw every one of
 -- those out as "a prop" for being too tall.
 local function Footprint(o)
-    local cf, s = o.CFrame, o.Size
+    local cf, s = o.CFrame, PartSize(o)
     local rx = math.abs(cf.RightVector.Y)
     local uy = math.abs(cf.UpVector.Y)
     local lz = math.abs(cf.LookVector.Y)
@@ -2463,11 +2510,53 @@ local function Footprint(o)
     end
 end
 
-local function IsTelegraph(o)
+-- The long axis of a part, as a segment plus a radius. For anything
+-- beam-shaped that is the beam; for anything else it is just its
+-- longest side, which NearDist below still finds useful.
+local function BeamSegment(o)
+    local s = PartSize(o)
+    local axis, half
+    if s.X >= s.Y and s.X >= s.Z then
+        axis = o.CFrame:VectorToWorldSpace(Vector3.new(1, 0, 0))
+        half = s.X / 2
+    elseif s.Y >= s.X and s.Y >= s.Z then
+        axis = o.CFrame:VectorToWorldSpace(Vector3.new(0, 1, 0))
+        half = s.Y / 2
+    else
+        axis = o.CFrame:VectorToWorldSpace(Vector3.new(0, 0, 1))
+        half = s.Z / 2
+    end
+    local thin = math.min(s.X, s.Y, s.Z)
+    return axis, half, thin / 2 + CONFIG.BeamPad
+end
+
+-- Horizontal distance from `p` to the segment a-b.
+local function SegDistFlat(p, a, b)
+    local ab = b - a
+    local len2 = ab:Dot(ab)
+    local t = len2 > 0.01 and math.clamp((p - a):Dot(ab) / len2, 0, 1) or 0
+    local n = a + ab * t
+    local dx, dz = p.X - n.X, p.Z - n.Z
+    return math.sqrt(dx * dx + dz * dz)
+end
+
+-- How near a part really is: distance to the closest point of its long
+-- axis, not to its centre. The centre of a 150-stud spoke sits 80
+-- studs off while the spoke itself runs under our feet, so every gate
+-- that compared centres was throwing the spokes away.
+local function NearDist(o, pos)
+    local axis, half = BeamSegment(o)
+    return SegDistFlat(pos, o.Position - axis * half, o.Position + axis * half)
+end
+
+-- `pos`/`radius` (optional) enable the first-sight rule in LooksActive:
+-- scenery enters the scan at its edge as we walk, so a part first seen
+-- well inside the radius appeared there.
+local function IsTelegraph(o, pos, radius)
     if not o:IsA("BasePart") then return false end
     if IsOurs(o) then return false end
     if o.Transparency > 0.95 then return false end
-    local s = o.Size
+    local s = PartSize(o)
     -- Cheap rejections before touching the CFrame: nothing whose
     -- smallest side is taller than the limit can lie flat any way up.
     if math.min(s.X, s.Y, s.Z) > CONFIG.TelegraphMaxY then return false end
@@ -2484,7 +2573,9 @@ local function IsTelegraph(o)
     -- What separates them is behaviour - the map is already there when
     -- we arrive and never moves; an attack marker either spawns or gets
     -- moved into place mid-fight.
-    return LooksActive(o)
+    local fresh = sweepFresh and pos ~= nil
+                  and NearDist(o, pos) < radius * 0.6
+    return LooksActive(o, fresh)
 end
 
 -- ============================================================
@@ -2573,7 +2664,7 @@ local function HazardCandidates(pos, radius)
     for p, born in pairs(recentParts) do
         if not p.Parent or now - born > CONFIG.RecentWindow then
             recentParts[p] = nil
-        elseif not p.CanQuery and (p.Position - pos).Magnitude < radius then
+        elseif not p.CanQuery and NearDist(p, pos) < radius then
             list[#list + 1] = p
         end
     end
@@ -2584,8 +2675,9 @@ end
 -- shapes: deciding where to go is done afterwards, over all of them.
 local function CollectTelegraphs(pos)
     if not CONFIG.DodgeTelegraph then return end
-    for _, o in ipairs(HazardCandidates(pos, CONFIG.DodgeRange)) do
-        if IsTelegraph(o) and not PlayerOwned(o) then
+    local radius = CONFIG.DodgeRange
+    for _, o in ipairs(HazardCandidates(pos, radius)) do
+        if IsTelegraph(o, pos, radius) and not PlayerOwned(o) then
             local _, a, b, va = Footprint(o)
             -- A ring AoE is as wide as it is long. Treating it as a box
             -- would pick one of its axes and walk us along a chord;
@@ -2642,17 +2734,19 @@ end
 local function AtBodyHeight(o)
     local root = GetRoot()
     if not root then return true end
-    local top  = o.Position.Y + o.Size.Y / 2
+    local height = Footprint(o)
+    local top  = o.Position.Y + height / 2
     local foot = root.Position.Y - CONFIG.FootOffset
     return top > foot + CONFIG.BeamMinHeight
 end
 
 -- Geometry only: long in exactly one axis, thin in the other two.
--- Declared outside the block: SurfaceRadius below uses it too.
+-- Declared at the top of the file: the spawn watcher and SurfaceRadius
+-- use it too.
 function BeamShaped(o)
     if not o:IsA("BasePart") then return false end
     if IsOurs(o) then return false end
-    local s = o.Size
+    local s = PartSize(o)
     local x, y, z = s.X, s.Y, s.Z
     local minLen, maxThick = CONFIG.BeamMinLen, CONFIG.BeamMaxThick
     local long = (x >= minLen and 1 or 0) + (y >= minLen and 1 or 0)
@@ -2683,50 +2777,9 @@ local function IsNewBeam(o)
     return true
 end
 
--- For parts that have been sitting there. Adds the height rule, because
--- with no evidence of activity a floor stripe and a laser are otherwise
--- indistinguishable - unless the thing has just moved, which scenery
--- never does.
-local function IsBeamPart(o)
-    if not IsBeamShape(o) then return false end
-    -- Ask first, so a parked beam's state is on record when it fires:
-    -- the fade-in is the activity that gives it away.
-    local active = LooksActive(o)
-    if o.Transparency > 0.9 then return false end   -- parked, not firing
-    return AtBodyHeight(o) or active
-end
-
--- The long axis of a beam-shaped part, as a segment plus a radius.
-local function BeamSegment(o)
-    local s = o.Size
-    local axis, half
-    if s.X >= s.Y and s.X >= s.Z then
-        axis = o.CFrame:VectorToWorldSpace(Vector3.new(1, 0, 0))
-        half = s.X / 2
-    elseif s.Y >= s.X and s.Y >= s.Z then
-        axis = o.CFrame:VectorToWorldSpace(Vector3.new(0, 1, 0))
-        half = s.Y / 2
-    else
-        axis = o.CFrame:VectorToWorldSpace(Vector3.new(0, 0, 1))
-        half = s.Z / 2
-    end
-    local thin = math.min(s.X, s.Y, s.Z)
-    return axis, half, thin / 2 + CONFIG.BeamPad
-end
-
 local function NoteBeamPart(o)
     local axis, half, r = BeamSegment(o)
     NoteLine(o.Position - axis * half, o.Position + axis * half, r)
-end
-
--- Horizontal distance from `p` to the segment a-b.
-local function SegDistFlat(p, a, b)
-    local ab = b - a
-    local len2 = ab:Dot(ab)
-    local t = len2 > 0.01 and math.clamp((p - a):Dot(ab) / len2, 0, 1) or 0
-    local n = a + ab * t
-    local dx, dz = p.X - n.X, p.Z - n.Z
-    return math.sqrt(dx * dx + dz * dz)
 end
 
 -- Records every beam near `pos` as a line footprint. Shapes only, no
@@ -2765,27 +2818,41 @@ local function CollectBeams(pos)
     for p, born in pairs(recentParts) do
         if not p.Parent or now - born > CONFIG.RecentWindow then
             recentParts[p] = nil
-        elseif IsNewBeam(p) and (p.Position - pos).Magnitude < reach
+        elseif IsNewBeam(p) and NearDist(p, pos) < reach
         and not PlayerOwned(p) then
             NoteBeamPart(p)
         end
     end
 
-    -- 3. Persistent beam-shaped parts at body height (a channelled
-    --    laser that was already there when we arrived), plus the ones
-    --    the broadphase cannot see. Anything still in the recent list
-    --    was handled above.
-    for _, o in ipairs(NearbyParts(pos, reach)) do
-        if not recentParts[o] and IsBeamPart(o) and not PlayerOwned(o) then
+    -- 3. Everything beam-shaped that has been sitting there, plus the
+    --    ones the broadphase cannot see. Two ways in:
+    --      * it has just been moved, resized, faded in or has turned up
+    --        beside us - a pooled effect being fired, whatever colour
+    --        it is. The Ice Elemental's telegraph spokes are hairline
+    --        and near-white, and the blue test threw them all away;
+    --      * or it is a standing laser at body height, which DOES have
+    --        to look like one, since a blue ice crystal is the same
+    --        shape and never moves.
+    --    The activity test runs before the visibility one so a parked,
+    --    invisible spoke is on record when it fades in.
+    local function Consider(o)
+        if not BeamShaped(o) or PlayerOwned(o) then return end
+        -- Scenery enters the scan at its edge as we walk; a part first
+        -- seen well inside it appeared there.
+        local fresh  = sweepFresh and NearDist(o, pos) < reach * 0.6
+        local active = LooksActive(o, fresh)
+        if recentParts[o] then return end           -- noted above already
+        if o.Transparency > 0.9 then return end     -- parked, not firing
+        if active or (IsBeamShape(o) and AtBodyHeight(o)) then
             NoteBeamPart(o)
         end
     end
+    for _, o in ipairs(NearbyParts(pos, reach)) do Consider(o) end
     for o in pairs(hiddenBeams) do
         if not o.Parent then
             hiddenBeams[o] = nil
-        elseif not recentParts[o] and (o.Position - pos).Magnitude < reach
-        and IsBeamPart(o) and not PlayerOwned(o) then
-            NoteBeamPart(o)
+        elseif NearDist(o, pos) < reach then
+            Consider(o)
         end
     end
 end
@@ -2915,6 +2982,7 @@ function ScanHazards()
     if now - hazardCache.t < CONFIG.HazardTTL then
         return hazardCache.escape
     end
+    local lastSweep = hazardCache.t
     hazardCache.t = now
     local root = GetRoot()
     if not root then
@@ -2922,6 +2990,17 @@ function ScanHazards()
         return nil
     end
     local pos = root.Position
+
+    -- First-sight activity (see LooksActive) is off for a few seconds
+    -- after the scanner starts or resumes, and after any teleport - a
+    -- respawn, a room change - because then EVERYTHING is new, at
+    -- every distance.
+    if not settledPos or (pos - settledPos).Magnitude > 30
+    or now - lastSweep > 2 then
+        settledAt = now
+    end
+    settledPos = pos
+    sweepFresh = (now - settledAt) > 3
 
     -- Rebuilt every sweep, and completely, before anything is decided.
     table.clear(hazardShapes)
@@ -2989,8 +3068,9 @@ function HazardDiag()
 
     local function Line(tag, o, extra)
         local height = Footprint(o)
-        print(("[%s] %s | size=%s h=%.1f | col=%s mat=%s tr=%.2f | query=%s collide=%s anch=%s | shape=%s look=%s tele=%s active=%s%s")
-            :format(tag, o:GetFullName(), tostring(o.Size), height,
+        print(("[%s] %s | size=%s drawn=%s h=%.1f near=%d | col=%s mat=%s tr=%.2f | query=%s collide=%s anch=%s | shape=%s look=%s tele=%s active=%s%s")
+            :format(tag, o:GetFullName(), tostring(o.Size),
+                    tostring(PartSize(o)), height, NearDist(o, pos),
                     tostring(o.Color),
                     (tostring(o.Material):gsub("Enum%.Material%.", "")),
                     o.Transparency, tostring(o.CanQuery),
@@ -3002,7 +3082,7 @@ function HazardDiag()
 
     local n = 0
     for p, born in pairs(recentParts) do
-        if p.Parent and (p.Position - pos).Magnitude < reach then
+        if p.Parent and NearDist(p, pos) < reach then
             n = n + 1
             if n <= 40 then Line(("new %.1fs"):format(now - born), p) end
         end
@@ -3031,7 +3111,7 @@ function HazardDiag()
     n = 0
     for _, o in ipairs(workspace:GetDescendants()) do
         if o:IsA("BasePart") and not recentParts[o] and BeamShaped(o)
-        and (o.Position - pos).Magnitude < reach then
+        and NearDist(o, pos) < reach then
             n = n + 1
             if n <= 40 then
                 Line("old", o, " body=" .. tostring(AtBodyHeight(o)))
