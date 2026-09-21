@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v8.0
+--  DQR AUTO FARM v8.4
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -81,6 +81,11 @@ local CONFIG = {
     -- close you are. Fight them from further out, and never stand still.
     BossStandoff   = 10,
     HazardMargin   = 8,      -- extra studs to clear a hazard edge by
+    -- Route around beams instead of only escaping once standing in one.
+    -- Costs two maths lookups per orbit candidate and a couple more on
+    -- the path worker's thread; nothing is added to the frame handler.
+    -- Set false to get exactly the v8.0 behaviour back.
+    AvoidHazardPaths = true,
 
     -- Stand and fight when the mob is not moving
     HoldWhenStill  = true,
@@ -460,6 +465,10 @@ end
 -- Declared early: the raycast in LineClear has to exclude it.
 local RangeBarPart = nil
 
+-- Forward declaration. The hazard footprints are built far below, but
+-- the path worker up here consults them. Assigned, not shadowed.
+local HazardAt
+
 -- ============================================================
 --  HAZARD REGISTRIES  (event driven, no polling)
 --
@@ -835,6 +844,34 @@ local function PathWorker(getDestFn)
                         end
                     else
                         clearStreak = 0
+                    end
+                end
+
+                -- Does the next leg of the walk run through a beam? This
+                -- runs here, on the path worker's own 2.5Hz thread, and
+                -- never in the frame handler - the previous attempt put
+                -- it at 60Hz and that alone made the game unplayable.
+                -- A couple of maths lookups, a few times a second.
+                if CONFIG.AvoidHazardPaths and HazardAt then
+                    local ahead = nil
+                    if #pathQueue > 0 then
+                        ahead = pathQueue[1].Position
+                    elseif dest then
+                        local d = Vector3.new(dest.X - root.Position.X, 0,
+                                              dest.Z - root.Position.Z)
+                        if d.Magnitude > 1 then
+                            ahead = root.Position
+                                  + d.Unit * math.min(d.Magnitude, 12)
+                        end
+                    end
+                    if ahead and HazardAt(ahead) then
+                        -- Drop it and recompute. A path made before the
+                        -- beam appeared points straight through it.
+                        ClearPath()
+                        forceRepath = true
+                        if CONFIG.HazardDebug then
+                            print("[DQR] Route crosses a hazard - repathing.")
+                        end
                     end
                 end
 
@@ -2319,6 +2356,60 @@ local function IsTelegraph(o)
 end
 
 -- Returns a world position to run to, or nil when we are standing clear.
+-- ============================================================
+--  HAZARD FOOTPRINTS
+--  The scanners below already walk every nearby hazard part to answer
+--  "am I standing in one". Recording the shape while they are there
+--  costs nothing extra, and lets us also answer "would walking to X
+--  put me in one" - without a second sweep and without any per-frame
+--  work, which is what made the previous attempt at this unusable.
+--
+--  Everything stored here is plain numbers captured at sweep time, so
+--  the lookup is pure maths with no instance access.
+-- ============================================================
+local hazardShapes = {}
+
+local function NoteDisc(cx, cy, cz, r)
+    hazardShapes[#hazardShapes + 1] =
+        {kind = "disc", x = cx, y = cy, z = cz, r = r}
+end
+
+local function NoteBox(cf, hx, hz, cy)
+    hazardShapes[#hazardShapes + 1] =
+        {kind = "box", cf = cf, hx = hx, hz = hz, y = cy}
+end
+
+local function NoteLine(a, b, r)
+    hazardShapes[#hazardShapes + 1] = {kind = "line", a = a, b = b, r = r}
+end
+
+-- Is this world point inside a known hazard? Pure maths over a short
+-- list - typically a handful of entries.
+function HazardAt(p)
+    for _, h in ipairs(hazardShapes) do
+        if h.kind == "disc" then
+            local dx, dz = p.X - h.x, p.Z - h.z
+            if (dx * dx + dz * dz) < (h.r * h.r)
+            and math.abs(p.Y - h.y) < 14 then return true end
+        elseif h.kind == "box" then
+            local rel = h.cf:PointToObjectSpace(p)
+            if math.abs(rel.X) < h.hx and math.abs(rel.Z) < h.hz
+            and math.abs(rel.Y) < 14 then return true end
+        else
+            local ab = h.b - h.a
+            local len2 = ab:Dot(ab)
+            if len2 > 0.01 then
+                local t = math.clamp((p - h.a):Dot(ab) / len2, 0, 1)
+                local n = h.a + ab * t
+                local dx, dz = p.X - n.X, p.Z - n.Z
+                if (dx * dx + dz * dz) < (h.r * h.r)
+                and math.abs(p.Y - n.Y) < 12 then return true end
+            end
+        end
+    end
+    return false
+end
+
 local function ScanTelegraphs()
     if not CONFIG.DodgeTelegraph then return nil end
     local root = GetRoot()
@@ -2344,6 +2435,7 @@ local function ScanTelegraphs()
             end
             if math.abs(s.X - s.Z) < 2 or round then
                 local r = math.max(s.X, s.Z) / 2 + CONFIG.TelegraphPad
+                NoteDisc(o.Position.X, o.Position.Y, o.Position.Z, r)
                 local away = Vector3.new(pos.X - o.Position.X, 0,
                                          pos.Z - o.Position.Z)
                 local d = away.Magnitude
@@ -2368,6 +2460,7 @@ local function ScanTelegraphs()
                 local rel = o.CFrame:PointToObjectSpace(pos)
                 local hx  = o.Size.X / 2 + CONFIG.TelegraphPad
                 local hz  = o.Size.Z / 2 + CONFIG.TelegraphPad
+                NoteBox(o.CFrame, hx, hz, o.Position.Y)
                 if math.abs(rel.X) < hx and math.abs(rel.Z) < hz
                 and math.abs(rel.Y) < 14 then
                     local outX = hx - math.abs(rel.X)  -- cost to leave sideways
@@ -2479,7 +2572,8 @@ local function EscapeFromLine(pos, c, axis, half, clear)
 end
 
 -- Escape from a long thin part, treating it as a line.
-local function EscapeFromBeamPart(pos, o)
+-- The long axis of a beam-shaped part, as a segment plus a radius.
+local function BeamSegment(o)
     local s = o.Size
     local axis, half
     if s.X >= s.Y and s.X >= s.Z then
@@ -2493,8 +2587,13 @@ local function EscapeFromBeamPart(pos, o)
         half = s.Z / 2
     end
     local thin = math.min(s.X, s.Y, s.Z)
-    return EscapeFromLine(pos, o.Position, axis, half,
-        thin / 2 + CONFIG.BeamPad)
+    return axis, half, thin / 2 + CONFIG.BeamPad
+end
+
+local function EscapeFromBeamPart(pos, o)
+    local axis, half, r = BeamSegment(o)
+    NoteLine(o.Position - axis * half, o.Position + axis * half, r)
+    return EscapeFromLine(pos, o.Position, axis, half, r)
 end
 
 local function ScanBeams()
@@ -2519,6 +2618,7 @@ local function ScanBeams()
             if okA and okB then
                 local seg = b - a
                 if seg.Magnitude > 1 then
+                    NoteLine(a, b, CONFIG.BeamPad)
                     local esc = EscapeFromLine(pos, (a + b) / 2,
                         seg.Unit, seg.Magnitude / 2, CONFIG.BeamPad)
                     if esc then
@@ -2579,7 +2679,13 @@ local function ScanHazards()
         return hazardCache.escape
     end
     hazardCache.t = now
+    -- Rebuilt every sweep. The two scanners fill it as they go, so the
+    -- footprint list is a free by-product of work already being done.
+    table.clear(hazardShapes)
     hazardCache.escape = ScanTelegraphs() or ScanBeams()
+    if CONFIG.HazardDebug and #hazardShapes > 0 then
+        print(("[DQR] %d hazard footprint(s)."):format(#hazardShapes))
+    end
     return hazardCache.escape
 end
 
@@ -2676,6 +2782,17 @@ local function BestOrbitAngle(mobPos, radius, targetModel, pos, natural)
 
         -- And prefer somewhere we can actually walk to.
         if not LineClear(pos, p) then score = score - 25 end
+
+        -- Do not circle INTO a beam, and do not cross one on the way.
+        -- Two maths lookups against a short list - no raycasts, no
+        -- instance access, and nothing added to the frame handler.
+        if CONFIG.AvoidHazardPaths then
+            if HazardAt(p) then
+                score = score - 300
+            elseif HazardAt((pos + p) * 0.5) then
+                score = score - 200
+            end
+        end
 
         if score > bestScore then bestA, bestScore = a, score end
     end
@@ -3332,7 +3449,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v8.0 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
+    print("[DQR] v8.4 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
