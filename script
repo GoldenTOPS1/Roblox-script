@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v9.3
+--  DQR AUTO FARM v9.4
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log
@@ -159,7 +159,9 @@ local CONFIG = {
     -- two 20Hz threads share one scan instead of doing two each.
     MobScanRadius  = 600,    -- outermost ring when nothing is near
     BossHealthHint = 5000,   -- MaxHealth above this counts as an enemy
-                             -- even without a health bar over its head
+                             -- even without a health bar over its head;
+                             -- above this AND no bar over its head = a
+                             -- boss (its bar is at the top of the screen)
     MaxQueryParts  = 2000,   -- cap per query; low values TRUNCATE results
                              -- non-deterministically and hide near mobs
     HazardTTL      = 0.06,   -- telegraph/beam scan rate cap
@@ -2240,8 +2242,8 @@ local function GetNearestMob()
                     -- part) never changes for a given model, so do it
                     -- once and remember it. Running GetDescendants on
                     -- every model on every scan was the expensive half.
-                    local verdict = mobShape[obj]
-                    if verdict == nil then
+                    local shape = mobShape[obj]
+                    if shape == nil then
                         local hasBB = false
                         for _, c in ipairs(obj:GetDescendants()) do
                             if c:IsA("BillboardGui") or c:IsA("Highlight") then
@@ -2259,10 +2261,21 @@ local function GetNearestMob()
                         -- invisible to the bot. A huge health pool is a
                         -- reliable second signal that it is a real
                         -- enemy and not scenery.
-                        local bossy = hum.MaxHealth >= CONFIG.BossHealthHint
-                        verdict = (hasBB and pc >= 2) or (bossy and pc >= 1)
-                        mobShape[obj] = verdict
+                        shape = {ok = (hasBB and pc >= 2) or (bossy and pc >= 1),
+                                 bb = hasBB}
+                        mobShape[obj] = shape
                     end
+                    local verdict = shape.ok
+                    -- A BOSS, as opposed to a big mob: huge health pool
+                    -- AND no health bar over its head. Health alone was
+                    -- the test, and at this dungeon's level every Frost
+                    -- Minion has 9K, so every minion was a "boss" -
+                    -- direct approach, hazard backoff, beam-fan standoff
+                    -- and all - which is why the bot kept backing off
+                    -- ordinary mobs. The minions carry their bars over
+                    -- their heads; the Ice Elemental's is at the top of
+                    -- the screen.
+                    local isBoss = bossy and not shape.bb
                     -- Skip anything the path worker has given up on, so
                     -- we stop pressing into a mountain at a mob on the
                     -- far side of it and go fight something reachable.
@@ -2288,7 +2301,7 @@ local function GetNearestMob()
                         end
                         local d = (mr.Position - root.Position).Magnitude
                         local rec = {Model=obj, Root=mr, Humanoid=hum,
-                                     Distance=d, Boss=bossy, Radius=rad}
+                                     Distance=d, Boss=isBoss, Radius=rad}
                         -- Every live mob goes in the list, blacklisted or
                         -- not: we still need to steer around one we have
                         -- given up on attacking.
@@ -2394,10 +2407,13 @@ local function MobDiag()
                     if c:IsA("BasePart") then pc = pc + 1 end
                 end
                 n = n + 1
-                print(("%s | d=%d hp=%d/%d root=%s anchored=%s bb=%s parts=%d cached=%s")
+                local shape = mobShape[obj]
+                print(("%s | d=%d hp=%d/%d root=%s anchored=%s bb=%s parts=%d cached=%s boss=%s")
                     :format(obj:GetFullName(), d, hum.Health, hum.MaxHealth,
                             mr.Name, tostring(mr.Anchored), tostring(hasBB),
-                            pc, tostring(mobShape[obj])))
+                            pc, tostring(shape and shape.ok),
+                            tostring(hum.MaxHealth >= CONFIG.BossHealthHint
+                                     and not hasBB)))
 
             elseif not hum and d >= 0 and d < 250 then
                 -- A rig with no Humanoid at all would be invisible to
@@ -2829,14 +2845,12 @@ local function CollectTelegraphs(pos)
             -- would pick one of its axes and walk us along a chord;
             -- the way out of a circle is straight outward from the
             -- centre, and that is also the shortest exit.
-            -- Shape exists only on Part; reading it on a MeshPart or a
-            -- Union throws, and an error in here kills the scan thread.
-            local round = false
-            if o:IsA("Part") then
-                round = o.Shape == Enum.PartType.Cylinder
-                     or o.Shape == Enum.PartType.Ball
-            end
-            if math.abs(a - b) < 2 or round then
+            -- Judged by the footprint alone. "A cylinder Part is a
+            -- ring" used to short-circuit this, and the Frost Wizard's
+            -- laser hitbox is a cylinder lying along the beam - 50 long,
+            -- 2 across - which became a ring 56 studs wide: the huge
+            -- slab that covered the room every time a wizard fired.
+            if math.abs(a - b) < 2 then
                 NoteDisc(o.Position.X, o.Position.Y, o.Position.Z,
                          math.max(a, b) / 2 + CONFIG.TelegraphPad, o)
             else
@@ -3799,10 +3813,10 @@ local function MainLoop()
         -- clear ring can lie outside it, and capping walked the bot
         -- straight back into the fan. Standing safe and idle beats
         -- casting from inside a beam.
-        -- Bosses only. Any two beams near an ordinary mob used to
-        -- count as a fan, and the bot backed twelve studs off every
-        -- wizard for no reason.
-        if target.Boss and hazardCache.radialN >= 2 then
+        -- Bosses only, and a real fan: one beam straight through a
+        -- mob's root reads as a spoke each way, so two "spokes" is a
+        -- single laser, not something to stand back from.
+        if target.Boss and hazardCache.radialN >= 3 then
             hazardBackoff = now + CONFIG.BeamBackoffTime
         end
         if hazardBackoff > now then
@@ -4419,7 +4433,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v9.3 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
+    print("[DQR] v9.4 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
