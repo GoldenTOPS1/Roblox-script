@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v8.4
+--  DQR AUTO FARM v8.5
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -86,6 +86,8 @@ local CONFIG = {
     -- the path worker's thread; nothing is added to the frame handler.
     -- Set false to get exactly the v8.0 behaviour back.
     AvoidHazardPaths = true,
+    LobbyGrace     = 4,      -- lobby UI must be gone this long before
+                             -- anything is allowed to start farming
 
     -- Stand and fight when the mob is not moving
     HoldWhenStill  = true,
@@ -1774,9 +1776,14 @@ local LOBBY_MARKERS = {
     "LobbyInfo", "Replay", "ShowFriends", "ShowPlayers",
 }
 
+local lobbySeenAt = tick()   -- last moment a lobby marker was on screen
+
 local function LobbyMarker()
     for _, k in ipairs(LOBBY_MARKERS) do
-        if PathVisible(UI[k]) then return k end
+        if PathVisible(UI[k]) then
+            lobbySeenAt = tick()
+            return k
+        end
     end
     return nil
 end
@@ -1784,6 +1791,31 @@ end
 local function InLobbyPlace()
     return LobbyMarker() ~= nil
 end
+
+-- How long the lobby has been off screen.
+--
+-- "No lobby marker" is NOT proof of being in a dungeon - it is briefly
+-- true at boot before the GUI loads, and again during the queue
+-- transition when the panels close. Treating that instant as "must be a
+-- dungeon" is what started farm mode in the lobby and sent the bot at
+-- an NPC. Anything that begins farming requires the lobby to have been
+-- gone for a sustained period, not merely absent right now.
+local function NotLobbyFor()
+    LobbyMarker()                    -- refreshes lobbySeenAt
+    return tick() - lobbySeenAt
+end
+
+local function DungeonConfirmed()
+    return NotLobbyFor() >= CONFIG.LobbyGrace
+end
+
+-- Keep the reading fresh even when nothing else is asking.
+task.spawn(function()
+    while true do
+        S(0.5)
+        pcall(LobbyMarker)
+    end
+end)
 
 -- One definition of "lobby", used everywhere. Keeping two slightly
 -- different ones is what let the script believe it was in the lobby and
@@ -3253,6 +3285,18 @@ function Farm.Start()
             .. tostring(LobbyMarker()) .. "' is on screen.")
         return
     end
+    -- The lobby UI vanishing for an instant is not a dungeon. It happens
+    -- while the queue panels close and at boot before the GUI loads,
+    -- and farming in that window sent the bot at the lobby's NPCs.
+    if not DungeonConfirmed() then
+        print(("[DQR] Not farming yet - lobby only gone %.1fs of %.0fs.")
+            :format(NotLobbyFor(), CONFIG.LobbyGrace))
+        return
+    end
+    if lobbyFlowActive then
+        print("[DQR] Not farming - still queueing a dungeon.")
+        return
+    end
     Farm.Running     = true
     loopBeat         = tick()
     Farm.Thread      = task.spawn(Guarded("Main loop", MainLoop))
@@ -3398,7 +3442,11 @@ local function Supervisor()
             continue
         end
 
-        -- Not the lobby: this is a dungeon, so fight.
+        -- Not the lobby. Wait for that to be true for a while before
+        -- calling it a dungeon - during the queue transition the lobby
+        -- panels close for a moment and this branch would fire.
+        if not DungeonConfirmed() then continue end
+
         print("[DQR] Idle outside the lobby - resuming farm.")
         Farm.Start()
         idleSince, reported = tick(), false
@@ -3449,16 +3497,26 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v8.4 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
+    print("[DQR] v8.5 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
 
-    print("[DQR] Lobby marker: " .. tostring(LobbyMarker() or "none"))
+    -- Sample for a few seconds before deciding. PlayerGui is still
+    -- populating right after injection, so a single read taken now can
+    -- report "no lobby" purely because the buttons have not appeared
+    -- yet - and then the bot starts farming the lobby's NPCs.
+    local marker = nil
+    for _ = 1, 8 do
+        marker = LobbyMarker()
+        if marker then break end
+        S(0.5)
+    end
+    print("[DQR] Lobby marker: " .. tostring(marker or "none"))
 
-    if not InLobbyPlace() then
-        -- Not the lobby place: we are already in a run (or loading).
-        print("[DQR] Not the lobby - assuming already in a dungeon.")
+    if not marker then
+        -- Still nothing after several seconds: genuinely in a run.
+        print("[DQR] No lobby UI after 4s - assuming already in a dungeon.")
         Farm.Start()
     elseif CONFIG.AutoRunDungeon then
         RunLobbyFlow()
