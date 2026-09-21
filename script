@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v6.1
+--  DQR AUTO FARM v6.2
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -85,7 +85,10 @@ local CONFIG = {
     -- Pathfinding
     PathMinDist    = 12,     -- only bother pathing past this range
     RepathDist     = 8,      -- target moved this far -> recompute
-    WaypointReach  = 4,      -- waypoint counts as reached within this
+    WaypointReach  = 4,      -- waypoint counts as reached within this (X/Z)
+    WaypointReachY = 6,      -- ...and within this vertically
+    WaypointTimeout= 3,      -- secs failing one waypoint before dropping it
+    SteerDwell     = 1.5,    -- hold a probed heading this long (no ping-pong)
     StuckDist      = 2.5,    -- moved less than this...
     StuckTime      = 1.5,    -- ...for this long = stuck
     AgentMaxSlope  = 45,     -- steeper than this = route around, not up
@@ -505,6 +508,8 @@ local stuckAt    = nil
 local stuckSince = 0
 local forceRepath = false
 local steerDir   = nil   -- fallback heading when no path exists
+local steerUntil = 0     -- keep that heading at least this long
+local wpStuck    = 0     -- seconds spent failing to reach pathQueue[1]
 local unreachable = {}   -- model -> tick() until which to ignore it
 local pathTargetModel = nil  -- what MainLoop is currently chasing
 
@@ -607,7 +612,15 @@ local function PathWorker(getDestFn)
                             ClearPath()
                             -- Do NOT just walk straight: that is what makes
                             -- it grind along a mountainside. Steer around.
-                            steerDir = ClearDirection(root.Position, dest)
+                            -- Hold a heading for a moment once chosen.
+                            -- Re-probing every 0.4s let it flip between
+                            -- two equally-good directions and shuffle.
+                            if not steerDir or tick() > steerUntil
+                            or not LineClear(root.Position,
+                                    root.Position + steerDir * CONFIG.ProbeDist) then
+                                steerDir   = ClearDirection(root.Position, dest)
+                                steerUntil = tick() + CONFIG.SteerDwell
+                            end
                             if pathFail % 5 == 1 then
                                 print("[DQR] No path to target ("
                                     .. pathFail .. ") - "
@@ -762,15 +775,38 @@ local function StartMoving(getDestFn)
         local step = dest
         if #pathQueue > 0 then
             local wp = pathQueue[1]
-            local d  = (Vector3.new(wp.Position.X, 0, wp.Position.Z)
-                      - Vector3.new(pos.X, 0, pos.Z)).Magnitude
-            if d < CONFIG.WaypointReach then
+            local flatD = (Vector3.new(wp.Position.X, 0, wp.Position.Z)
+                         - Vector3.new(pos.X, 0, pos.Z)).Magnitude
+            local dy = wp.Position.Y - pos.Y
+
+            -- A waypoint counts as reached only when we are close in
+            -- BOTH axes. Judging on X/Z alone popped waypoints stacked
+            -- on top of a ledge the instant we stood underneath them -
+            -- so the bot kept re-aiming at the one behind it and walked
+            -- back and forth on the spot without ever climbing up.
+            if flatD < CONFIG.WaypointReach
+            and math.abs(dy) < CONFIG.WaypointReachY then
                 table.remove(pathQueue, 1)
+                wpStuck = 0
                 wp = pathQueue[1]
+            else
+                wpStuck = wpStuck + dt
+                if wpStuck > CONFIG.WaypointTimeout then
+                    -- Cannot get to this one. Drop it and recompute
+                    -- instead of grinding at it forever.
+                    wpStuck = 0
+                    table.remove(pathQueue, 1)
+                    forceRepath = true
+                    wp = pathQueue[1]
+                end
             end
+
             if wp then
                 step = wp.Position
-                if wp.Action == Enum.PathWaypointAction.Jump then
+                -- Jump for a flagged waypoint, and for any real step up:
+                -- the pathfinder does not always mark a ledge.
+                if wp.Action == Enum.PathWaypointAction.Jump
+                or (wp.Position.Y - pos.Y) > 3 then
                     human.Jump = true
                 end
             end
@@ -1930,6 +1966,7 @@ local seeded     = false
 local lastDodge  = 0
 local lastTeleWarn = 0
 local lastCrowdWarn = 0
+local retreating   = false
 
 -- Tracks how long the current target has held position
 local stillModel = nil
@@ -2071,6 +2108,13 @@ local function MainLoop()
         local dist   = target.Distance
         pathTargetModel = target.Model   -- so the path worker can blacklist it
 
+        -- Positioning uses HORIZONTAL distance. target.Distance is 3D, so
+        -- a mob standing on a ledge above reads as far away even when it
+        -- is right on top of us - which flipped the range checks on and
+        -- off and made the bot pace back and forth under the ledge.
+        local flat = (Vector3.new(mobPos.X, 0, mobPos.Z)
+                    - Vector3.new(root.Position.X, 0, root.Position.Z)).Magnitude
+
         -- Always face mob
         if not faceTarget then
             StartFacing(function()
@@ -2126,7 +2170,15 @@ local function MainLoop()
         -- bot sitting inside the mob's swing arc taking hits while it
         -- slowly drifted outward. Melee keeps firing while retreating,
         -- because DoMelee was already called above on this frame.
-        if dist < CONFIG.MinRange then
+        -- Deadband, or it flips between retreating and advancing on
+        -- every frame while hovering right at MinRange.
+        if retreating then
+            if flat >= CONFIG.CircleRadius * 0.95 then retreating = false end
+        elseif flat < CONFIG.MinRange then
+            retreating = true
+        end
+
+        if retreating then
             local away = Vector3.new(root.Position.X - mobPos.X, 0,
                                      root.Position.Z - mobPos.Z)
             if away.Magnitude < 0.5 then
@@ -2156,7 +2208,7 @@ local function MainLoop()
 
         if CONFIG.HoldWhenStill
         and (now - stillSince) > CONFIG.MobStillTime
-        and dist <= CONFIG.MaxRange then
+        and flat <= CONFIG.MaxRange then
             currentDest = nil          -- stand still, keep attacking
             ShowRangeBar(root, mobPos, dist)
             S(CONFIG.ScanRate)
@@ -2202,7 +2254,7 @@ local function MainLoop()
         -- we actually arrive at it. Being too CLOSE is handled by the
         -- retreat branch above, which exits before reaching here.
         local radius = CONFIG.CircleRadius
-        if dist > CONFIG.MaxRange then
+        if flat > CONFIG.MaxRange then
             radius = CONFIG.CircleRadius * 0.85
         end
 
@@ -2528,7 +2580,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v6.1 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v6.2 loaded.  F5 farm  F6 dump  F7 show/hide log")
     ApplyClass()
     NukeGraphics()
     S(2.5)
