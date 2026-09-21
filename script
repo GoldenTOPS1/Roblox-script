@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v8.9
+--  DQR AUTO FARM v8.8
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log
@@ -102,7 +102,12 @@ local CONFIG = {
     -- there is nothing to measure.
     BeamGapWant    = 5,
     BeamSpread     = 12,
-    BeamBackoffTime= 6,      -- seconds to stay backed off after a hazard
+    BeamBackoffTime= 6,      -- seconds to stay backed off after the
+                             -- spokes are gone
+    BeamBackoffMax = 70,     -- never further out than this. NOT capped
+                             -- at spell range: with twenty spokes the
+                             -- first clear ring is outside it, and
+                             -- capping walked the bot back into the fan
     HoldSlack      = 2,      -- within CircleRadius + this = at fighting distance
     EscapeMaxDist  = 30,     -- furthest one hazard escape will move us
     EscapeClearWant= 7,      -- clearance from a hazard edge that counts as safe
@@ -2660,28 +2665,38 @@ end
 -- ============================================================
 local hazardShapes = {}
 
+-- A footprint this far across in its narrow direction cannot be
+-- stepped out of within an escape's reach, and while it is in the
+-- list every point around us reads as "inside", which hides the
+-- hazards that CAN be dodged. Kept, but skipped when that happens.
+local HUGE = 35
+
 local function NoteDisc(cx, cy, cz, r)
     hazardShapes[#hazardShapes + 1] =
-        {kind = "disc", x = cx, y = cy, z = cz, r = r}
+        {kind = "disc", x = cx, y = cy, z = cz, r = r, huge = r > HUGE}
 end
 
 local function NoteBox(cf, hx, hz, cy)
     hazardShapes[#hazardShapes + 1] =
-        {kind = "box", cf = cf, hx = hx, hz = hz, y = cy}
+        {kind = "box", cf = cf, hx = hx, hz = hz, y = cy,
+         huge = math.min(hx, hz) > HUGE}
 end
 
 local function NoteLine(a, b, r)
-    hazardShapes[#hazardShapes + 1] = {kind = "line", a = a, b = b, r = r}
+    hazardShapes[#hazardShapes + 1] =
+        {kind = "line", a = a, b = b, r = r, huge = r > HUGE}
 end
 
 -- How far this world point is from the nearest hazard edge: negative
 -- means inside one, by that much. Pure maths over a short list -
 -- typically a handful of entries.
-local function HazardClearance(p)
+local function HazardClearance(p, ignoreHuge)
     local best = math.huge
     for _, h in ipairs(hazardShapes) do
         local c = nil
-        if h.kind == "disc" then
+        if ignoreHuge and h.huge then
+            -- skip
+        elseif h.kind == "disc" then
             if math.abs(p.Y - h.y) < 14 then
                 local dx, dz = p.X - h.x, p.Z - h.z
                 c = math.sqrt(dx * dx + dz * dz) - h.r
@@ -2960,6 +2975,17 @@ local function CollectBeams(pos)
                 r = CONFIG.BeamPad
             elseif ad:IsA("CylinderHandleAdornment") then
                 local h = ad.Height / 2
+                if math.abs(cf.LookVector.Y) > 0.7 then
+                    -- Standing on end: a disc painted on the floor -
+                    -- the ring under the boss that the spokes fan out
+                    -- across. As a "line" this covered the whole
+                    -- arena in one footprint.
+                    if (cf.Position - pos).Magnitude < reach + ad.Radius then
+                        NoteDisc(cf.Position.X, cf.Position.Y, cf.Position.Z,
+                                 ad.Radius + CONFIG.TelegraphPad)
+                    end
+                    return
+                end
                 a = cf.Position - cf.LookVector * h
                 b = cf.Position + cf.LookVector * h
                 r = ad.Radius + CONFIG.BeamPad
@@ -2989,11 +3015,14 @@ local function CollectBeams(pos)
 end
 
 -- Are the line hazards spokes radiating from `c`? Returns how many
--- are, and the smallest angle between two neighbouring spokes (nil
--- when there are fewer than three to measure).
+-- are, the smallest angle between two neighbouring spokes (nil when
+-- there are fewer than three to measure), and the widest spoke's
+-- radius, pad included.
 local function RadialSpokes(c)
     local angs = {}
-    local function Spoke(a, b)
+    local rMax = CONFIG.BeamPad
+    local function Spoke(a, b, r)
+        if r and r > rMax then rMax = r end
         local ab = b - a
         local len2 = ab:Dot(ab)
         if len2 < 0.01 then return end
@@ -3014,18 +3043,19 @@ local function RadialSpokes(c)
         end
     end
     for _, h in ipairs(hazardShapes) do
-        if h.kind == "line" then
-            Spoke(h.a, h.b)
+        if h.kind == "line" and not h.huge then
+            Spoke(h.a, h.b, h.r)
         elseif h.kind == "box"
         and math.max(h.hx, h.hz) > 3 * math.min(h.hx, h.hz) then
             -- A long strip is a beam painted on the floor.
             local axis = h.hx >= h.hz and h.cf.RightVector
                        or h.cf:VectorToWorldSpace(Vector3.new(0, 0, 1))
             local half = math.max(h.hx, h.hz)
-            Spoke(h.cf.Position - axis * half, h.cf.Position + axis * half)
+            Spoke(h.cf.Position - axis * half, h.cf.Position + axis * half,
+                  math.min(h.hx, h.hz))
         end
     end
-    if #angs < 3 then return #angs, nil end
+    if #angs < 3 then return #angs, nil, rMax end
     table.sort(angs)
     -- Drop duplicates: the same beam seen as both a Beam and a part.
     local u = {angs[1]}
@@ -3033,13 +3063,13 @@ local function RadialSpokes(c)
         if angs[i] - u[#u] > 0.05 then u[#u + 1] = angs[i] end
     end
     if #u > 1 and u[1] + 2 * math.pi - u[#u] <= 0.05 then table.remove(u) end
-    if #u < 3 then return #u, nil end
+    if #u < 3 then return #u, nil, rMax end
     local minGap = u[1] + 2 * math.pi - u[#u]
     for i = 2, #u do
         local g = u[i] - u[i - 1]
         if g < minGap then minGap = g end
     end
-    return #u, minGap
+    return #u, minGap, rMax
 end
 
 local ESCAPE_DIRS = {}
@@ -3056,8 +3086,14 @@ end
 -- pick outward when the hazards radiate from the mob (the gaps widen
 -- with distance) and keeps it inside `keepWithin` of the mob so we can
 -- go on casting.
-local function FindEscape(pos, mobPos, keepWithin, outward)
+-- `ignoreHuge` drops footprints too big to step out of (see HUGE):
+-- with one of those under everything, every sample reads "inside" and
+-- the spokes that CAN be dodged are invisible behind it. The last
+-- resort is the least-bad point: still inside something, but deeper
+-- into a gap than where we stand.
+local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
     local clean, crossing = {}, {}
+    local bestBad, bestBadC = nil, HazardClearance(pos, ignoreHuge) + 2
     local flatNow = 0
     if mobPos then
         flatNow = Vector3.new(pos.X - mobPos.X, 0, pos.Z - mobPos.Z).Magnitude
@@ -3066,11 +3102,12 @@ local function FindEscape(pos, mobPos, keepWithin, outward)
         local wasClear, crossed = false, false
         for d = 3, CONFIG.EscapeMaxDist, 3 do
             local p = pos + dir * d
-            local c = HazardClearance(p)
+            local c = HazardClearance(p, ignoreHuge)
             if c <= 0 then
                 -- Back inside something after having been clear: this
                 -- heading crosses a second hazard to get anywhere.
                 if wasClear then crossed = true end
+                if c > bestBadC then bestBad, bestBadC = p, c end
             else
                 wasClear = true
                 local score = math.min(c, CONFIG.EscapeClearWant) * 2 - d * 0.5
@@ -3097,6 +3134,9 @@ local function FindEscape(pos, mobPos, keepWithin, outward)
             local p = list[i].p
             if LineClear(pos, p) and HasGround(p) then return p end
         end
+    end
+    if bestBad and LineClear(pos, bestBad) and HasGround(bestBad) then
+        return bestBad
     end
     return nil
 end
@@ -3157,7 +3197,7 @@ end
 -- One call for every "get out of the way" test. Cached: two 20Hz
 -- threads poll this, and re-running the scans 40 times a second was a
 -- large part of the in-combat lag.
-hazardCache = {t = 0, escape = nil, radial = false,
+hazardCache = {t = 0, escape = nil, radial = false, radialN = 0,
                backoffR = nil, backoffFor = nil,
                holdP = nil, holdUntil = 0}
 
@@ -3192,43 +3232,58 @@ function ScanHazards()
     CollectBeams(pos)
     if CONFIG.HazardDebug then pcall(DrawHazards) end
 
-    local esc = nil
-    if #hazardShapes > 0 and HazardAt(pos) then
-        local mobPos, keep, outward = nil, nil, false
-        local tgt = cachedTarget
-        if tgt and tgt.Root and tgt.Root.Parent then
-            mobPos = tgt.Root.Position
-            keep   = CONFIG.AttackRange + (tgt.Radius or 0) - 3
-            -- A standoff measured against one boss says nothing about
-            -- the next one.
-            if hazardCache.backoffFor ~= tgt.Model then
-                hazardCache.backoffFor, hazardCache.backoffR = tgt.Model, nil
-            end
-            local n, gap = RadialSpokes(mobPos)
-            outward = n >= 2
+    -- Is the target fanning beams out around itself? Measured every
+    -- sweep, not only once we are hit: the main loop keeps its
+    -- distance for as long as the spokes are on the floor, and the
+    -- old "six seconds after the last hit" walked the bot back into a
+    -- fan that was still there.
+    local mobPos, keep = nil, nil
+    local tgt = cachedTarget
+    hazardCache.radialN = 0
+    if tgt and tgt.Root and tgt.Root.Parent then
+        mobPos = tgt.Root.Position
+        keep   = CONFIG.AttackRange + (tgt.Radius or 0) - 3
+        -- A standoff measured against one boss says nothing about the
+        -- next one.
+        if hazardCache.backoffFor ~= tgt.Model then
+            hazardCache.backoffFor, hazardCache.backoffR = tgt.Model, nil
+        end
+        if #hazardShapes > 0 then
+            local n, gap, rMax = RadialSpokes(mobPos)
+            hazardCache.radialN = n
             if gap then
                 -- Far enough out that neighbouring beams leave
-                -- BeamGapWant studs of floor between their pads.
-                hazardCache.backoffR = math.min(keep,
-                    (2 * CONFIG.BeamPad + CONFIG.BeamGapWant) / gap)
+                -- BeamGapWant studs of floor between their pads - the
+                -- pads of the beams as they actually are, since the
+                -- thick ones need more room than the hairlines.
+                hazardCache.backoffR = math.min(CONFIG.BeamBackoffMax,
+                    (2 * rMax + CONFIG.BeamGapWant) / gap)
             end
         end
-        hazardCache.radial = outward
+    end
+    local outward = hazardCache.radialN >= 2
+    hazardCache.radial = outward
 
+    local esc = nil
+    if #hazardShapes > 0 and HazardAt(pos) then
         -- Keep a chosen exit for a moment rather than re-picking every
         -- sweep and zig-zagging between two equally good ones.
         local held = hazardCache.holdP
         if held and now < hazardCache.holdUntil
-        and HazardClearance(held) > 0 then
+        and HazardClearance(held, true) > 0 then
             esc = held
         else
+            local how = "clear"
             esc = FindEscape(pos, mobPos, keep, outward)
+            if not esc then
+                how = "clear of what can be dodged"
+                esc = FindEscape(pos, mobPos, keep, outward, true)
+            end
             hazardCache.holdP, hazardCache.holdUntil = esc, now + 0.8
             if CONFIG.HazardDebug then
-                print(("[DQR] In a hazard (%d footprint(s), %s) - %s")
-                    :format(#hazardShapes,
-                            outward and "radial" or "not radial",
-                            esc and "escaping" or "NO EXIT FOUND"))
+                print(("[DQR] In a hazard (%d footprint(s), %d spokes) - %s")
+                    :format(#hazardShapes, hazardCache.radialN,
+                            esc and ("moving " .. how) or "NO EXIT FOUND"))
             end
         end
     else
@@ -3625,15 +3680,21 @@ local function MainLoop()
         local spellR = CONFIG.AttackRange  + tRad
 
         -- Radial beams fan out from the boss, so the gaps between them
-        -- are narrow up close and wide further out. After one has
-        -- forced us to move, fight from further out for a few seconds -
-        -- from where the last volley showed there was room to step
-        -- between them - and raise MinRange with it so the retreat
-        -- branch below actually walks us out there.
+        -- are narrow up close and wide further out. While the spokes
+        -- are on the floor - and for a few seconds after - fight from
+        -- where there is room to step between them, and raise MinRange
+        -- with it so the retreat branch below actually walks us out
+        -- there. Not capped at spell range: with twenty spokes the
+        -- first clear ring lies outside it, and capping walked the bot
+        -- straight back into the fan. Standing safe and idle beats
+        -- casting from inside a beam.
+        if hazardCache.radialN >= 2 then
+            hazardBackoff = now + CONFIG.BeamBackoffTime
+        end
         if hazardBackoff > now then
             local want = math.min(
                 hazardCache.backoffR or (ringR + CONFIG.BeamSpread),
-                spellR - 3)
+                CONFIG.BeamBackoffMax)
             if want > ringR then
                 ringR = want
                 maxR  = math.max(maxR, ringR + 6)
@@ -3672,13 +3733,12 @@ local function MainLoop()
         -- there is no point orbiting prettily inside the damage zone.
         local escape = ScanHazards()
         if escape then
-            -- Beams radiating from the mob - or any hazard at all from a
-            -- boss: for the next few seconds fight from further back,
-            -- where there is room between them. Without this the hold
-            -- branch walked us straight back into the fan the moment
-            -- the escape had us clear of it. The escape itself is
-            -- already biased outward.
-            if hazardCache.radial or target.Boss then
+            -- Any hazard at all from a boss: for the next few seconds
+            -- fight from further back. (A beam fan keeps the backoff
+            -- alive by itself, above, for as long as it is there.)
+            -- Without this the hold branch walked us straight back
+            -- into the hazard the moment the escape had us clear of it.
+            if target.Boss then
                 hazardBackoff = now + CONFIG.BeamBackoffTime
             end
             currentDest = Vector3.new(escape.X, root.Position.Y, escape.Z)
@@ -4245,7 +4305,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v8.6 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
+    print("[DQR] v8.8 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
