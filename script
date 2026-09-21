@@ -5,8 +5,8 @@
 -- ============================================================
 
 local CONFIG = {
-    TargetDungeon  = "Desert Temple",
-    Difficulty     = "Insane",
+    TargetDungeon  = "Winter Outpost",
+    Difficulty     = "Easy",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
     UseRemotes     = false,  -- blind-firing guessed remotes; off by default
