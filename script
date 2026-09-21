@@ -1,7 +1,7 @@
 -- ============================================================
---  DQR AUTO FARM v4.7
---  Axiom Build — No mouse clicks, CFrame movement,
---  melee + spells, full speed, remote-based dungeon queue
+--  DQR AUTO FARM v4.8
+--  Humanoid:Move walking + PathfindingService, melee + spells,
+--  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
 
 local CONFIG = {
@@ -21,13 +21,25 @@ local CONFIG = {
     DodgeStep      = 18,
     AttackRate     = 0.3,    -- spell cast rate
     MeleeRate      = 0.2,    -- melee swing rate
-    WalkSpeed      = 16,
+    WalkSpeed      = 0,      -- 0 = keep the character's own speed
     CircleRadius   = 18,
     CircleSpeed    = 0.85,
     ScanRate       = 0.05,
     AimCamera      = true,   -- point the camera at the mob (DQR aims from camera)
     CameraHeight   = 12,
     CameraBack     = 14,
+
+    -- Pathfinding
+    PathMinDist    = 12,     -- only bother pathing past this range
+    RepathDist     = 8,      -- target moved this far -> recompute
+    WaypointReach  = 4,      -- waypoint counts as reached within this
+    StuckDist      = 2.5,    -- moved less than this...
+    StuckTime      = 1.5,    -- ...for this long = stuck
+
+    -- Range bar
+    ShowRangeBar   = true,
+    BarWidth       = 1.4,
+    BarMaxLen      = 120,
 }
 
 local Players          = game:GetService("Players")
@@ -213,7 +225,7 @@ local function BuildLogGui()
         if Copy(all) then
             copyBtn.Text = "Copied!"
         else
-            -- No clipboard global — select the text so Ctrl+C works
+            -- No clipboard global - select the text so Ctrl+C works
             LogBox.TextEditable = true
             LogBox:CaptureFocus()
             LogBox.SelectionStart = 1
@@ -307,24 +319,135 @@ local function GetHuman()
     local c = GetChar() return c and c:FindFirstChildOfClass("Humanoid")
 end
 
+-- Declared early: the raycast in LineClear has to exclude it.
+local RangeBarPart = nil
+
 -- ============================================================
---  MOVEMENT — pure CFrame stepping, no MoveTo, no velocity
---  Delta blocks MoveTo in dungeons — CFrame teleport is
---  the only reliable way to move in executor context
+--  MOVEMENT - real humanoid walking + PathfindingService
+--
+--  Up to v4.7 this wrote root.CFrame directly every heartbeat. That is a
+--  teleport, not a walk, and it explains two bugs at once:
+--    * no walk animation - the Humanoid never gets a MoveDirection, so
+--      the animation state machine has nothing to play;
+--    * getting stuck on walls - each step is only WalkSpeed*dt (~0.27
+--      studs), so the character grinds into geometry and physics shoves
+--      it straight back out, forever.
+--  Humanoid:Move drives the real character controller: animation,
+--  collision and wall-sliding all work. PathfindingService then routes
+--  around geometry instead of walking face-first into it.
 -- ============================================================
---  ONE connection owns the root CFrame. Two connections both writing
---  root.CFrame fight each other every frame — that was why the character
---  ended up staring off into space instead of at the mob.
+local PathfindingService = game:GetService("PathfindingService")
+
 local moveConn   = nil
 local faceTarget = nil   -- function returning the Vector3 to look at, or nil
+local pathQueue  = {}    -- waypoints still to walk
+local pathGoal   = nil   -- what pathQueue was computed for
+local pathFail   = 0
+local stuckAt    = nil
+local stuckSince = 0
+local forceRepath = false
+
+local function ClearPath()
+    pathQueue = {}
+    pathGoal  = nil
+end
+
+-- Straight line clear? Cheap check so we only pay for a path when a wall
+-- is actually in the way.
+-- Renamed from Blacklist in 2022; support both.
+local EXCLUDE = (function()
+    local ok, v = pcall(function() return Enum.RaycastFilterType.Exclude end)
+    if ok and v then return v end
+    return Enum.RaycastFilterType.Blacklist
+end)()
+
+local function LineClear(from, to)
+    local char = GetChar()
+    local p = RaycastParams.new()
+    p.FilterType = EXCLUDE
+    p.FilterDescendantsInstances = {char, RangeBarPart}
+    local a = from + Vector3.new(0, 1.5, 0)
+    local b = to   + Vector3.new(0, 1.5, 0)
+    local d = b - a
+    if d.Magnitude < 1 then return true end
+    local hit = workspace:Raycast(a, d, p)
+    if not hit then return true end
+    -- Ignore things a walking character passes through anyway
+    if not hit.Instance.CanCollide then return true end
+    return false
+end
+
+local function ComputePath(from, to)
+    local path = PathfindingService:CreatePath({
+        AgentRadius   = 3,
+        AgentHeight   = 5,
+        AgentCanJump  = true,
+        AgentMaxSlope = 60,
+    })
+    local ok = pcall(function() path:ComputeAsync(from, to) end)
+    if not ok or path.Status ~= Enum.PathStatus.Success then return nil end
+    local wps, out = path:GetWaypoints(), {}
+    for i = 2, #wps do out[#out + 1] = wps[i] end  -- [1] is where we stand
+    if #out == 0 then return nil end
+    return out
+end
+
+-- Runs on its own thread: ComputeAsync yields and must never be called
+-- from inside a Heartbeat handler.
+local function PathWorker(getDestFn)
+    task.spawn(function()
+        while moveConn do
+            S(0.4)
+            local root = GetRoot()
+            local dest = getDestFn()
+            if root and dest then
+                local flat = (Vector3.new(dest.X, 0, dest.Z)
+                            - Vector3.new(root.Position.X, 0, root.Position.Z)).Magnitude
+                local needPath = forceRepath
+                    or (flat > CONFIG.PathMinDist and not LineClear(root.Position, dest))
+
+                if needPath then
+                    local moved = pathGoal and (dest - pathGoal).Magnitude or 1e9
+                    if forceRepath or moved > CONFIG.RepathDist or #pathQueue == 0 then
+                        local wps = ComputePath(root.Position, dest)
+                        forceRepath = false
+                        if wps then
+                            pathQueue = wps
+                            pathGoal  = dest
+                            pathFail  = 0
+                        else
+                            pathFail = pathFail + 1
+                            ClearPath()
+                            if pathFail % 5 == 1 then
+                                print("[DQR] No path to target ("
+                                    .. pathFail .. ") - walking straight.")
+                            end
+                        end
+                    end
+                elseif #pathQueue > 0 and LineClear(root.Position, dest) then
+                    ClearPath()  -- wall cleared, go direct again
+                end
+            end
+        end
+    end)
+end
 
 local function StartMoving(getDestFn)
     if moveConn then moveConn:Disconnect() end
+    ClearPath()
+    forceRepath = false
+    stuckAt, stuckSince = nil, 0
 
-    -- Humanoid.AutoRotate re-orients the character from its own move
-    -- direction every frame and overwrites our facing. Kill it.
     local h0 = GetHuman()
-    if h0 then pcall(function() h0.AutoRotate = false end) end
+    if h0 then
+        -- AutoRotate re-orients the character from its own move direction
+        -- every frame and would overwrite our facing.
+        pcall(function() h0.AutoRotate = false end)
+        -- 0 = leave the character's own speed alone (gear/buffs apply)
+        if CONFIG.WalkSpeed > 0 then
+            pcall(function() h0.WalkSpeed = CONFIG.WalkSpeed end)
+        end
+    end
 
     moveConn = RunService.Heartbeat:Connect(function(dt)
         local root  = GetRoot()
@@ -332,41 +455,73 @@ local function StartMoving(getDestFn)
         if not root or not human then return end
         if human.AutoRotate then human.AutoRotate = false end
 
-        local pos = root.Position
-
-        -- Step toward destination at WalkSpeed (position only)
+        local pos  = root.Position
         local dest = getDestFn()
-        if dest then
-            local dir  = Vector3.new(dest.X - pos.X, 0, dest.Z - pos.Z)
-            local dist = dir.Magnitude
-            if dist > 1 then
-                local step = math.min(dist, CONFIG.WalkSpeed * dt)
-                local np   = pos + dir.Unit * step
-                pos = Vector3.new(np.X, pos.Y, np.Z)
+
+        -- Follow the path queue when we have one, else head straight
+        local step = dest
+        if #pathQueue > 0 then
+            local wp = pathQueue[1]
+            local d  = (Vector3.new(wp.Position.X, 0, wp.Position.Z)
+                      - Vector3.new(pos.X, 0, pos.Z)).Magnitude
+            if d < CONFIG.WaypointReach then
+                table.remove(pathQueue, 1)
+                wp = pathQueue[1]
+            end
+            if wp then
+                step = wp.Position
+                if wp.Action == Enum.PathWaypointAction.Jump then
+                    human.Jump = true
+                end
             end
         end
 
-        -- Look direction: at the mob if we have one, else along travel
+        -- Walk. This is what makes the animation play.
+        if step then
+            local dir = Vector3.new(step.X - pos.X, 0, step.Z - pos.Z)
+            if dir.Magnitude > 1 then
+                human:Move(dir.Unit, false)
+            else
+                human:Move(Vector3.zero, false)
+            end
+        else
+            human:Move(Vector3.zero, false)
+        end
+
+        -- Stuck detection: real walking can be blocked, so notice it and
+        -- ask for a fresh path (plus a hop to clear small ledges).
+        if dest and (dest - pos).Magnitude > CONFIG.WaypointReach then
+            local now = tick()
+            if not stuckAt or (pos - stuckAt).Magnitude > CONFIG.StuckDist then
+                stuckAt, stuckSince = pos, now
+            elseif now - stuckSince > CONFIG.StuckTime then
+                stuckAt, stuckSince = pos, now
+                human.Jump  = true
+                forceRepath = true
+                print("[DQR] Stuck - jumping and repathing.")
+            end
+        else
+            stuckAt = nil
+        end
+
+        -- Rotation only: position is the Humanoid's business now.
         local look = nil
         local fp = faceTarget and faceTarget() or nil
         if fp then
             local d = Vector3.new(fp.X - pos.X, 0, fp.Z - pos.Z)
             if d.Magnitude > 0.5 then look = d.Unit end
         end
-        if not look and dest then
-            local d = Vector3.new(dest.X - pos.X, 0, dest.Z - pos.Z)
+        if not look and step then
+            local d = Vector3.new(step.X - pos.X, 0, step.Z - pos.Z)
             if d.Magnitude > 0.5 then look = d.Unit end
         end
-
         if look then
             root.CFrame = CFrame.lookAt(pos, pos + look)
-        else
-            root.CFrame = root.CFrame - root.CFrame.Position + pos
         end
 
-        -- Aim the camera at the mob too — DQR resolves attacks from the
+        -- Aim the camera at the mob too - DQR resolves attacks from the
         -- camera/mouse ray, not from the character's own facing.
-        if CONFIG.AimCamera and fp then
+        if CONFIG.AimCamera and fp and look then
             local cam = workspace.CurrentCamera
             if cam then
                 if cam.CameraType ~= Enum.CameraType.Scriptable then
@@ -378,6 +533,8 @@ local function StartMoving(getDestFn)
             end
         end
     end)
+
+    PathWorker(getDestFn)
 end
 
 local function StopMoving()
@@ -385,6 +542,9 @@ local function StopMoving()
         moveConn:Disconnect()
         moveConn = nil
     end
+    ClearPath()
+    local hm = GetHuman()
+    if hm then pcall(function() hm:Move(Vector3.zero, false) end) end
     local h = GetHuman()
     if h then pcall(function() h.AutoRotate = true end) end
     local cam = workspace.CurrentCamera
@@ -395,7 +555,7 @@ local function StopMoving()
 end
 
 -- ============================================================
---  FACE MOB — feeds the single movement connection above
+--  FACE MOB - feeds the single movement connection above
 -- ============================================================
 local function StartFacing(getPosFn) faceTarget = getPosFn end
 local function StopFacing()          faceTarget = nil     end
@@ -403,27 +563,48 @@ local function StopFacing()          faceTarget = nil     end
 -- ============================================================
 --  WALK LINE
 -- ============================================================
-local WalkLinePart = nil
-local function ShowWalkLine(from, to)
-    if WalkLinePart and WalkLinePart.Parent then WalkLinePart:Destroy() end
-    local len = (to - from).Magnitude
-    if len < 0.5 then return end
-    local p = Instance.new("Part")
-    p.Name = "DQR_Line" p.Anchored = true p.CanCollide = false
-    p.CastShadow = false p.Material = Enum.Material.Neon
-    p.Color = Color3.fromRGB(80, 200, 255) p.Transparency = 0.3
-    p.Size = Vector3.new(0.1, 0.1, len)
-    p.CFrame = CFrame.lookAt((from+to)/2, to)
-    p.Parent = workspace WalkLinePart = p
-end
-local function ClearWalkLine()
-    if WalkLinePart and WalkLinePart.Parent then
-        WalkLinePart:Destroy() WalkLinePart = nil
+-- Red bar laid out in front of the character, pointing at the current
+-- mob. Its length IS the distance to that mob, so it shrinks as you
+-- close in and stretches as the mob runs away.
+local function ShowRangeBar(root, mobPos, dist)
+    if not CONFIG.ShowRangeBar then return end
+    if not RangeBarPart or not RangeBarPart.Parent then
+        local p = Instance.new("Part")
+        p.Name        = "DQR_RangeBar"
+        p.Anchored    = true
+        p.CanCollide  = false
+        p.CanQuery    = false
+        p.CanTouch    = false
+        p.CastShadow  = false
+        p.Material    = Enum.Material.Neon
+        p.Color       = Color3.fromRGB(255, 45, 45)
+        p.Transparency = 0.3
+        p.Parent      = workspace
+        RangeBarPart  = p
     end
+
+    local dir = Vector3.new(mobPos.X - root.Position.X, 0,
+                            mobPos.Z - root.Position.Z)
+    if dir.Magnitude < 0.1 then return end
+    dir = dir.Unit
+
+    local len  = math.clamp(dist, 1, CONFIG.BarMaxLen)
+    local base = root.Position - Vector3.new(0, 2.6, 0)
+    local mid  = base + dir * (len / 2)
+
+    RangeBarPart.Size  = Vector3.new(CONFIG.BarWidth, 0.12, len)
+    RangeBarPart.CFrame = CFrame.lookAt(mid, mid + dir)
+end
+
+local function ClearRangeBar()
+    if RangeBarPart and RangeBarPart.Parent then
+        RangeBarPart:Destroy()
+    end
+    RangeBarPart = nil
 end
 
 -- ============================================================
---  REMOTE SCANNER — finds RemoteEvents / RemoteFunctions
+--  REMOTE SCANNER - finds RemoteEvents / RemoteFunctions
 --  DQR uses remotes for dungeon queuing under ReplicatedStorage
 -- ============================================================
 local RS = game:GetService("ReplicatedStorage")
@@ -450,11 +631,11 @@ local function PrintRemotes()
 end
 
 -- ============================================================
---  DUNGEON QUEUE — via RemoteEvent fire instead of clicking
+--  DUNGEON QUEUE - via RemoteEvent fire instead of clicking
 --  DQR remote names discovered at runtime via PrintRemotes()
 -- ============================================================
 local KNOWN_DUNGEON_REMOTES = {
-    -- Common patterns in DQR — will match whichever exists
+    -- Common patterns in DQR - will match whichever exists
     "CreateDungeon",
     "createDungeon",
     "StartDungeon",
@@ -509,10 +690,10 @@ local function TryFireDungeonRemote()
 end
 
 -- ============================================================
---  DUNGEON QUEUE — fallback button fire (no click, direct signal)
+--  DUNGEON QUEUE - fallback button fire (no click, direct signal)
 -- ============================================================
 -- ============================================================
---  BUTTON PRESS — the real one.
+--  BUTTON PRESS - the real one.
 --  `signal:Fire()` does NOT exist on RBXScriptSignal; every
 --  `pcall(function() btn.MouseButton1Click:Fire() end)` in v4.3
 --  threw and was silently swallowed, so nothing was ever clicked.
@@ -536,7 +717,7 @@ local function Norm(s) return (s or ""):lower():gsub("%s+", "") end
 
 -- The label of a Roblox button is very often a child TextLabel, not the
 -- button's own .Text. v4.4 only read TextButton.Text, so an ImageButton
--- named "frame" wrapping a TextLabel reading "PLAY" matched nothing —
+-- named "frame" wrapping a TextLabel reading "PLAY" matched nothing -
 -- which is exactly why the main-screen Play button was never pressed.
 local function ButtonTokens(btn)
     local t = {}
@@ -554,7 +735,7 @@ local function ButtonText(btn)
 end
 
 -- EXACT by default. Substring matching is what made "play" match the
--- "Show Players" button in the top-right HUD — which is on screen inside
+-- "Show Players" button in the top-right HUD - which is on screen inside
 -- a dungeon too, so InLobby() was always true and the script kept
 -- queueing new runs mid-dungeon. Pass contains=true to opt back in.
 local function ButtonMatches(btn, m)
@@ -582,7 +763,7 @@ end
 
 -- AbsolutePosition is measured below the topbar unless the owning
 -- ScreenGui sets IgnoreGuiInset. VirtualInputManager wants true viewport
--- coordinates, so the inset must be added *conditionally* — adding it
+-- coordinates, so the inset must be added *conditionally* - adding it
 -- always put the click ~36px below buttons like Create Lobby and missed.
 local function ScreenPointOf(gui)
     local ignore = false
@@ -614,7 +795,7 @@ local function ClickButton(btn)
         if ok then return true end
     end
 
-    -- Hidden or input blocked — drive the signal directly. getconnections
+    -- Hidden or input blocked - drive the signal directly. getconnections
     -- first because it is verifiable: we can count the handlers we fired.
     local gc = Env("getconnections")
     if typeof(gc) == "function" then
@@ -698,7 +879,7 @@ local function FindAndFireBtn(matches, timeout, verify)
 end
 
 -- Prints every button in PlayerGui. Run this in the lobby and paste the
--- output if a step still misses — it gives the real names to match on.
+-- output if a step still misses - it gives the real names to match on.
 local function DumpGui()
     local pg = LP:FindFirstChildOfClass("PlayerGui")
     if not pg then return end
@@ -725,7 +906,7 @@ end
 --  moment in a dungeon (between rooms, mobs not matching the strict
 --  filter) read as "not in a dungeon" and the watcher happily started
 --  queueing another one mid-run. Seeing the lobby's own Play button on
---  screen is a positive, unambiguous signal — use that instead.
+--  screen is a positive, unambiguous signal - use that instead.
 -- ============================================================
 local function AnyVisible(matches)
     for _, b in ipairs(FindButtons(matches)) do
@@ -739,7 +920,7 @@ end
 --
 --  Keyword matching could never work for the dungeon list or the
 --  difficulty buttons: every one of them is *named* "TextButton" and
---  has EMPTY text. The identifying name sits on the parent frame —
+--  has EMPTY text. The identifying name sits on the parent frame -
 --  chooseDungeon.backgroundFillLeft.ScrollingFrame["Desert Temple"]
 --  .TextButton, chooseDungeon.backgroundFillRight.Easy.TextButton.
 --  Exact paths remove all the guessing.
@@ -824,7 +1005,7 @@ local function RunLobbyFlow()
 
     -- Hard guard: never queue a dungeon unless the lobby is actually up.
     if not InLobby() then
-        print("[DQR] Not in the lobby — refusing to queue a dungeon.")
+        print("[DQR] Not in the lobby - refusing to queue a dungeon.")
         return
     end
     if lobbyFlowActive then
@@ -838,7 +1019,7 @@ local function RunLobbyFlow()
 
     -- Remotes are only a hint here. TryFireDungeonRemote returned true as
     -- soon as it found *any* name-matching remote and blind-fired guessed
-    -- arguments at it — and the old code then `return`ed, skipping the whole
+    -- arguments at it - and the old code then `return`ed, skipping the whole
     -- button flow. That is why the match never started. Now it is opt-in and
     -- never short-circuits the UI path.
     if CONFIG.UseRemotes then
@@ -862,7 +1043,7 @@ local function RunLobbyFlow()
         end
         if not o then
             local exists = Path(parts)
-            print(("[DQR]   MISS — %s (%s)"):format(
+            print(("[DQR]   MISS - %s (%s)"):format(
                 table.concat(parts, "."),
                 exists and "exists but hidden" or "does not exist"))
             return false
@@ -873,7 +1054,7 @@ local function RunLobbyFlow()
 
     -- Step 0: the intro/title splash. This is a DIFFERENT Play button
     -- (introGui.title.Frame.TextButton) from the lobby's
-    -- mainInterface.buttons.playButton — the flow has to pass both.
+    -- mainInterface.buttons.playButton - the flow has to pass both.
     if PathVisible(UI.IntroPlay) then
         Step(0, "Intro splash Play", UI.IntroPlay, 3)
         local w = 0
@@ -906,7 +1087,7 @@ local function RunLobbyFlow()
         ClickButton(db)
     else
         local list = Path(UI.DungeonList)
-        print("[DQR]   MISS — no row named '" .. CONFIG.TargetDungeon .. "'.")
+        print("[DQR]   MISS - no row named '" .. CONFIG.TargetDungeon .. "'.")
         if list then
             local names = {}
             for _, c in ipairs(list:GetChildren()) do names[#names+1] = c.Name end
@@ -917,18 +1098,18 @@ local function RunLobbyFlow()
     end
     S(0.8)
 
-    -- Step 4: difficulty — same shape, frame named Easy/Medium/Hard/...
+    -- Step 4: difficulty - same shape, frame named Easy/Medium/Hard/...
     print("[DQR] Step 4: Difficulty " .. CONFIG.Difficulty)
     local fb = DifficultyBtn(CONFIG.Difficulty)
     if fb then
         ClickButton(fb)
     else
-        print("[DQR]   MISS — no difficulty frame named '"
+        print("[DQR]   MISS - no difficulty frame named '"
             .. CONFIG.Difficulty .. "'.")
     end
     S(0.8)
 
-    -- Step 5: Create Lobby — verified by the panel actually closing
+    -- Step 5: Create Lobby - verified by the panel actually closing
     print("[DQR] Step 5: Create Lobby")
     local made = false
     for attempt = 1, 4 do
@@ -957,7 +1138,7 @@ local function RunLobbyFlow()
 end
 
 -- ============================================================
---  MOB DETECTION — strict, cached
+--  MOB DETECTION - strict, cached
 -- ============================================================
 local cachedTarget = nil
 local lastScan     = 0
@@ -1061,7 +1242,7 @@ local function IsInDungeonSafe()
 end
 
 -- ============================================================
---  COMBAT — spells + melee swing
+--  COMBAT - spells + melee swing
 -- ============================================================
 local spellSlot   = false
 local lastSpell   = 0
@@ -1074,7 +1255,7 @@ local function FireKey(kc)
 end
 
 local function DoMelee()
-    -- Left click swing — DQR auto-attacks on left mouse
+    -- Left click swing - DQR auto-attacks on left mouse
     local now = tick()
     if now - lastMelee < CONFIG.MeleeRate then return end
     lastMelee = now
@@ -1180,7 +1361,7 @@ local function MainLoop()
     seeded = false
     lastFrame = tick()
 
-    -- Start movement engine — reads currentDest every heartbeat
+    -- Start movement engine - reads currentDest every heartbeat
     StartMoving(function() return currentDest end)
 
     while Farm.Running do
@@ -1193,7 +1374,7 @@ local function MainLoop()
 
         if not root or not human or human.Health <= 0 then
             currentDest = nil
-            ClearWalkLine()
+            ClearRangeBar()
             StopFacing()
             S(0.5)
             continue
@@ -1203,7 +1384,7 @@ local function MainLoop()
 
         if not target then
             currentDest = nil
-            ClearWalkLine()
+            ClearRangeBar()
             StopFacing()
             seeded = false
             S(CONFIG.ScanRate)
@@ -1232,7 +1413,7 @@ local function MainLoop()
         -- Seed orbit on new target
         if not seeded then SeedOrbit(mobPos) end
 
-        -- Dodge — highest movement priority
+        -- Dodge - highest movement priority
         local threatened, tOrigin = ScanThreats()
         if threatened and (now - lastDodge) > CONFIG.DodgeCooldown then
             lastDodge = now
@@ -1243,7 +1424,7 @@ local function MainLoop()
             local sign = math.cos(orbitAngle) > 0 and 1 or -1
             local dodge = root.Position + perp * sign * CONFIG.DodgeStep
             currentDest = Vector3.new(dodge.X, root.Position.Y, dodge.Z)
-            ShowWalkLine(root.Position, currentDest)
+            ShowRangeBar(root, mobPos, dist)
             orbitAngle = orbitAngle + sign * 0.5
             S(CONFIG.ScanRate)
             continue
@@ -1265,7 +1446,7 @@ local function MainLoop()
 
         local dest = GetOrbitPos(mobPos, radius)
         currentDest = Vector3.new(dest.X, root.Position.Y, dest.Z)
-        ShowWalkLine(root.Position, currentDest)
+        ShowRangeBar(root, mobPos, dist)
 
         S(CONFIG.ScanRate)
     end
@@ -1273,7 +1454,7 @@ local function MainLoop()
     currentDest = nil
     StopMoving()
     StopFacing()
-    ClearWalkLine()
+    ClearRangeBar()
 end
 
 -- ============================================================
@@ -1315,7 +1496,7 @@ function Farm.Stop()
     currentDest  = nil
     StopMoving()
     StopFacing()
-    ClearWalkLine()
+    ClearRangeBar()
     print("[DQR] Farm stopped.")
 end
 
@@ -1329,6 +1510,30 @@ end)
 -- ============================================================
 --  DUNGEON COMPLETE WATCHER
 -- ============================================================
+-- ============================================================
+--  IN-DUNGEON START BUTTON
+--  The dungeon is a separate place, so its GUI is not in the lobby
+--  dump and has no known path. Match it by exact text instead:
+--  "START" normalises to "start", and the lobby's own start button
+--  can't be confused with it because this only runs outside the lobby.
+-- ============================================================
+local function StartWatcher()
+    while true do
+        S(1.5)
+        if not InLobby() then
+            local b = AnyVisible({
+                {text = "start"}, {text = "startdungeon"},
+                {name = "startbutton"},
+            })
+            if b then
+                print("[DQR] In-dungeon START visible - clicking.")
+                ClickButton(b)
+                S(2)
+            end
+        end
+    end
+end
+
 local function DungeonWatcher()
     local empty = 0
     while true do
@@ -1340,14 +1545,14 @@ local function DungeonWatcher()
             continue
         end
 
-        -- No mobs. That alone does NOT mean the run is over — it happens
+        -- No mobs. That alone does NOT mean the run is over - it happens
         -- constantly between rooms. Only act on a long dry spell (30s),
         -- and only queue once the lobby is actually back on screen.
         empty = empty + 1
         if empty < 10 then continue end
         empty = 0
 
-        print("[DQR] No mobs for 30s — pausing farm.")
+        print("[DQR] No mobs for 30s - pausing farm.")
         Farm.Stop()
 
         -- Wait for the game to return us to the lobby on its own.
@@ -1355,7 +1560,7 @@ local function DungeonWatcher()
         repeat
             S(2) w = w + 2
             if MobsPresent() then
-                print("[DQR] Mobs again — still in the run.")
+                print("[DQR] Mobs again - still in the run.")
                 Farm.Start()
                 break
             end
@@ -1365,7 +1570,7 @@ local function DungeonWatcher()
         -- beats redriving the whole six-step queue flow.
         local replay = PathVisible(UI.Replay)
         if replay and CONFIG.AutoRunDungeon then
-            print("[DQR] Replay Dungeon available — clicking it.")
+            print("[DQR] Replay Dungeon available - clicking it.")
             ClickButton(replay)
             local t = 0
             repeat S(2) t = t + 2 until IsInDungeon() or t > 60
@@ -1374,13 +1579,13 @@ local function DungeonWatcher()
         end
 
         if not Farm.Running and InLobby() and CONFIG.AutoRunDungeon then
-            print("[DQR] Back in the lobby — queueing next run.")
+            print("[DQR] Back in the lobby - queueing next run.")
             RunLobbyFlow()
             local t = 0
             repeat S(2) t = t + 2 until IsInDungeon() or t > 90
             if IsInDungeon() then Farm.Start() end
         elseif not Farm.Running and not InLobby() then
-            print("[DQR] Still in the dungeon, no lobby — resuming farm.")
+            print("[DQR] Still in the dungeon, no lobby - resuming farm.")
             Farm.Start()
         end
     end
@@ -1390,14 +1595,14 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v4.7 loaded.  F5 farm  F6 dump  F7 hide log")
+    print("[DQR] v4.8 loaded.  F5 farm  F6 dump  F7 hide log")
     NukeGraphics()
     S(2.5)
 
     if not InLobby() then
         -- Not at the main screen: we are already in a run (or loading).
         -- Never queue from here.
-        print("[DQR] Lobby UI not present — assuming already in a dungeon.")
+        print("[DQR] Lobby UI not present - assuming already in a dungeon.")
         Farm.Start()
     elseif CONFIG.AutoRunDungeon then
         RunLobbyFlow()
@@ -1415,6 +1620,7 @@ task.spawn(function()
     end
 
     task.spawn(DungeonWatcher)
+    task.spawn(StartWatcher)
 end)
 
 -- ============================================================
