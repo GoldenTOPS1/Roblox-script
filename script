@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v9.5
+--  DQR AUTO FARM v9.7
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log
@@ -120,6 +120,21 @@ local CONFIG = {
     EscapeClearWant= 4,      -- clearance from a hazard's pad that counts
                              -- as safe; more than this buys nothing, so
                              -- the exit stays close
+    -- Hazard escapes: hop straight to the nearest safe spot when it is
+    -- close, walk when it is not. The hop is a CFrame write - a short
+    -- one, never more often than the cooldown - because a game may
+    -- treat larger or constant jumps as teleporting. Afterwards the
+    -- bot stands its ground and keeps attacking for as long as the
+    -- hazard is still beside it and the spot stays safe, rather than
+    -- walking straight back into it.
+    HazardTeleport = true,
+    TeleportMax    = 8,      -- hop at most this far; further = walk
+    TeleportClear  = 1,      -- land this far outside the hazard's pad
+                             -- (pad 3 + 1 = 4 studs off its visible edge)
+    TeleportCooldown = 0.65,
+    RestNearHazard = 12,     -- after an escape, rest while a hazard is
+                             -- still within this many studs...
+    RestMaxTime    = 8,      -- ...but never for longer than this
     -- Route around beams instead of only escaping once standing in one.
     -- Costs two maths lookups per orbit candidate and a couple more on
     -- the path worker's thread; nothing is added to the frame handler.
@@ -3331,6 +3346,89 @@ local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
     return nil
 end
 
+-- Can a hop from `from` land at `to`? A hop is not a walk: physics
+-- will not stop it at a wall or drop it at a ledge, so everything a
+-- walk discovers by bumping has to be checked beforehand. Nothing
+-- solid between here and there at shin, hip and head height, body
+-- wide; a floor there, flat enough to stand on and within a short
+-- step up or down of ours; and nothing solid in the space a body
+-- takes up at the landing. Returns the landing point, floor height
+-- included, or nil.
+local function HopClear(from, to)
+    local char = GetChar()
+    local rp = RaycastParams.new()
+    rp.FilterType = EXCLUDE
+    rp.FilterDescendantsInstances = {char, RangeBarPart}
+
+    local d = Vector3.new(to.X - from.X, 0, to.Z - from.Z)
+    if d.Magnitude < 0.5 then return nil end
+    -- Heights are relative to the root, which sits FootOffset above the
+    -- feet: the lowest ray runs two studs off the ground, low enough
+    -- for a crate or a fence, high enough not to graze a gentle slope.
+    local side = Vector3.new(-d.Unit.Z, 0, d.Unit.X) * CONFIG.AgentWidth
+    for _, h in ipairs({-1, 1, 2.5}) do
+        for _, off in ipairs({Vector3.zero, side, -side}) do
+            local hit = workspace:Raycast(from + off + Vector3.new(0, h, 0), d, rp)
+            if hit and hit.Instance.CanCollide then return nil end
+        end
+    end
+
+    local flat = Vector3.new(to.X, from.Y, to.Z)
+    local hit = workspace:Raycast(flat + Vector3.new(0, 4, 0),
+                                  Vector3.new(0, -12, 0), rp)
+    if not hit or not hit.Instance.CanCollide then return nil end  -- a pit
+    if hit.Normal.Y < 0.6 then return nil end                      -- a slope
+    local y = hit.Position.Y + CONFIG.FootOffset
+    if math.abs(y - from.Y) > 5 then return nil end                -- a ledge
+
+    local op = OverlapParams.new()
+    op.FilterType = EXCLUDE
+    op.FilterDescendantsInstances = {char, RangeBarPart}
+    op.MaxParts = 20
+    local body = CFrame.new(to.X, y + 0.5, to.Z)
+    for _, p in ipairs(workspace:GetPartBoundsInBox(body, Vector3.new(3, 4, 3), op)) do
+        if p.CanCollide then return nil end                        -- inside something
+    end
+    return Vector3.new(to.X, y, to.Z)
+end
+
+-- Where a hop lands: the closest point outside every footprint, in
+-- whichever direction that is, that HopClear will allow. Fine-grained,
+-- unlike FindEscape's coarse samples, and shortest-first rather than
+-- best-scored - a hop should land just clear, not a stride further
+-- along a heading that happened to have more room. nil when nothing
+-- within TeleportMax is both safe and reachable.
+local function NearestClear(pos, ignoreHuge)
+    local found = {}
+    for _, dir in ipairs(ESCAPE_DIRS) do
+        for d = 1, CONFIG.TeleportMax do
+            local p = pos + dir * d
+            if HazardClearance(p, ignoreHuge) >= CONFIG.TeleportClear then
+                found[#found + 1] = {p = p, d = d}
+                break
+            end
+        end
+    end
+    table.sort(found, function(a, b) return a.d < b.d end)
+    for _, f in ipairs(found) do
+        local land = HopClear(pos, f.p)
+        if land then return land, f.d end
+    end
+    return nil
+end
+
+-- The hop itself, to a point HopClear has already passed. One CFrame
+-- write: rotation kept, velocity zeroed so physics does not carry us
+-- on.
+local lastBlink = 0
+local function Blink(root, land)
+    return pcall(function()
+        local rot = root.CFrame - root.CFrame.Position
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(land) * rot
+    end)
+end
+
 -- HazardDebug only: draws every footprint from the last sweep as a red
 -- slab on the floor, so what the bot thinks is dangerous can be held
 -- up against what is actually on screen. Named DQR_ so the scanners
@@ -3389,7 +3487,8 @@ end
 -- large part of the in-combat lag.
 hazardCache = {t = 0, escape = nil, radial = false, radialN = 0,
                backoffR = nil, backoffFor = nil,
-               holdP = nil, holdUntil = 0, commitUntil = 0}
+               holdP = nil, holdUntil = 0, commitUntil = 0,
+               restUntil = 0, resting = false}
 
 function ScanHazards()
     local now = tick()
@@ -3458,25 +3557,45 @@ function ScanHazards()
 
     local esc = nil
     local held = hazardCache.holdP
+    hazardCache.resting = false
     if #hazardShapes > 0 and HazardAt(pos) then
+        hazardCache.restUntil = 0
         -- Keep a chosen exit for a moment rather than re-picking every
         -- sweep and zig-zagging between two equally good ones.
         if held and now < hazardCache.holdUntil
         and HazardClearance(held, true) > 0 then
             esc = held
         else
-            local how = "clear"
+            local how, tier2 = "clear", false
             esc = FindEscape(pos, mobPos, keep, outward)
             if not esc then
-                how = "clear of what can be dodged"
+                how, tier2 = "clear of what can be dodged", true
                 esc = FindEscape(pos, mobPos, keep, outward, true)
             end
             hazardCache.holdP, hazardCache.holdUntil = esc, now + 0.8
             hazardCache.commitUntil = now + 2.5
+
+            -- A safe spot within hopping range? Straight there, and
+            -- that is the whole escape: land just clear, then rest
+            -- (below). Otherwise it is a walk from the start.
+            if esc and CONFIG.HazardTeleport
+            and now - lastBlink > CONFIG.TeleportCooldown then
+                local near, hop = NearestClear(pos, tier2)
+                if near and Blink(root, near) then
+                    lastBlink = now
+                    esc = near
+                    hazardCache.holdP, hazardCache.commitUntil = near, now
+                    hazardCache.restUntil = now + CONFIG.RestMaxTime
+                    how = ("hopped %d studs"):format(hop)
+                end
+            end
+
             if CONFIG.HazardDebug then
                 print(("[DQR] In a hazard (%d footprint(s), %d spokes) - %s")
                     :format(#hazardShapes, hazardCache.radialN,
-                            esc and ("moving " .. how) or "NO EXIT FOUND"))
+                            esc and how:find("hopped") and how
+                            or esc and ("moving " .. how)
+                            or "NO EXIT FOUND"))
             end
         end
     elseif held and now < hazardCache.commitUntil
@@ -3489,7 +3608,30 @@ function ScanHazards()
         -- standing on the rim of a ring it had all but escaped.
         esc = held
     else
-        hazardCache.holdP = nil
+        if held then
+            -- An escape just finished, on foot: rest here too.
+            hazardCache.holdP = nil
+            hazardCache.restUntil = now + CONFIG.RestMaxTime
+        end
+        -- Resting: the hazard we just left is still beside us, this
+        -- spot is safe, the target is still in reach. Stand here and
+        -- keep hitting rather than walk back toward the ring - the
+        -- hold logic would otherwise close in the moment the escape
+        -- ended, straight back into whatever we had just left. Ends
+        -- when the hazard goes, the spot stops being safe (the
+        -- normal escape then runs), the target moves off, or the
+        -- clock runs out.
+        if now < hazardCache.restUntil then
+            local c = HazardClearance(pos, true)
+            local inReach = keep == nil or mobPos == nil
+                or Vector3.new(mobPos.X - pos.X, 0, mobPos.Z - pos.Z).Magnitude <= keep
+            if c > 0 and c < CONFIG.RestNearHazard and inReach then
+                esc = pos
+                hazardCache.resting = true
+            else
+                hazardCache.restUntil = 0
+            end
+        end
     end
     hazardCache.escape = esc
     return esc
@@ -3955,14 +4097,18 @@ local function MainLoop()
             -- alive by itself, above, for as long as it is there.)
             -- Without this the hold branch walked us straight back
             -- into the hazard the moment the escape had us clear of it.
-            if target.Boss then
+            -- Not while merely resting beside one: that spot is safe,
+            -- and backing further off it costs attacks for nothing.
+            if target.Boss and not hazardCache.resting then
                 hazardBackoff = now + CONFIG.BeamBackoffTime
             end
             currentDest = Vector3.new(escape.X, root.Position.Y, escape.Z)
             ShowRangeBar(root, mobPos, dist)
             if now - lastTeleWarn > 2 then
                 lastTeleWarn = now
-                print(hazardCache.radial
+                print(hazardCache.resting
+                    and "[DQR] Clear of the hazard - holding here until it goes."
+                    or hazardCache.radial
                     and "[DQR] In a beam fan - stepping clear and backing out."
                     or  "[DQR] In a hazard - moving clear.")
             end
@@ -4522,7 +4668,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v9.5 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
+    print("[DQR] v9.7 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
