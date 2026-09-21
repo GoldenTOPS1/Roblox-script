@@ -19,7 +19,7 @@ local CONFIG = {
     -- orbits from the mob, so it IS the fighting distance. It has to
     -- sit inside MeleeRange or the left-click swing never fires.
     -- Lower CircleRadius to hug the mob, raise it to keep away.
-    CircleRadius   = 6,      -- <-- orbit distance = fighting distance
+    CircleRadius   = 8,      -- <-- orbit distance = fighting distance
     MeleeRange     = 9,      -- swing left click when closer than this
     MinRange       = 4,      -- ease out if closer than this
     MaxRange       = 14,     -- close in if farther than this
@@ -35,7 +35,7 @@ local CONFIG = {
     ScanRate       = 0.05,
     AimCamera      = true,   -- point the camera at the mob (DQR aims from camera)
     CameraHeight   = 12,
-    CameraBack     = 14,
+    CameraBack     = 17,
 
     -- Pathfinding
     PathMinDist    = 12,     -- only bother pathing past this range
@@ -46,8 +46,8 @@ local CONFIG = {
 
     -- Range bar
     ShowRangeBar   = true,
-    BarWidth       = 2.4,
-    BarMaxLen      = 120,
+    BarWidth       = 4,
+    BarMaxLen      = 200,
 }
 
 local Players          = game:GetService("Players")
