@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v5.5
+--  DQR AUTO FARM v5.6
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -46,6 +46,12 @@ local CONFIG = {
     -- Walk speed: SetWalkSpeed=false leaves whatever the game gives you
     SetWalkSpeed   = true,
     WalkSpeed      = 19,
+
+    -- Beams / lasers (the blue line the Frost Wizards fire)
+    DodgeBeams     = true,
+    BeamMinLen     = 12,     -- a laser is long in exactly one axis...
+    BeamMaxThick   = 3,      -- ...and thin in the other two
+    BeamPad        = 5,      -- clearance to keep from the line
 
     -- Ground telegraphs (the red strips a boss paints before it hits)
     DodgeTelegraph = true,
@@ -1605,14 +1611,9 @@ local function ScanThreats()
                     end
                 end
             end
-            for _, ch in ipairs(obj:GetChildren()) do
-                if ch:IsA("Beam") then
-                    if (obj.Position - root.Position).Magnitude
-                        < CONFIG.DodgeRange then
-                        return true, obj.Position
-                    end
-                end
-            end
+            -- Beams used to be handled here by fleeing the part's centre,
+            -- which is wrong for a line: the way out of a laser is
+            -- sideways, not backwards. ScanBeams below does it properly.
         end
     end
     return false, nil
@@ -1679,6 +1680,114 @@ local function ScanTelegraphs()
         end
     end
     return escape
+end
+
+-- ============================================================
+--  BEAMS / LASERS
+--  A beam is a LINE, not a footprint, so neither of the scanners
+--  above fits: ScanThreats wants something flying at you, and the
+--  telegraph test wants you inside a rectangle. What matters here is
+--  perpendicular distance to the line - and the way out of a laser is
+--  sideways, never backwards along it.
+--
+--  Shape is what separates a laser from scenery: a beam is long in
+--  EXACTLY ONE axis and thin in the other two. A wall is long in two.
+--  That matters in Winter Outpost, where half the map is blue.
+-- ============================================================
+local function ColorIsBeam(c)
+    -- cyan / blue, but not pale blue ice (which has high red too)
+    if c.B > 0.5 and c.R < 0.5 and c.G > 0.35 then return true end   -- cyan
+    if c.B > 0.55 and c.R < 0.45 and c.G < 0.55 then return true end -- blue
+    return false
+end
+
+local function IsBeamPart(o)
+    if not o:IsA("BasePart") then return false end
+    if IsOurs(o) then return false end
+    if o.Transparency > 0.9 then return false end
+
+    local s = o.Size
+    local long, thin = 0, 0
+    for _, d in ipairs({s.X, s.Y, s.Z}) do
+        if d >= CONFIG.BeamMinLen   then long = long + 1 end
+        if d <= CONFIG.BeamMaxThick then thin = thin + 1 end
+    end
+    if long ~= 1 or thin < 2 then return false end
+
+    return o.Material == Enum.Material.Neon or ColorIsBeam(o.Color)
+end
+
+-- Sideways escape from a line through `c` along `axis`, half-length `half`.
+local function EscapeFromLine(pos, c, axis, half, clear)
+    local toUs  = pos - c
+    local along = toUs:Dot(axis)
+    if math.abs(along) > half + CONFIG.BeamPad then return nil end  -- past the end
+
+    local perp = toUs - axis * along
+    perp = Vector3.new(perp.X, 0, perp.Z)
+    local d = perp.Magnitude
+    if d > clear then return nil end
+
+    local out
+    if d < 0.1 then
+        -- Standing dead on the line: any perpendicular will do.
+        out = Vector3.new(-axis.Z, 0, axis.X)
+        if out.Magnitude < 0.01 then out = Vector3.new(1, 0, 0) end
+    else
+        out = perp
+    end
+    return pos + out.Unit * (clear - d + 4)
+end
+
+local function ScanBeams()
+    if not CONFIG.DodgeBeams then return nil end
+    local root = GetRoot()
+    if not root then return nil end
+    local char = GetChar()
+    local pos  = root.Position
+
+    for _, o in ipairs(workspace:GetDescendants()) do
+        if char and o:IsDescendantOf(char) then
+            -- ours, skip
+        elseif o:IsA("Beam") then
+            -- Attachment-based beams: a real segment between two points.
+            if o.Enabled and o.Attachment0 and o.Attachment1 then
+                local a = o.Attachment0.WorldPosition
+                local b = o.Attachment1.WorldPosition
+                local seg = b - a
+                if seg.Magnitude > 1
+                and (a - pos).Magnitude < CONFIG.DodgeRange * 2 then
+                    local esc = EscapeFromLine(pos, (a + b) / 2,
+                        seg.Unit, seg.Magnitude / 2, CONFIG.BeamPad)
+                    if esc then return esc end
+                end
+            end
+        elseif IsBeamPart(o) then
+            if (o.Position - pos).Magnitude < CONFIG.DodgeRange * 2 then
+                local s = o.Size
+                local axis, half
+                if s.X >= s.Y and s.X >= s.Z then
+                    axis = o.CFrame:VectorToWorldSpace(Vector3.new(1, 0, 0))
+                    half = s.X / 2
+                elseif s.Y >= s.X and s.Y >= s.Z then
+                    axis = o.CFrame:VectorToWorldSpace(Vector3.new(0, 1, 0))
+                    half = s.Y / 2
+                else
+                    axis = o.CFrame:VectorToWorldSpace(Vector3.new(0, 0, 1))
+                    half = s.Z / 2
+                end
+                local esc = EscapeFromLine(pos, o.Position, axis, half,
+                    CONFIG.BeamMaxThick / 2 + CONFIG.BeamPad)
+                if esc then return esc end
+            end
+        end
+    end
+    return nil
+end
+
+-- One call for every "get out of the way" test, in priority order.
+local function ScanHazards()
+    return ScanTelegraphs() or ScanBeams()
 end
 
 -- ============================================================
@@ -1785,13 +1894,13 @@ local function MainLoop()
 
         -- Standing in a telegraphed strip beats every other movement:
         -- there is no point orbiting prettily inside the damage zone.
-        local escape = ScanTelegraphs()
+        local escape = ScanHazards()
         if escape then
             currentDest = Vector3.new(escape.X, root.Position.Y, escape.Z)
             ShowRangeBar(root, mobPos, dist)
             if now - lastTeleWarn > 2 then
                 lastTeleWarn = now
-                print("[DQR] Standing in a telegraph - moving clear.")
+                print("[DQR] In a hazard (telegraph/beam) - moving clear.")
             end
             S(CONFIG.ScanRate)
             continue
@@ -1878,8 +1987,8 @@ local function DodgeWatcher()
             continue
         end
 
-        -- Telegraphs first: standing in one is already damage incoming.
-        local esc = ScanTelegraphs()
+        -- Telegraphs and beams first: being in one is damage incoming.
+        local esc = ScanHazards()
         if esc then
             currentDest = Vector3.new(esc.X, root.Position.Y, esc.Z)
             continue
@@ -2100,7 +2209,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v5.5 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v5.6 loaded.  F5 farm  F6 dump  F7 show/hide log")
     NukeGraphics()
     S(2.5)
 
