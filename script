@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v9.1
+--  DQR AUTO FARM v9.3
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log
@@ -60,7 +60,7 @@ local CONFIG = {
     DodgeBeams     = true,
     BeamMinLen     = 12,     -- a laser is long in exactly one axis...
     BeamMaxThick   = 6,      -- ...and thin in the other two
-    BeamPad        = 5,      -- clearance to keep from the line
+    BeamPad        = 3,      -- clearance to keep from the line's edge
     BeamMinHeight  = 1.5,    -- a PERSISTENT beam must sit this far above
                              -- foot level, else it is floor decoration
     FootOffset     = 3,      -- studs from HumanoidRootPart down to feet
@@ -71,7 +71,7 @@ local CONFIG = {
 
     -- Ground telegraphs (the red strips a boss paints before it hits)
     DodgeTelegraph = true,
-    TelegraphPad   = 4,      -- treat this much beyond the edge as unsafe
+    TelegraphPad   = 3,      -- treat this much beyond the edge as unsafe
     TelegraphMinLen= 6,      -- ignore red parts smaller than this
     TelegraphMaxY  = 2,      -- ...and anything taller than this (props)
     TelegraphMaxWide= 30,    -- ...and anything wider than this in its
@@ -94,32 +94,26 @@ local CONFIG = {
     -- close you are. Fight them from further out, and never stand still.
     BossStandoff   = 10,
     HazardMargin   = 8,      -- extra studs to clear a hazard edge by
-    -- A boss that fires beams radially leaves narrow gaps up close and
-    -- wide ones further out. Once a hazard has forced a move, fight
-    -- from further back for a while: far enough that the floor between
-    -- two beams is at least BeamGapWant studs, measured from the beams
-    -- actually on the floor - or BeamSpread further out than usual when
-    -- there is nothing to measure.
-    BeamGapWant    = 5,
-    BeamSpread     = 12,
-    BeamBackoffTime= 6,      -- seconds to stay backed off after the
+    -- A BOSS that fires beams radially leaves narrow gaps up close and
+    -- wide ones further out. While the spokes are on the floor, fight
+    -- from far enough back that the middle of a gap is BeamGapWant
+    -- studs clear of both neighbours' pads, measured from the beams
+    -- actually there - or BeamSpread further out than usual when
+    -- there is nothing to measure. Bosses only: a wizard's single beam
+    -- is dodged sideways and the fight goes on where it was.
+    BeamGapWant    = 2,
+    BeamSpread     = 10,
+    BeamBackoffTime= 2,      -- seconds to stay backed off after the
                              -- spokes are gone
-    BeamBackoffMax = 70,     -- never further out than this. NOT capped
+    BeamBackoffMax = 45,     -- never further out than this. NOT capped
                              -- at spell range: with twenty spokes the
-                             -- first clear ring is outside it, and
+                             -- first clear ring can be outside it, and
                              -- capping walked the bot back into the fan
     HoldSlack      = 2,      -- within CircleRadius + this = at fighting distance
     EscapeMaxDist  = 30,     -- furthest one hazard escape will move us
-    EscapeClearWant= 7,      -- clearance from a hazard edge that counts as safe
-    -- Hazard escapes: hop straight to the nearest safe spot when it is
-    -- close, walk when it is not. The hop is a CFrame write - a short
-    -- one, never more often than the cooldown - because a game may
-    -- treat larger or constant jumps as teleporting. The hop is the
-    -- whole escape: it lands just outside the hazard's pad and stays.
-    HazardTeleport = true,
-    TeleportMax    = 8,      -- hop at most this far; further = walk
-    TeleportClear  = 1,      -- land this far outside the hazard's pad
-    TeleportCooldown = 0.6,
+    EscapeClearWant= 4,      -- clearance from a hazard's pad that counts
+                             -- as safe; more than this buys nothing, so
+                             -- the exit stays close
     -- Route around beams instead of only escaping once standing in one.
     -- Costs two maths lookups per orbit candidate and a couple more on
     -- the path worker's thread; nothing is added to the frame handler.
@@ -2696,40 +2690,47 @@ local hazardShapes = {}
 -- hazards that CAN be dodged. Kept, but skipped when that happens.
 local HUGE = 35
 
--- HazardDebug: name the instance behind any footprint far bigger than
--- a beam or a ring ought to be, once every few seconds per instance,
--- so a phantom slab on screen can be traced to what produced it.
-local bigWarned = setmetatable({}, {__mode = "k"})
-local function WarnBig(src, what)
+-- HazardDebug: a census. Every footprint names the instance it came
+-- from, once every few seconds per instance, so a slab on screen that
+-- matches nothing visible can be traced to what produced it. Copy the
+-- log while the slab is there, or press F9 for the current list.
+local censusAt = setmetatable({}, {__mode = "k"})
+local function Census(src, what)
     if not CONFIG.HazardDebug or not src then return end
     local now = tick()
-    if bigWarned[src] and now - bigWarned[src] < 5 then return end
-    bigWarned[src] = now
-    print(("[DQR] Big hazard from %s (%s): %s")
-        :format(src:GetFullName(), src.ClassName, what))
+    if censusAt[src] and now - censusAt[src] < 5 then return end
+    censusAt[src] = now
+    print(("[DQR] Hazard %s <- %s (%s)")
+        :format(what, src:GetFullName(), src.ClassName))
+end
+
+local function Describe(h)
+    if h.kind == "disc" then
+        return ("disc r=%d"):format(h.r)
+    elseif h.kind == "box" then
+        return ("box %dx%d"):format(h.hx * 2, h.hz * 2)
+    end
+    return ("line len=%d r=%d"):format((h.b - h.a).Magnitude, h.r)
 end
 
 local function NoteDisc(cx, cy, cz, r, src)
-    hazardShapes[#hazardShapes + 1] =
-        {kind = "disc", x = cx, y = cy, z = cz, r = r, huge = r > HUGE}
-    if r > 20 then WarnBig(src, ("disc r=%d"):format(r)) end
+    local h = {kind = "disc", x = cx, y = cy, z = cz, r = r,
+               huge = r > HUGE, src = src}
+    hazardShapes[#hazardShapes + 1] = h
+    Census(src, Describe(h))
 end
 
 local function NoteBox(cf, hx, hz, cy, src)
-    hazardShapes[#hazardShapes + 1] =
-        {kind = "box", cf = cf, hx = hx, hz = hz, y = cy,
-         huge = math.min(hx, hz) > HUGE}
-    if math.min(hx, hz) > 12 then
-        WarnBig(src, ("box %dx%d"):format(hx * 2, hz * 2))
-    end
+    local h = {kind = "box", cf = cf, hx = hx, hz = hz, y = cy,
+               huge = math.min(hx, hz) > HUGE, src = src}
+    hazardShapes[#hazardShapes + 1] = h
+    Census(src, Describe(h))
 end
 
 local function NoteLine(a, b, r, src)
-    hazardShapes[#hazardShapes + 1] =
-        {kind = "line", a = a, b = b, r = r, huge = r > HUGE}
-    if r > 9 or (b - a).Magnitude > 250 then
-        WarnBig(src, ("line r=%d len=%d"):format(r, (b - a).Magnitude))
-    end
+    local h = {kind = "line", a = a, b = b, r = r, huge = r > HUGE, src = src}
+    hazardShapes[#hazardShapes + 1] = h
+    Census(src, Describe(h))
 end
 
 -- How far this world point is from the nearest hazard edge: negative
@@ -3227,29 +3228,6 @@ local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
     return nil
 end
 
--- Where a hop lands: the closest point outside every footprint, in
--- whichever direction that is. Fine-grained, unlike FindEscape's
--- coarse samples, and shortest-first rather than best-scored - a hop
--- should land just clear, not a stride further along a heading that
--- happened to have more room.
-local function NearestClear(pos, ignoreHuge)
-    local found = {}
-    for _, dir in ipairs(ESCAPE_DIRS) do
-        for d = 1, CONFIG.TeleportMax do
-            local p = pos + dir * d
-            if HazardClearance(p, ignoreHuge) >= CONFIG.TeleportClear then
-                found[#found + 1] = {p = p, d = d}
-                break
-            end
-        end
-    end
-    table.sort(found, function(a, b) return a.d < b.d end)
-    for _, f in ipairs(found) do
-        if LineClear(pos, f.p) and HasGround(f.p) then return f.p, f.d end
-    end
-    return nil
-end
-
 -- HazardDebug only: draws every footprint from the last sweep as a red
 -- slab on the floor, so what the bot thinks is dangerous can be held
 -- up against what is actually on screen. Named DQR_ so the scanners
@@ -3301,28 +3279,6 @@ local function DrawHazards()
             p.CFrame = CFrame.new(0, -500, 0)
         end
     end
-end
-
--- A short hop straight to a safe spot, for when the exit is close
--- enough that walking there is the slow way. One CFrame write:
--- rotation kept, velocity zeroed so physics does not carry us on,
--- dropped onto whatever floor is under the spot - and refused if
--- there is none, rather than hopping out over a pit.
-local lastBlink = 0
-local function Blink(root, target)
-    local rp = RaycastParams.new()
-    rp.FilterType = EXCLUDE
-    rp.FilterDescendantsInstances = {GetChar(), RangeBarPart}
-    local hit = workspace:Raycast(target + Vector3.new(0, 6, 0),
-                                  Vector3.new(0, -CONFIG.GroundProbe, 0), rp)
-    if not hit then return false end
-    local ok = pcall(function()
-        local rot = root.CFrame - root.CFrame.Position
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.CFrame = CFrame.new(target.X, hit.Position.Y + CONFIG.FootOffset,
-                                 target.Z) * rot
-    end)
-    return ok
 end
 
 -- One call for every "get out of the way" test. Cached: two 20Hz
@@ -3392,7 +3348,9 @@ function ScanHazards()
             end
         end
     end
-    local outward = hazardCache.radialN >= 2
+    -- Outward bias for the exit only against a boss's fan; a wizard's
+    -- beam is left sideways, and the fight stays where it was.
+    local outward = hazardCache.radialN >= 2 and tgt ~= nil and tgt.Boss == true
     hazardCache.radial = outward
 
     local esc = nil
@@ -3404,35 +3362,18 @@ function ScanHazards()
         and HazardClearance(held, true) > 0 then
             esc = held
         else
-            local how, tier2 = "clear", false
+            local how = "clear"
             esc = FindEscape(pos, mobPos, keep, outward)
             if not esc then
-                how, tier2 = "clear of what can be dodged", true
+                how = "clear of what can be dodged"
                 esc = FindEscape(pos, mobPos, keep, outward, true)
             end
             hazardCache.holdP, hazardCache.holdUntil = esc, now + 0.8
             hazardCache.commitUntil = now + 2.5
-
-            -- A safe spot within hopping range? Straight there, and
-            -- that IS the escape - land just clear and stay. Otherwise
-            -- it is a walk from the start, as quick as the legs allow.
-            local hopped = false
-            if esc and CONFIG.HazardTeleport
-            and now - lastBlink > CONFIG.TeleportCooldown then
-                local near, hop = NearestClear(pos, tier2)
-                if near and Blink(root, near) then
-                    lastBlink, hopped = now, true
-                    esc = near
-                    hazardCache.holdP, hazardCache.commitUntil = near, now
-                    how = ("hopped %d studs"):format(hop)
-                end
-            end
-
             if CONFIG.HazardDebug then
                 print(("[DQR] In a hazard (%d footprint(s), %d spokes) - %s")
                     :format(#hazardShapes, hazardCache.radialN,
-                            esc and (hopped and how or ("moving " .. how))
-                                or "NO EXIT FOUND"))
+                            esc and ("moving " .. how) or "NO EXIT FOUND"))
             end
         end
     elseif held and now < hazardCache.commitUntil
@@ -3463,6 +3404,18 @@ function HazardDiag()
     local pos, now = root.Position, tick()
     local reach = CONFIG.DodgeRange * 2
     print("[DQR] === HAZARD DIAG ===")
+
+    -- What the last sweep is treating as dangerous right now, and
+    -- what each footprint was made from. The first thing to read when
+    -- a red slab matches nothing on screen.
+    for i, h in ipairs(hazardShapes) do
+        if i > 40 then break end
+        local src = h.src
+        print(("[Hazard] %s <- %s"):format(Describe(h),
+            src and (src:GetFullName() .. " (" .. src.ClassName .. ")")
+                or "?"))
+    end
+    print(("[DQR] %d footprint(s) in the last sweep."):format(#hazardShapes))
 
     local function Line(tag, o, extra)
         local height = Footprint(o)
@@ -3543,8 +3496,8 @@ function HazardDiag()
             end
         end
     end
-    print(("[DQR] %d older beam-shaped part(s) within %d studs; %d hazard footprint(s) in the last sweep.")
-        :format(n, reach, #hazardShapes))
+    print(("[DQR] %d older beam-shaped part(s) within %d studs.")
+        :format(n, reach))
     print("[DQR] === END HAZARD DIAG ===")
 end
 
@@ -3837,16 +3790,19 @@ local function MainLoop()
         local meleeR = CONFIG.MeleeRange   + tRad
         local spellR = CONFIG.AttackRange  + tRad
 
-        -- Radial beams fan out from the boss, so the gaps between them
+        -- Radial beams fan out from a BOSS, so the gaps between them
         -- are narrow up close and wide further out. While the spokes
-        -- are on the floor - and for a few seconds after - fight from
-        -- where there is room to step between them, and raise MinRange
-        -- with it so the retreat branch below actually walks us out
-        -- there. Not capped at spell range: with twenty spokes the
-        -- first clear ring lies outside it, and capping walked the bot
+        -- are on the floor - and for a moment after - fight from where
+        -- there is room to step between them, and raise MinRange with
+        -- it so the retreat branch below actually walks us out there.
+        -- Not capped at spell range: with twenty spokes the first
+        -- clear ring can lie outside it, and capping walked the bot
         -- straight back into the fan. Standing safe and idle beats
         -- casting from inside a beam.
-        if hazardCache.radialN >= 2 then
+        -- Bosses only. Any two beams near an ordinary mob used to
+        -- count as a fan, and the bot backed twelve studs off every
+        -- wizard for no reason.
+        if target.Boss and hazardCache.radialN >= 2 then
             hazardBackoff = now + CONFIG.BeamBackoffTime
         end
         if hazardBackoff > now then
@@ -4463,7 +4419,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v9.1 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
+    print("[DQR] v9.3 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
