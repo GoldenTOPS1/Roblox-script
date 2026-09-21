@@ -1,10 +1,17 @@
 -- ============================================================
---  DQR AUTO FARM v5.8
+--  DQR AUTO FARM v5.9
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
 
 local CONFIG = {
+    -- "Warrior" / "Tank"  -> melee range, hugs the mob
+    -- "Mage" / "Healer"   -> stands back and casts
+    -- Picks the engagement distances below. Anything you set by hand in
+    -- the ENGAGEMENT DISTANCE block is overwritten by this at boot, so
+    -- set Class to "" if you want to tune the numbers yourself.
+    Class          = "Mage",
+
     TargetDungeon  = "Winter Outpost",
     Difficulty     = "Easy",
     Hardcore       = false,  -- true = also press HARDCORE MODE
@@ -28,10 +35,10 @@ local CONFIG = {
 
     -- ---- ENGAGEMENT DISTANCE -------------------------------
     -- CircleRadius is the one that matters: it is how far the bot
-    -- orbits from the mob, so it IS the fighting distance. It has to
-    -- sit inside MeleeRange or the left-click swing never fires.
-    -- Lower CircleRadius to hug the mob, raise it to keep away.
-    CircleRadius   = 10,      -- <-- orbit distance = fighting distance
+    -- orbits from the mob, so it IS the fighting distance. For a melee
+    -- class it has to sit inside MeleeRange or the swing never fires.
+    -- NOTE: Class above overwrites all five of these at boot.
+    CircleRadius   = 10,     -- <-- orbit distance = fighting distance
     MeleeRange     = 9,      -- swing left click when closer than this
     MinRange       = 4,      -- ease out if closer than this
     MaxRange       = 14,     -- close in if farther than this
@@ -84,6 +91,31 @@ local CONFIG = {
     ShowRangeBar   = true,
     BarWidth       = 4,
     BarMaxLen      = 200,
+}
+
+-- ============================================================
+--  CLASS PROFILES
+--  Melee classes have to orbit inside MeleeRange or the left-click
+--  swing never lands. Casters want the opposite: stay out past the
+--  mob's own reach and lean on Q/E, which is what AttackRange covers.
+-- ============================================================
+local CLASS_RANGES = {
+    Warrior = {
+        CircleRadius = 6,  MeleeRange = 9,  MinRange = 4,
+        MaxRange     = 14, AttackRange = 25,
+    },
+    Tank = {
+        CircleRadius = 5,  MeleeRange = 10, MinRange = 3,
+        MaxRange     = 13, AttackRange = 25,
+    },
+    Mage = {
+        CircleRadius = 20, MeleeRange = 9,  MinRange = 14,
+        MaxRange     = 30, AttackRange = 40,
+    },
+    Healer = {
+        CircleRadius = 22, MeleeRange = 9,  MinRange = 16,
+        MaxRange     = 32, AttackRange = 40,
+    },
 }
 
 local Players          = game:GetService("Players")
@@ -2319,11 +2351,35 @@ local function Supervisor()
     end
 end
 
+-- Defined down here so its output goes through the log window.
+local function ApplyClass()
+    local want = tostring(CONFIG.Class or "")
+    if want == "" then
+        print("[DQR] Class unset - using the hand-tuned distances.")
+        return
+    end
+
+    local name, prof
+    for k, v in pairs(CLASS_RANGES) do
+        if k:lower() == want:lower() then name, prof = k, v break end
+    end
+
+    if not prof then
+        name, prof = "Warrior", CLASS_RANGES.Warrior
+        print("[DQR] Unknown Class '" .. want .. "' - falling back to Warrior.")
+    end
+
+    for k, v in pairs(prof) do CONFIG[k] = v end
+    print(("[DQR] Class %s: orbit %d, melee under %d, spells under %d.")
+        :format(name, prof.CircleRadius, prof.MeleeRange, prof.AttackRange))
+end
+
 -- ============================================================
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v5.8 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v5.9 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    ApplyClass()
     NukeGraphics()
     S(2.5)
 
