@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v8.8
+--  DQR AUTO FARM v8.9
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log
@@ -637,15 +637,18 @@ function LooksActive(o, fresh)
     -- "never moved". Scenery in range is seen every sweep, so its
     -- record never goes stale.
     if rec and now - rec.seen > 3 then rec = nil end
+    -- Returns active?, and WHY ("new", "moved", "faded", "grew",
+    -- "fresh") so a caller can weigh the evidence: a solid floor part
+    -- that just moved is one thing, one that merely faded is another.
     if not rec then
-        local hit = new or fresh
+        local why = new and "new" or fresh and "fresh" or nil
         effectSeen[o] = {pos = o.Position, tr = o.Transparency,
-                         size = PartSize(o), moved = hit and now or 0,
-                         seen = now}
-        if hit and not new and CONFIG.HazardDebug then
+                         size = PartSize(o), moved = why and now or 0,
+                         why = why, seen = now}
+        if why == "fresh" and CONFIG.HazardDebug then
             print("[DQR] Turned up beside us: " .. o:GetFullName())
         end
-        return hit
+        return why ~= nil, why
     end
     rec.seen = now
     -- Movement, or a pooled effect being stretched out from nothing or
@@ -653,13 +656,19 @@ function LooksActive(o, fresh)
     -- of transparency used to count, and that flagged every glowing
     -- inlay in the map that pulses between bright and dim.
     local size, tr = PartSize(o), o.Transparency
-    if (o.Position - rec.pos).Magnitude > 1
-    or (rec.tr > 0.9 and tr <= 0.9)
-    or (size - rec.size).Magnitude > 1 then
-        rec.moved = now
+    local why = nil
+    if (o.Position - rec.pos).Magnitude > 1 then
+        why = "moved"
+    elseif rec.tr > 0.9 and tr <= 0.9 then
+        why = "faded"
+    elseif (size - rec.size).Magnitude > 1 then
+        why = "grew"
     end
+    if why then rec.moved, rec.why = now, why end
     rec.pos, rec.tr, rec.size = o.Position, tr, size
-    return new or (now - rec.moved) < CONFIG.RecentWindow
+    if new then return true, "new" end
+    if (now - rec.moved) < CONFIG.RecentWindow then return true, rec.why end
+    return false, nil
 end
 
 end -- of the LooksActive block
@@ -2621,7 +2630,6 @@ end
 local function IsTelegraph(o, pos, radius)
     if not o:IsA("BasePart") then return false end
     if IsOurs(o) then return false end
-    if o.Transparency > 0.95 then return false end
     local s = PartSize(o)
     -- Cheap rejections before touching the CFrame: nothing whose
     -- smallest side is taller than the limit can lie flat any way up.
@@ -2634,22 +2642,30 @@ local function IsTelegraph(o, pos, radius)
     -- both ways is a floor, and a whole room floor was being flagged.
     if math.min(a, b) > CONFIG.TelegraphMaxWide then return false end
 
-    local c = o.Color
-    if c.R > 0.55 and c.G < 0.45 and c.B < 0.45 then return true end -- red
-
-    -- You stand ON floors and never on an attack marker: anything
-    -- solid is map, whatever else it does. This is what kept the
-    -- corridor's floor strips out of the hazard list.
-    if o.CanCollide then return false end
-
     -- Colour alone is not enough: the Ice Elemental paints CYAN rings,
     -- and cyan is also the colour of half the Winter Outpost scenery.
     -- What separates them is behaviour - the map is already there when
     -- we arrive and never moves; an attack marker either spawns or gets
-    -- moved into place mid-fight.
+    -- moved into place mid-fight. Asked BEFORE the visibility test, so
+    -- a ring that fades in from invisible has a parked reading on
+    -- record to be compared against.
     local fresh = sweepFresh and pos ~= nil
                   and NearDist(o, pos) < radius * 0.6
-    return LooksActive(o, fresh)
+    local active, why = LooksActive(o, fresh)
+    if o.Transparency > 0.95 then return false end
+
+    local c = o.Color
+    if c.R > 0.55 and c.G < 0.45 and c.B < 0.45 then return true end -- red
+    if not active then return false end
+
+    -- You stand ON floors, so a solid part is map unless the evidence
+    -- is unambiguous: it was not here a moment ago, or it has just
+    -- been moved into place. Fading in, or turning up in the query
+    -- results, is not enough - a glowing floor inlay does both. (A
+    -- ring marker laid flush with the floor is very often left
+    -- collidable, so rejecting every solid part lost the rings.)
+    if o.CanCollide and why ~= "new" and why ~= "moved" then return false end
+    return true
 end
 
 -- ============================================================
@@ -2743,12 +2759,25 @@ end
 -- it off so they stay out of the game's own raycasts - but the spawn
 -- registry saw those arrive regardless, so add them to what it found.
 local function HazardCandidates(pos, radius)
-    local list = NearbyParts(pos, radius)
-    local now  = tick()
+    -- The wide query is capped at MaxQueryParts and truncates
+    -- arbitrarily past that, so in a busy arena the ring under our
+    -- feet could be missing from it for a sweep - which stopped an
+    -- escape dead in the middle of the ring. A small query cannot
+    -- overflow, so anything actually touching us is guaranteed.
+    local list = NearbyParts(pos, 10)
+    local done = {}
+    for _, o in ipairs(list) do done[o] = true end
+    for _, o in ipairs(NearbyParts(pos, radius)) do
+        if not done[o] then
+            done[o] = true
+            list[#list + 1] = o
+        end
+    end
+    local now = tick()
     for p, born in pairs(recentParts) do
         if not p.Parent or now - born > CONFIG.RecentWindow then
             recentParts[p] = nil
-        elseif not p.CanQuery and NearDist(p, pos) < radius then
+        elseif not done[p] and not p.CanQuery and NearDist(p, pos) < radius then
             list[#list + 1] = p
         end
     end
@@ -3199,7 +3228,7 @@ end
 -- large part of the in-combat lag.
 hazardCache = {t = 0, escape = nil, radial = false, radialN = 0,
                backoffR = nil, backoffFor = nil,
-               holdP = nil, holdUntil = 0}
+               holdP = nil, holdUntil = 0, commitUntil = 0}
 
 function ScanHazards()
     local now = tick()
@@ -3265,10 +3294,10 @@ function ScanHazards()
     hazardCache.radial = outward
 
     local esc = nil
+    local held = hazardCache.holdP
     if #hazardShapes > 0 and HazardAt(pos) then
         -- Keep a chosen exit for a moment rather than re-picking every
         -- sweep and zig-zagging between two equally good ones.
-        local held = hazardCache.holdP
         if held and now < hazardCache.holdUntil
         and HazardClearance(held, true) > 0 then
             esc = held
@@ -3280,12 +3309,22 @@ function ScanHazards()
                 esc = FindEscape(pos, mobPos, keep, outward, true)
             end
             hazardCache.holdP, hazardCache.holdUntil = esc, now + 0.8
+            hazardCache.commitUntil = now + 2.5
             if CONFIG.HazardDebug then
                 print(("[DQR] In a hazard (%d footprint(s), %d spokes) - %s")
                     :format(#hazardShapes, hazardCache.radialN,
                             esc and ("moving " .. how) or "NO EXIT FOUND"))
             end
         end
+    elseif held and now < hazardCache.commitUntil
+    and Vector3.new(held.X - pos.X, 0, held.Z - pos.Z).Magnitude > 2.5
+    and HazardClearance(held, true) > 0 then
+        -- Out of the footprint but not yet at the exit: see it
+        -- through. The footprint ends where the PART ends, which is
+        -- not necessarily where the damage does, and stopping the
+        -- instant the root crossed the padded edge left the bot
+        -- standing on the rim of a ring it had all but escaped.
+        esc = held
     else
         hazardCache.holdP = nil
     end
@@ -4305,7 +4344,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v8.8 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
+    print("[DQR] v8.9 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
