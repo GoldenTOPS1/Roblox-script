@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v4.8
+--  DQR AUTO FARM v4.9
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -432,11 +432,58 @@ local function PathWorker(getDestFn)
     end)
 end
 
+-- ============================================================
+--  WHY Humanoid:Move ALONE DID NOTHING
+--  Roblox's default control module calls Humanoid:Move() itself every
+--  frame - with a ZERO vector when no key is held - from a
+--  BindToRenderStep that runs after our Heartbeat. So our command was
+--  being wiped before the physics step ever saw it: no walking, and
+--  no jump either, because the same module owns the jump state.
+--  Disabling the control module hands movement back to us.
+-- ============================================================
+local Controls     = nil
+local controlsOff  = false
+
+local function SetDefaultControls(enabled)
+    pcall(function()
+        if not Controls then
+            local pm = LP:FindFirstChild("PlayerScripts")
+            pm = pm and pm:FindFirstChild("PlayerModule")
+            if not pm then return end
+            Controls = require(pm):GetControls()
+        end
+        if not Controls then return end
+        if enabled then Controls:Enable() else Controls:Disable() end
+        controlsOff = not enabled
+    end)
+end
+
+-- One-line snapshot of everything that can stop a humanoid moving.
+local function Diag()
+    local r, h = GetRoot(), GetHuman()
+    if not r or not h then return "no character" end
+    return ("state=%s ws=%.1f md=%.2f vel=%.1f anchored=%s platform=%s sit=%s floor=%s jumpOK=%s ctrlOff=%s")
+        :format(tostring(h:GetState()):gsub("Enum.HumanoidStateType%.", ""),
+                h.WalkSpeed, h.MoveDirection.Magnitude,
+                r.AssemblyLinearVelocity.Magnitude,
+                tostring(r.Anchored), tostring(h.PlatformStand),
+                tostring(h.Sit), tostring(h.FloorMaterial),
+                tostring(h:GetStateEnabled(Enum.HumanoidStateType.Jumping)),
+                tostring(controlsOff))
+end
+
+local moveMode     = "humanoid"  -- or "velocity"
+local commandSince = 0
+local diagCount    = 0
+
 local function StartMoving(getDestFn)
     if moveConn then moveConn:Disconnect() end
     ClearPath()
     forceRepath = false
     stuckAt, stuckSince = nil, 0
+    moveMode, commandSince, diagCount = "humanoid", 0, 0
+
+    SetDefaultControls(false)
 
     local h0 = GetHuman()
     if h0 then
@@ -447,7 +494,11 @@ local function StartMoving(getDestFn)
         if CONFIG.WalkSpeed > 0 then
             pcall(function() h0.WalkSpeed = CONFIG.WalkSpeed end)
         end
+        pcall(function()
+            h0:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+        end)
     end
+    print("[DQR] Move start: " .. Diag())
 
     moveConn = RunService.Heartbeat:Connect(function(dt)
         local root  = GetRoot()
@@ -477,15 +528,44 @@ local function StartMoving(getDestFn)
         end
 
         -- Walk. This is what makes the animation play.
+        local dir = nil
         if step then
-            local dir = Vector3.new(step.X - pos.X, 0, step.Z - pos.Z)
-            if dir.Magnitude > 1 then
-                human:Move(dir.Unit, false)
+            local d = Vector3.new(step.X - pos.X, 0, step.Z - pos.Z)
+            if d.Magnitude > 1 then dir = d.Unit end
+        end
+
+        if dir then
+            if commandSince == 0 then commandSince = tick() end
+
+            if moveMode == "humanoid" then
+                human:Move(dir, false)
+                -- If we have been commanding movement for a full second
+                -- and the humanoid still reports no MoveDirection, then
+                -- something is still eating the command. Switch to
+                -- driving the assembly velocity instead, which physics
+                -- applies directly and which still fires Humanoid.Running
+                -- so the walk animation keeps playing.
+                if tick() - commandSince > 1
+                and human.MoveDirection.Magnitude < 0.1 then
+                    moveMode = "velocity"
+                    print("[DQR] Humanoid:Move is being overridden - "
+                        .. "switching to velocity mode. " .. Diag())
+                end
             else
-                human:Move(Vector3.zero, false)
+                local spd = human.WalkSpeed > 0 and human.WalkSpeed or 16
+                local v   = root.AssemblyLinearVelocity
+                root.AssemblyLinearVelocity =
+                    Vector3.new(dir.X * spd, v.Y, dir.Z * spd)
+                human:Move(dir, false)  -- keep the animation state in sync
             end
         else
-            human:Move(Vector3.zero, false)
+            commandSince = 0
+            if moveMode == "humanoid" then
+                human:Move(Vector3.zero, false)
+            else
+                local v = root.AssemblyLinearVelocity
+                root.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
+            end
         end
 
         -- Stuck detection: real walking can be blocked, so notice it and
@@ -496,9 +576,20 @@ local function StartMoving(getDestFn)
                 stuckAt, stuckSince = pos, now
             elseif now - stuckSince > CONFIG.StuckTime then
                 stuckAt, stuckSince = pos, now
-                human.Jump  = true
+                human.Jump = true
+                pcall(function()
+                    human:ChangeState(Enum.HumanoidStateType.Jumping)
+                end)
                 forceRepath = true
-                print("[DQR] Stuck - jumping and repathing.")
+                -- Log the full state the first few times only; the cause
+                -- is always visible in the first one or two.
+                if diagCount < 3 then
+                    diagCount = diagCount + 1
+                    print("[DQR] Stuck - " .. Diag())
+                elseif diagCount == 3 then
+                    diagCount = 4
+                    print("[DQR] Stuck (further diagnostics suppressed).")
+                end
             end
         else
             stuckAt = nil
@@ -545,6 +636,8 @@ local function StopMoving()
     ClearPath()
     local hm = GetHuman()
     if hm then pcall(function() hm:Move(Vector3.zero, false) end) end
+    -- Hand the controls back so you can move the character yourself.
+    SetDefaultControls(true)
     local h = GetHuman()
     if h then pcall(function() h.AutoRotate = true end) end
     local cam = workspace.CurrentCamera
@@ -1380,6 +1473,16 @@ local function MainLoop()
             continue
         end
 
+        -- The run has not begun while START is still on screen. Dungeon
+        -- Quest freezes players until then, so trying to walk just spams
+        -- the stuck detector. Stand still and let StartWatcher press it.
+        if not InLobby() and AnyVisible({{text = "start"}}) then
+            currentDest = nil
+            ClearRangeBar()
+            S(0.5)
+            continue
+        end
+
         local target = GetNearestMob()
 
         if not target then
@@ -1595,7 +1698,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v4.8 loaded.  F5 farm  F6 dump  F7 hide log")
+    print("[DQR] v4.9 loaded.  F5 farm  F6 dump  F7 hide log")
     NukeGraphics()
     S(2.5)
 
