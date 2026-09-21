@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v6.3
+--  DQR AUTO FARM v6.4
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -94,6 +94,14 @@ local CONFIG = {
     AgentMaxSlope  = 45,     -- steeper than this = route around, not up
     ProbeDist      = 14,     -- how far ahead to test a clear heading
     GroundProbe    = 20,     -- how far down to look for floor at a target
+
+    -- Performance. Scanners use the physics broadphase over a radius
+    -- instead of walking the whole map, and cache their verdicts so the
+    -- two 20Hz threads share one scan instead of doing two each.
+    MobScanRadius  = 300,    -- studs to look for mobs in
+    MaxQueryParts  = 500,    -- cap on parts returned by one query
+    HazardTTL      = 0.1,    -- telegraph/beam scan at most 10x a second
+    ThreatTTL      = 0.1,    -- projectile scan at most 10x a second
     PathGiveUp     = 6,      -- failed paths before abandoning a mob
     UnreachableFor = 12,     -- seconds to ignore an abandoned mob
 
@@ -542,6 +550,28 @@ local function LineClear(from, to)
     -- Ignore things a walking character passes through anyway
     if not hit.Instance.CanCollide then return true end
     return false
+end
+
+-- ============================================================
+--  SPATIAL QUERY
+--  Every scanner used to walk workspace:GetDescendants(), which visits
+--  the whole map - tens of thousands of instances - to find things
+--  within ~40 studs. With the farm loop and the dodge watcher both at
+--  20Hz that was over a hundred full traversals a second, and it is
+--  what made the game crawl while fighting.
+--  GetPartBoundsInRadius asks the physics broadphase instead and
+--  returns only what is actually near us.
+-- ============================================================
+local function NearbyParts(pos, radius)
+    local op = OverlapParams.new()
+    op.FilterType = EXCLUDE
+    op.FilterDescendantsInstances = {GetChar(), RangeBarPart}
+    op.MaxParts = CONFIG.MaxQueryParts
+    local ok, parts = pcall(function()
+        return workspace:GetPartBoundsInRadius(pos, radius, op)
+    end)
+    if ok and parts then return parts end
+    return {}
 end
 
 -- Is there floor under this spot? Stops an escape from sending the bot
@@ -1614,6 +1644,8 @@ local cachedTarget = nil
 local cachedMobs   = nil
 local lastScan     = 0
 local CACHE_TTL    = 0.15
+-- Weak keys: entries vanish when the mob model is collected.
+local mobShape = setmetatable({}, {__mode = "k"})
 
 local function GetNearestMob()
     local root = GetRoot()
@@ -1633,28 +1665,42 @@ local function GetNearestMob()
     lastScan = now
     local best, bestD = nil, math.huge
     local mobList = {}
+    local seen = {}
 
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("Model") then
+    -- Find mobs by their HumanoidRootPart through the broadphase rather
+    -- than walking every instance in the map.
+    for _, prt in ipairs(NearbyParts(root.Position, CONFIG.MobScanRadius)) do
+        local obj = prt.Name == "HumanoidRootPart" and prt.Parent or nil
+        if obj and obj:IsA("Model") and not seen[obj] then
+            seen[obj] = true
             local hum = obj:FindFirstChildOfClass("Humanoid")
-            local mr  = obj:FindFirstChild("HumanoidRootPart")
-            if hum and mr and hum.Health > 0
+            local mr  = prt
+            if hum and hum.Health > 0
             and hum.MaxHealth > 0 and not mr.Anchored then
                 local isPlayer = false
                 for _, p in ipairs(Players:GetPlayers()) do
                     if p.Character == obj then isPlayer = true break end
                 end
                 if not isPlayer then
-                    local hasBB = false
-                    for _, c in ipairs(obj:GetDescendants()) do
-                        if c:IsA("BillboardGui") or c:IsA("Highlight") then
-                            hasBB = true break
+                    -- The shape test (health bar present, more than one
+                    -- part) never changes for a given model, so do it
+                    -- once and remember it. Running GetDescendants on
+                    -- every model on every scan was the expensive half.
+                    local verdict = mobShape[obj]
+                    if verdict == nil then
+                        local hasBB = false
+                        for _, c in ipairs(obj:GetDescendants()) do
+                            if c:IsA("BillboardGui") or c:IsA("Highlight") then
+                                hasBB = true break
+                            end
                         end
-                    end
-                    local pc = 0
-                    for _, c in ipairs(obj:GetChildren()) do
-                        if c:IsA("BasePart") or c:IsA("MeshPart")
-                        or c:IsA("UnionOperation") then pc = pc + 1 end
+                        local pc = 0
+                        for _, c in ipairs(obj:GetChildren()) do
+                            if c:IsA("BasePart") or c:IsA("MeshPart")
+                            or c:IsA("UnionOperation") then pc = pc + 1 end
+                        end
+                        verdict = (hasBB and pc >= 2)
+                        mobShape[obj] = verdict
                     end
                     -- Skip anything the path worker has given up on, so
                     -- we stop pressing into a mountain at a mob on the
@@ -1665,7 +1711,7 @@ local function GetNearestMob()
                         blocked = nil
                     end
 
-                    if hasBB and pc >= 2 then
+                    if verdict then
                         local d = (mr.Position - root.Position).Magnitude
                         local rec = {Model=obj, Root=mr, Humanoid=hum, Distance=d}
                         -- Every live mob goes in the list, blacklisted or
@@ -1696,30 +1742,12 @@ end
 -- ============================================================
 --  DUNGEON DETECTION
 -- ============================================================
+-- Reuses the mob scan rather than walking the map again. GetNearestMob
+-- refreshes the cache when it is stale, so this costs one broadphase
+-- query at most, and usually nothing at all.
 local function MobsPresent()
-    local count = 0
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("Model") then
-            local hum = obj:FindFirstChildOfClass("Humanoid")
-            local mr  = obj:FindFirstChild("HumanoidRootPart")
-            if hum and mr and hum.Health > 0
-            and hum.MaxHealth > 0 and not mr.Anchored then
-                local isP = false
-                for _, p in ipairs(Players:GetPlayers()) do
-                    if p.Character == obj then isP = true break end
-                end
-                if not isP then
-                    for _, c in ipairs(obj:GetDescendants()) do
-                        if c:IsA("BillboardGui") or c:IsA("Highlight") then
-                            count = count + 1 break
-                        end
-                    end
-                    if count >= 2 then return true end
-                end
-            end
-        end
-    end
-    return false
+    GetNearestMob()
+    return #GetMobs() >= 2
 end
 
 -- In a dungeon = the lobby UI is gone. Mobs are corroborating evidence,
@@ -1798,23 +1826,18 @@ local function IsOurs(o)
     return o == RangeBarPart or o.Name:sub(1, 4) == "DQR_"
 end
 
-local function ScanThreats()
+local function ScanThreatsRaw()
     local root = GetRoot()
     if not root then return false, nil end
-    local char = GetChar()
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("BasePart") and not IsOurs(obj)
-        and (not char or not obj:IsDescendantOf(char)) then
+    for _, obj in ipairs(NearbyParts(root.Position, CONFIG.DodgeRange)) do
+        if not IsOurs(obj) then
             if obj.Material == Enum.Material.Neon
             or ColorIsThreat(obj.Color) then
-                local d = (obj.Position - root.Position).Magnitude
-                if d < CONFIG.DodgeRange then
-                    local vel = obj.AssemblyLinearVelocity
-                    if vel.Magnitude > 8 then
-                        if vel.Unit:Dot(
-                            (root.Position - obj.Position).Unit) > 0.55 then
-                            return true, obj.Position
-                        end
+                local vel = obj.AssemblyLinearVelocity
+                if vel.Magnitude > 8 then
+                    if vel.Unit:Dot(
+                        (root.Position - obj.Position).Unit) > 0.55 then
+                        return true, obj.Position
                     end
                 end
             end
@@ -1824,6 +1847,19 @@ local function ScanThreats()
         end
     end
     return false, nil
+end
+
+-- The farm loop and the dodge watcher both poll this at 20Hz. Cache the
+-- verdict briefly so the work happens ~10x a second, not 40.
+local threatCache = {t = 0, hit = false, pos = nil}
+local function ScanThreats()
+    local now = tick()
+    if now - threatCache.t < CONFIG.ThreatTTL then
+        return threatCache.hit, threatCache.pos
+    end
+    threatCache.t = now
+    threatCache.hit, threatCache.pos = ScanThreatsRaw()
+    return threatCache.hit, threatCache.pos
 end
 
 -- ============================================================
@@ -1855,9 +1891,9 @@ local function ScanTelegraphs()
 
     local worstDepth, escape = 0, nil
 
-    for _, o in ipairs(workspace:GetDescendants()) do
-        if IsTelegraph(o) and (not char or not o:IsDescendantOf(char)) then
-            if (o.Position - pos).Magnitude < CONFIG.DodgeRange then
+    for _, o in ipairs(NearbyParts(pos, CONFIG.DodgeRange)) do
+        if IsTelegraph(o) then
+            do
                 -- Where do we stand in the strip's own axes?
                 local rel = o.CFrame:PointToObjectSpace(pos)
                 local hx  = o.Size.X / 2 + CONFIG.TelegraphPad
@@ -1956,24 +1992,35 @@ local function ScanBeams()
     local char = GetChar()
     local pos  = root.Position
 
-    for _, o in ipairs(workspace:GetDescendants()) do
-        if char and o:IsDescendantOf(char) then
-            -- ours, skip
-        elseif o:IsA("Beam") then
-            -- Attachment-based beams: a real segment between two points.
-            if o.Enabled and o.Attachment0 and o.Attachment1 then
-                local a = o.Attachment0.WorldPosition
-                local b = o.Attachment1.WorldPosition
+    -- Beam objects hang off nearby parts (or their attachments), so the
+    -- spatial query finds them without walking the whole map.
+    local near = NearbyParts(pos, CONFIG.DodgeRange * 2)
+
+    for _, host in ipairs(near) do
+        for _, c in ipairs(host:GetChildren()) do
+            local beam = nil
+            if c:IsA("Beam") then
+                beam = c
+            elseif c:IsA("Attachment") then
+                beam = c:FindFirstChildWhichIsA("Beam")
+            end
+            if beam and beam.Enabled
+            and beam.Attachment0 and beam.Attachment1 then
+                local a = beam.Attachment0.WorldPosition
+                local b = beam.Attachment1.WorldPosition
                 local seg = b - a
-                if seg.Magnitude > 1
-                and (a - pos).Magnitude < CONFIG.DodgeRange * 2 then
+                if seg.Magnitude > 1 then
                     local esc = EscapeFromLine(pos, (a + b) / 2,
                         seg.Unit, seg.Magnitude / 2, CONFIG.BeamPad)
                     if esc then return esc end
                 end
             end
-        elseif IsBeamPart(o) then
-            if (o.Position - pos).Magnitude < CONFIG.DodgeRange * 2 then
+        end
+    end
+
+    for _, o in ipairs(near) do
+        if IsBeamPart(o) then
+            do
                 local s = o.Size
                 local axis, half
                 if s.X >= s.Y and s.X >= s.Z then
@@ -1996,8 +2043,17 @@ local function ScanBeams()
 end
 
 -- One call for every "get out of the way" test, in priority order.
+-- Cached: two 20Hz threads poll this, and re-running both scans 40
+-- times a second was a large part of the in-combat lag.
+local hazardCache = {t = 0, escape = nil}
 local function ScanHazards()
-    return ScanTelegraphs() or ScanBeams()
+    local now = tick()
+    if now - hazardCache.t < CONFIG.HazardTTL then
+        return hazardCache.escape
+    end
+    hazardCache.t = now
+    hazardCache.escape = ScanTelegraphs() or ScanBeams()
+    return hazardCache.escape
 end
 
 -- ============================================================
@@ -2009,6 +2065,8 @@ local lastDodge  = 0
 local lastTeleWarn = 0
 local lastCrowdWarn = 0
 local retreating   = false
+local lastStartCheck = 0
+local startVisible = false
 
 -- Tracks how long the current target has held position
 local stillModel = nil
@@ -2128,7 +2186,14 @@ local function MainLoop()
         -- The run has not begun while START is still on screen. Dungeon
         -- Quest freezes players until then, so trying to walk just spams
         -- the stuck detector. Stand still and let StartWatcher press it.
-        if not InLobby() and AnyVisible({{text = "start"}}) then
+        -- Throttled: AnyVisible walks all of PlayerGui, which is far too
+        -- expensive to do 20 times a second.
+        if now - lastStartCheck > 1 then
+            lastStartCheck = now
+            startVisible = (not InLobby())
+                and (AnyVisible({{text = "start"}}) ~= nil)
+        end
+        if startVisible then
             currentDest = nil
             ClearRangeBar()
             S(0.5)
@@ -2646,7 +2711,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v6.3 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v6.4 loaded.  F5 farm  F6 dump  F7 show/hide log")
     ApplyClass()
     NukeGraphics()
     S(2.5)
