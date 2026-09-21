@@ -1,28 +1,34 @@
 -- ============================================================
---  DQR AUTO FARM v4.9
+--  DQR AUTO FARM v5.0
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
 
 local CONFIG = {
     TargetDungeon  = "Desert Temple",
-    Difficulty     = "Easy",
+    Difficulty     = "Medium",
     AutoRunDungeon = true,
     UseRemotes     = false,  -- blind-firing guessed remotes; off by default
     DebugGui       = false,  -- full button dump on every queue (F6 does it too)
     LowerGraphics  = true,
 
-    MeleeRange     = 8,      -- swing left click when closer than this
+    -- ---- ENGAGEMENT DISTANCE -------------------------------
+    -- CircleRadius is the one that matters: it is how far the bot
+    -- orbits from the mob, so it IS the fighting distance. It has to
+    -- sit inside MeleeRange or the left-click swing never fires.
+    -- Lower CircleRadius to hug the mob, raise it to keep away.
+    CircleRadius   = 6,      -- <-- orbit distance = fighting distance
+    MeleeRange     = 9,      -- swing left click when closer than this
+    MinRange       = 4,      -- ease out if closer than this
+    MaxRange       = 14,     -- close in if farther than this
     AttackRange    = 25,     -- cast spells when closer than this
-    MinRange       = 7,     -- back off if closer than this
-    MaxRange       = 28,     -- close in if farther than this
+    -- --------------------------------------------------------
     DodgeRange     = 40,
     DodgeCooldown  = 0.9,
     DodgeStep      = 18,
     AttackRate     = 0.3,    -- spell cast rate
     MeleeRate      = 0.2,    -- melee swing rate
     WalkSpeed      = 0,      -- 0 = keep the character's own speed
-    CircleRadius   = 18,
     CircleSpeed    = 0.85,
     ScanRate       = 0.05,
     AimCamera      = true,   -- point the camera at the mob (DQR aims from camera)
@@ -1539,12 +1545,15 @@ local function MainLoop()
             orbitAngle = orbitAngle - math.pi * 2
         end
 
-        -- Scale orbit radius by current distance
+        -- Nudge the orbit radius by current distance. These used to be
+        -- 1.6x / 0.5x, which threw the bot out to ~29 studs whenever it
+        -- got close - so it backed itself out of melee range every time
+        -- it arrived. Gentle corrections keep it inside MeleeRange.
         local radius = CONFIG.CircleRadius
         if dist < CONFIG.MinRange then
-            radius = CONFIG.CircleRadius * 1.6
+            radius = CONFIG.CircleRadius * 1.25
         elseif dist > CONFIG.MaxRange then
-            radius = CONFIG.CircleRadius * 0.5
+            radius = CONFIG.CircleRadius * 0.7
         end
 
         local dest = GetOrbitPos(mobPos, radius)
@@ -1698,7 +1707,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v4.9 loaded.  F5 farm  F6 dump  F7 hide log")
+    print("[DQR] v5.0 loaded.  F5 farm  F6 dump  F7 hide log")
     NukeGraphics()
     S(2.5)
 
