@@ -14,7 +14,7 @@ local CONFIG = {
 
     MeleeRange     = 8,      -- swing left click when closer than this
     AttackRange    = 25,     -- cast spells when closer than this
-    MinRange       = 10,     -- back off if closer than this
+    MinRange       = 7,     -- back off if closer than this
     MaxRange       = 28,     -- close in if farther than this
     DodgeRange     = 40,
     DodgeCooldown  = 0.9,
