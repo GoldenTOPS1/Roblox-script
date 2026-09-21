@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v7.2
+--  DQR AUTO FARM v7.3
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -107,7 +107,9 @@ local CONFIG = {
     -- Performance. Scanners use the physics broadphase over a radius
     -- instead of walking the whole map, and cache their verdicts so the
     -- two 20Hz threads share one scan instead of doing two each.
-    MobScanRadius  = 300,    -- outermost ring when nothing is near
+    MobScanRadius  = 600,    -- outermost ring when nothing is near
+    BossHealthHint = 5000,   -- MaxHealth above this counts as an enemy
+                             -- even without a health bar over its head
     MaxQueryParts  = 2000,   -- cap per query; low values TRUNCATE results
                              -- non-deterministically and hide near mobs
     HazardTTL      = 0.1,    -- telegraph/beam scan at most 10x a second
@@ -1857,7 +1859,7 @@ local function GetNearestMob()
     lastScan = now
     local best, bestD = nil, math.huge
     local mobList = {}
-    local seen = {}
+    local seen = {}   -- reassigned between passes, so not a local const
 
     -- Find mobs by their HumanoidRootPart through the broadphase rather
     -- than walking every instance in the map.
@@ -1872,12 +1874,30 @@ local function GetNearestMob()
     -- a ring containing something humanoid-but-not-a-mob would stop the
     -- search and leave us with nothing. Run the real test per ring and
     -- widen until an actual mob turns up.
-    local function Consider(prt)
-        local obj = prt.Name == "HumanoidRootPart" and prt.Parent or nil
+    -- `deep` walks up from any part to find an owning Humanoid model.
+    -- The cheap path keys on a part literally named HumanoidRootPart,
+    -- which misses rigs that name their root anything else - bosses in
+    -- particular. The deep pass is only used when the cheap one finds
+    -- nothing, so the common case stays fast.
+    local function Consider(prt, deep)
+        local obj = nil
+        if prt.Name == "HumanoidRootPart" then
+            obj = prt.Parent
+        elseif deep then
+            local n = prt
+            for _ = 1, 3 do
+                if not n or n == workspace then break end
+                if n:IsA("Model") and n:FindFirstChildOfClass("Humanoid") then
+                    obj = n break
+                end
+                n = n.Parent
+            end
+        end
         if obj and obj:IsA("Model") and not seen[obj] then
             seen[obj] = true
             local hum = obj:FindFirstChildOfClass("Humanoid")
-            local mr  = prt
+            local mr  = obj:FindFirstChild("HumanoidRootPart")
+                     or obj.PrimaryPart or prt
             if hum and hum.Health > 0
             and hum.MaxHealth > 0 and not mr.Anchored then
                 local isPlayer = false
@@ -1902,7 +1922,14 @@ local function GetNearestMob()
                             if c:IsA("BasePart") or c:IsA("MeshPart")
                             or c:IsA("UnionOperation") then pc = pc + 1 end
                         end
-                        verdict = (hasBB and pc >= 2)
+                        -- A boss usually shows its health in a big GUI
+                        -- on screen rather than a BillboardGui over its
+                        -- head, so it fails the health-bar test and was
+                        -- invisible to the bot. A huge health pool is a
+                        -- reliable second signal that it is a real
+                        -- enemy and not scenery.
+                        local bossy = hum.MaxHealth >= CONFIG.BossHealthHint
+                        verdict = (hasBB and pc >= 2) or (bossy and pc >= 1)
                         mobShape[obj] = verdict
                     end
                     -- Skip anything the path worker has given up on, so
@@ -1932,10 +1959,34 @@ local function GetNearestMob()
     end
 
     for _, r in ipairs({60, 140, CONFIG.MobScanRadius}) do
-        for _, prt in ipairs(NearbyParts(root.Position, r)) do
-            Consider(prt)
+        local parts = NearbyParts(root.Position, r)
+        for _, prt in ipairs(parts) do Consider(prt, false) end
+        if #mobList == 0 then
+            -- Nothing by root-part name; look harder before widening.
+            seen = {}
+            for _, prt in ipairs(parts) do Consider(prt, true) end
         end
         if #mobList > 0 then break end
+    end
+
+    -- Last resort: the broadphase found nothing at any radius. Walk the
+    -- models directly, which is slow but only happens when the map
+    -- genuinely looks empty - and standing idle with a boss still alive
+    -- is far worse than one expensive scan.
+    if #mobList == 0 then
+        seen = {}
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") then
+                local anchor = obj:FindFirstChild("HumanoidRootPart")
+                            or obj.PrimaryPart
+                            or obj:FindFirstChildWhichIsA("BasePart")
+                if anchor then Consider(anchor, true) end
+            end
+        end
+        if #mobList > 0 then
+            print(("[DQR] Broadphase missed %d mob(s) - found them by "
+                .. "full scan."):format(#mobList))
+        end
     end
 
     -- Failsafe: if everything in range is blacklisted we would return
@@ -2294,6 +2345,7 @@ local lastCrowdWarn = 0
 local retreating   = false
 local lastStartCheck = 0
 local startVisible = false
+local lastNoTarget = 0
 
 -- Tracks how long the current target has held position
 local stillModel = nil
@@ -2437,6 +2489,11 @@ local function MainLoop()
             ClearRangeBar()
             StopFacing()
             seeded = false
+            if now - lastNoTarget > 5 then
+                lastNoTarget = now
+                print(("[DQR] No target. %d mob(s) in the scan, radius %d.")
+                    :format(#GetMobs(), CONFIG.MobScanRadius))
+            end
             S(CONFIG.ScanRate)
             continue
         end
@@ -2998,7 +3055,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v7.2 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v7.3 loaded.  F5 farm  F6 dump  F7 show/hide log")
     ApplyClass()
     NukeGraphics()
     S(2.5)
