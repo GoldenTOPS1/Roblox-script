@@ -1,7 +1,9 @@
 -- ============================================================
---  DQR AUTO FARM v8.5
+--  DQR AUTO FARM v9.5
+--  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
---  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
+--  exact-path lobby queue, on-screen log
+--  (F5 farm / F6 dump / F7 log / F8 mob diag / F9 hazard diag)
 -- ============================================================
 
 local CONFIG = {
@@ -12,7 +14,7 @@ local CONFIG = {
     -- set Class to "" if you want to tune the numbers yourself.
     Class          = "Warrior",
 
-    TargetDungeon  = "Pirate island",
+    TargetDungeon  = "Pirate Island",
     Difficulty     = "Insane",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
@@ -58,18 +60,35 @@ local CONFIG = {
     DodgeBeams     = true,
     BeamMinLen     = 12,     -- a laser is long in exactly one axis...
     BeamMaxThick   = 6,      -- ...and thin in the other two
-    BeamPad        = 5,      -- clearance to keep from the line
+    BeamPad        = 3,      -- clearance to keep from the line's edge
     BeamMinHeight  = 1.5,    -- a PERSISTENT beam must sit this far above
                              -- foot level, else it is floor decoration
     FootOffset     = 3,      -- studs from HumanoidRootPart down to feet
     RecentWindow   = 8,      -- a part this new counts as an attack
-    HazardDebug    = false,  -- log what the beam scanner reacts to
+    HazardDebug    = true,  -- log what the hazard scanner reacts to AND
+                             -- draw every footprint it sees as a red
+                             -- slab on the floor (F9 dumps the details)
 
     -- Ground telegraphs (the red strips a boss paints before it hits)
     DodgeTelegraph = true,
-    TelegraphPad   = 4,      -- treat this much beyond the edge as unsafe
+    TelegraphPad   = 3,      -- treat this much beyond the edge as unsafe
     TelegraphMinLen= 6,      -- ignore red parts smaller than this
     TelegraphMaxY  = 2,      -- ...and anything taller than this (props)
+    TelegraphMaxWide= 30,    -- ...and anything wider than this in its
+                             -- NARROW direction: a strip is narrow, a
+                             -- ring is small, a room floor is neither
+    -- Red is this game's colour for "about to be hit" and nothing on a
+    -- map is painted it, so a RED part is trusted past the caps above:
+    -- Captain Blackbeard's rings are 40 studs across, and a marker on
+    -- terrain is a slab sunk a few studs in to show through the grass.
+    RedMaxY        = 6,
+    RedMaxWide     = 80,
+    -- A part first seen well inside the scan radius (rather than
+    -- entering at its edge as we walk) counts as an attack that was
+    -- just moved in from an effect pool. Catches pooled effects parked
+    -- out of range; also catches map parts the capped broadphase query
+    -- happened to drop for a while, so it is off unless needed.
+    FreshSightRule = false,
 
     -- Crowd handling: keep clear of mobs other than the one being hit
     AvoidOtherMobs = true,
@@ -81,6 +100,26 @@ local CONFIG = {
     -- close you are. Fight them from further out, and never stand still.
     BossStandoff   = 10,
     HazardMargin   = 8,      -- extra studs to clear a hazard edge by
+    -- A BOSS that fires beams radially leaves narrow gaps up close and
+    -- wide ones further out. While the spokes are on the floor, fight
+    -- from far enough back that the middle of a gap is BeamGapWant
+    -- studs clear of both neighbours' pads, measured from the beams
+    -- actually there - or BeamSpread further out than usual when
+    -- there is nothing to measure. Bosses only: a wizard's single beam
+    -- is dodged sideways and the fight goes on where it was.
+    BeamGapWant    = 2,
+    BeamSpread     = 10,
+    BeamBackoffTime= 2,      -- seconds to stay backed off after the
+                             -- spokes are gone
+    BeamBackoffMax = 45,     -- never further out than this. NOT capped
+                             -- at spell range: with twenty spokes the
+                             -- first clear ring can be outside it, and
+                             -- capping walked the bot back into the fan
+    HoldSlack      = 2,      -- within CircleRadius + this = at fighting distance
+    EscapeMaxDist  = 30,     -- furthest one hazard escape will move us
+    EscapeClearWant= 4,      -- clearance from a hazard's pad that counts
+                             -- as safe; more than this buys nothing, so
+                             -- the exit stays close
     -- Route around beams instead of only escaping once standing in one.
     -- Costs two maths lookups per orbit candidate and a couple more on
     -- the path worker's thread; nothing is added to the frame handler.
@@ -126,7 +165,9 @@ local CONFIG = {
     -- two 20Hz threads share one scan instead of doing two each.
     MobScanRadius  = 600,    -- outermost ring when nothing is near
     BossHealthHint = 5000,   -- MaxHealth above this counts as an enemy
-                             -- even without a health bar over its head
+                             -- even without a health bar over its head;
+                             -- above this AND no bar over its head = a
+                             -- boss (its bar is at the top of the screen)
     MaxQueryParts  = 2000,   -- cap per query; low values TRUNCATE results
                              -- non-deterministically and hide near mobs
     HazardTTL      = 0.06,   -- telegraph/beam scan rate cap
@@ -484,24 +525,80 @@ local HazardAt
 -- ============================================================
 local beamObjects = setmetatable({}, {__mode = "k"})  -- Beam -> true
 local recentParts = setmetatable({}, {__mode = "k"})  -- BasePart -> born
+-- Beam-shaped parts the broadphase cannot see. GetPartBoundsInRadius
+-- skips anything with CanQuery off, and effect parts very often have it
+-- off so they stay out of the game's own raycasts. A pooled one is not
+-- "recent" either, so it was invisible to the scanner twice over.
+local hiddenBeams = setmetatable({}, {__mode = "k"})  -- BasePart -> true
+local IsBeamShape, BeamShaped   -- assigned with the beam scanner far below
+
+-- Handle adornments. A LineHandleAdornment is drawn one pixel wide at
+-- any distance - which is exactly what the Ice Elemental's hairline
+-- telegraph spokes look like - and it is not a part, so no part query,
+-- raycast or Beam registry will ever see it. They can be parented
+-- anywhere (a LocalScript often puts them in PlayerGui or the Camera),
+-- so this listens on the whole DataModel, not just workspace.
+local adornObjects = setmetatable({}, {__mode = "k"})  -- adornment -> true
+
+local function IsAdorn(o)
+    return o:IsA("LineHandleAdornment")
+        or o:IsA("CylinderHandleAdornment")
+        or o:IsA("BoxHandleAdornment")
+        or o:IsA("SphereHandleAdornment")
+        or o:IsA("ImageHandleAdornment")
+end
 
 workspace.DescendantAdded:Connect(function(o)
     if o:IsA("Beam") then
         beamObjects[o] = true
     elseif o:IsA("BasePart") then
         recentParts[o] = tick()
+        -- Shape only: a parked spoke is any colour and invisible.
+        if not o.CanQuery and BeamShaped and BeamShaped(o) then
+            hiddenBeams[o] = true
+        end
     end
 end)
 
 workspace.DescendantRemoving:Connect(function(o)
     beamObjects[o] = nil
     recentParts[o] = nil
+    hiddenBeams[o] = nil
 end)
 
--- Beams that already existed before the script loaded.
+pcall(function()
+    game.DescendantAdded:Connect(function(o)
+        if IsAdorn(o) then adornObjects[o] = true end
+    end)
+    game.DescendantRemoving:Connect(function(o)
+        adornObjects[o] = nil
+    end)
+end)
+
+-- Beams and adornments that already existed before the script loaded.
+-- The wait is needed: task.spawn runs its function immediately, before
+-- the rest of this file - BeamShaped included - has been defined.
 task.spawn(function()
+    S(1)
     for _, o in ipairs(workspace:GetDescendants()) do
-        if o:IsA("Beam") then beamObjects[o] = true end
+        if o:IsA("Beam") then
+            beamObjects[o] = true
+        elseif o:IsA("BasePart") and not o.CanQuery
+        and BeamShaped and BeamShaped(o) then
+            hiddenBeams[o] = true
+        elseif IsAdorn(o) then
+            adornObjects[o] = true
+        end
+    end
+    for _, name in ipairs({"PlayerGui", "CoreGui"}) do
+        pcall(function()
+            local root = LP:FindFirstChildOfClass(name)
+                      or game:FindFirstChildOfClass(name)
+            if not root then return end
+            for _, o in ipairs(root:GetDescendants()) do
+                if IsAdorn(o) then adornObjects[o] = true end
+            end
+        end)
     end
 end)
 
@@ -510,24 +607,84 @@ end)
 -- never "new", so DescendantAdded never sees it and the recent-spawn
 -- test misses it entirely. Movement is the giveaway - scenery never
 -- moves, a pooled effect gets CFramed into place the moment it fires.
-local effectSeen = setmetatable({}, {__mode = "k"})
+local PartSize, LooksActive
+do
 
-local function LooksActive(o)
-    local now = tick()
+local effectSeen = setmetatable({}, {__mode = "k"})
+local meshOf     = setmetatable({}, {__mode = "k"})  -- part -> mesh|false
+
+-- A part's size as drawn. Older games size an effect with a
+-- SpecialMesh's Scale and leave the Part itself at 1x1x1, which no
+-- shape test would ever call long or flat.
+function PartSize(o)
+    local m = meshOf[o]
+    if m == nil then
+        m = o:IsA("Part") and o:FindFirstChildOfClass("SpecialMesh") or false
+        meshOf[o] = m
+    end
+    if m and m.Parent then return o.Size * m.Scale end
+    return o.Size
+end
+
+-- `fresh` is the caller saying "this part was first seen well inside
+-- the scan radius, not at its edge". A part we have never seen before
+-- normally means WE walked into range of some scenery, and scenery
+-- always enters at the edge; one that appears deep inside the radius
+-- is a pooled effect just brought in from wherever it is parked. The
+-- beam and ring pools sit far under the map between casts, so there
+-- is no "parked" reading on record to compare against, and first
+-- sight is the only chance to notice them. Off unless FreshSightRule
+-- is set: the capped broadphase query drops parts arbitrarily when an
+-- area is busy, and a floor strip that flickers back into the results
+-- looks exactly like something that just arrived.
+function LooksActive(o, fresh)
+    local now  = tick()
     local born = recentParts[o]
-    if born and now - born < CONFIG.RecentWindow then return true end
+    local new  = born ~= nil and now - born < CONFIG.RecentWindow
+    fresh = fresh == true and CONFIG.FreshSightRule == true
 
     local rec = effectSeen[o]
+    -- Out of sight for a while and now back? As good as never seen: a
+    -- pooled spoke fired at the same angle as last time lands on
+    -- exactly the position we have on record, and would read as
+    -- "never moved". Scenery in range is seen every sweep, so its
+    -- record never goes stale.
+    if rec and now - rec.seen > 3 then rec = nil end
+    -- Returns active?, and WHY ("new", "moved", "faded", "grew",
+    -- "fresh") so a caller can weigh the evidence: a solid floor part
+    -- that just moved is one thing, one that merely faded is another.
     if not rec then
-        effectSeen[o] = {pos = o.Position, moved = 0}
-        return false
+        local why = new and "new" or fresh and "fresh" or nil
+        effectSeen[o] = {pos = o.Position, tr = o.Transparency,
+                         size = PartSize(o), moved = why and now or 0,
+                         why = why, seen = now}
+        if why == "fresh" and CONFIG.HazardDebug then
+            print("[DQR] Turned up beside us: " .. o:GetFullName())
+        end
+        return why ~= nil, why
     end
+    rec.seen = now
+    -- Movement, or a pooled effect being stretched out from nothing or
+    -- faded in from INVISIBLE. Scenery does none of these. Any change
+    -- of transparency used to count, and that flagged every glowing
+    -- inlay in the map that pulses between bright and dim.
+    local size, tr = PartSize(o), o.Transparency
+    local why = nil
     if (o.Position - rec.pos).Magnitude > 1 then
-        rec.pos   = o.Position
-        rec.moved = now
+        why = "moved"
+    elseif rec.tr > 0.9 and tr <= 0.9 then
+        why = "faded"
+    elseif (size - rec.size).Magnitude > 1 then
+        why = "grew"
     end
-    return (now - rec.moved) < CONFIG.RecentWindow
+    if why then rec.moved, rec.why = now, why end
+    rec.pos, rec.tr, rec.size = o.Position, tr, size
+    if new then return true, "new" end
+    if (now - rec.moved) < CONFIG.RecentWindow then return true, rec.why end
+    return false, nil
 end
+
+end -- of the LooksActive block
 
 -- ============================================================
 --  ARMOUR / COSMETIC STRIPPING
@@ -621,6 +778,7 @@ local bestFar    = math.huge  -- closest we have got to the target
 local bestFarAt  = 0     -- ...and when
 local unreachable = {}   -- model -> tick() until which to ignore it
 local pathTargetModel = nil  -- what MainLoop is currently chasing
+local engageRing = 0     -- MainLoop's current fighting distance to it
 
 local function ClearPath()
     pathQueue = {}
@@ -824,7 +982,8 @@ local function PathWorker(getDestFn)
                             -- we could actually be hitting from here.
                             if pathFail >= CONFIG.PathGiveUp
                             and pathTargetModel
-                            and howFar > CONFIG.CircleRadius * 1.5 then
+                            and howFar > math.max(engageRing,
+                                                  CONFIG.CircleRadius) * 1.5 then
                                 unreachable[pathTargetModel] =
                                     tick() + CONFIG.UnreachableFor
                                 print(("[DQR] %s unreachable at %d studs - switching.")
@@ -866,7 +1025,16 @@ local function PathWorker(getDestFn)
                                   + d.Unit * math.min(d.Magnitude, 12)
                         end
                     end
-                    if ahead and HazardAt(ahead) then
+                    -- Only when there is something to route AROUND. If
+                    -- we are already standing in it, the escape logic
+                    -- owns the problem; if the destination itself is
+                    -- in it, no route avoids it. Dropping the path in
+                    -- either case just meant dropping it again 0.4s
+                    -- later, forever - the bot paced at a doorway for
+                    -- as long as a false hazard covered the room.
+                    if ahead and HazardAt(ahead)
+                    and not HazardAt(root.Position)
+                    and not HazardAt(dest) then
                         -- Drop it and recompute. A path made before the
                         -- beam appeared points straight through it.
                         ClearPath()
@@ -896,7 +1064,12 @@ local function PathWorker(getDestFn)
                 -- meant a mob on a ledge 18 studs away counted as
                 -- engaged, so the watchdog reset forever while the bot
                 -- paced below it, unable to reach it.
-                if far <= CONFIG.CircleRadius * 1.5 then
+                -- That distance includes the target's own radius: a
+                -- boss is fought from 25+ studs root-to-root, and with
+                -- the bare CircleRadius here the watchdog decided we
+                -- were "not closing" on it, and blacklisted the boss
+                -- we were standing next to hitting.
+                if far <= math.max(engageRing, CONFIG.CircleRadius) * 1.5 then
                     bestFar, bestFarAt = far, tick()
                 elseif far < bestFar - 3 then
                     bestFar, bestFarAt = far, tick()
@@ -924,6 +1097,11 @@ local function PathWorker(getDestFn)
                     end
                 end
             else
+                -- No destination means stand still. A path or a steer
+                -- heading left over from the walk in would otherwise
+                -- keep the heartbeat walking it.
+                if #pathQueue > 0 then ClearPath() end
+                steerDir = nil
                 bestFar, bestFarAt = math.huge, tick()
             end
         end
@@ -1062,7 +1240,7 @@ local function StartMoving(getDestFn)
         -- the whole point is to stop heading where we were heading.
         if unstickDir and tick() < unstickUntil then
             step = pos + unstickDir * CONFIG.UnstickDist
-        elseif #pathQueue > 0 then
+        elseif dest and #pathQueue > 0 then
             local wp = pathQueue[1]
             local flatD = (Vector3.new(wp.Position.X, 0, wp.Position.Z)
                          - Vector3.new(pos.X, 0, pos.Z)).Magnitude
@@ -1099,7 +1277,7 @@ local function StartMoving(getDestFn)
                     human.Jump = true
                 end
             end
-        elseif steerDir then
+        elseif dest and steerDir then
             -- No path and the direct line is blocked: follow the clear
             -- heading the path worker probed instead of pressing into it.
             step = pos + steerDir * CONFIG.ProbeDist
@@ -1994,7 +2172,8 @@ local cachedMobs   = nil
 local lastScan     = 0
 local CACHE_TTL    = 0.15
 -- Weak keys: entries vanish when the mob model is collected.
-local mobShape = setmetatable({}, {__mode = "k"})
+local mobShape  = setmetatable({}, {__mode = "k"})
+local mobRadius = setmetatable({}, {__mode = "k"})
 
 local function GetNearestMob()
     local root = GetRoot()
@@ -2071,8 +2250,8 @@ local function GetNearestMob()
                     -- part) never changes for a given model, so do it
                     -- once and remember it. Running GetDescendants on
                     -- every model on every scan was the expensive half.
-                    local verdict = mobShape[obj]
-                    if verdict == nil then
+                    local shape = mobShape[obj]
+                    if shape == nil then
                         local hasBB = false
                         for _, c in ipairs(obj:GetDescendants()) do
                             if c:IsA("BillboardGui") or c:IsA("Highlight") then
@@ -2090,10 +2269,21 @@ local function GetNearestMob()
                         -- invisible to the bot. A huge health pool is a
                         -- reliable second signal that it is a real
                         -- enemy and not scenery.
-                        local bossy = hum.MaxHealth >= CONFIG.BossHealthHint
-                        verdict = (hasBB and pc >= 2) or (bossy and pc >= 1)
-                        mobShape[obj] = verdict
+                        shape = {ok = (hasBB and pc >= 2) or (bossy and pc >= 1),
+                                 bb = hasBB}
+                        mobShape[obj] = shape
                     end
+                    local verdict = shape.ok
+                    -- A BOSS, as opposed to a big mob: huge health pool
+                    -- AND no health bar over its head. Health alone was
+                    -- the test, and at this dungeon's level every Frost
+                    -- Minion has 9K, so every minion was a "boss" -
+                    -- direct approach, hazard backoff, beam-fan standoff
+                    -- and all - which is why the bot kept backing off
+                    -- ordinary mobs. The minions carry their bars over
+                    -- their heads; the Ice Elemental's is at the top of
+                    -- the screen.
+                    local isBoss = bossy and not shape.bb
                     -- Skip anything the path worker has given up on, so
                     -- we stop pressing into a mountain at a mob on the
                     -- far side of it and go fight something reachable.
@@ -2104,9 +2294,22 @@ local function GetNearestMob()
                     end
 
                     if verdict then
+                        -- How wide is it? Measured once per model. An
+                        -- Ice Elemental's surface is 15+ studs from its
+                        -- root, so every range has to account for that
+                        -- or the bot fights a phantom at the centre.
+                        local rad = mobRadius[obj]
+                        if rad == nil then
+                            local okx, sz = pcall(function()
+                                return obj:GetExtentsSize() end)
+                            rad = (okx and sz)
+                                and math.max(0, math.max(sz.X, sz.Z) / 2 - 2)
+                                or 0
+                            mobRadius[obj] = rad
+                        end
                         local d = (mr.Position - root.Position).Magnitude
                         local rec = {Model=obj, Root=mr, Humanoid=hum,
-                                     Distance=d, Boss=bossy}
+                                     Distance=d, Boss=isBoss, Radius=rad}
                         -- Every live mob goes in the list, blacklisted or
                         -- not: we still need to steer around one we have
                         -- given up on attacking.
@@ -2212,10 +2415,13 @@ local function MobDiag()
                     if c:IsA("BasePart") then pc = pc + 1 end
                 end
                 n = n + 1
-                print(("%s | d=%d hp=%d/%d root=%s anchored=%s bb=%s parts=%d cached=%s")
+                local shape = mobShape[obj]
+                print(("%s | d=%d hp=%d/%d root=%s anchored=%s bb=%s parts=%d cached=%s boss=%s")
                     :format(obj:GetFullName(), d, hum.Health, hum.MaxHealth,
                             mr.Name, tostring(mr.Anchored), tostring(hasBB),
-                            pc, tostring(mobShape[obj])))
+                            pc, tostring(shape and shape.ok),
+                            tostring(hum.MaxHealth >= CONFIG.BossHealthHint
+                                     and not hasBB)))
 
             elseif not hum and d >= 0 and d < 250 then
                 -- A rig with no Humanoid at all would be invisible to
@@ -2296,8 +2502,8 @@ local function DoMelee()
     end)
 end
 
-local function DoSpell(dist)
-    if dist > CONFIG.AttackRange then return end
+local function DoSpell(dist, range)
+    if dist > (range or CONFIG.AttackRange) then return end
     local now = tick()
     if now - lastSpell < CONFIG.AttackRate then return end
     lastSpell = now
@@ -2341,7 +2547,8 @@ local function ScanThreatsRaw()
             end
             -- Beams used to be handled here by fleeing the part's centre,
             -- which is wrong for a line: the way out of a laser is
-            -- sideways, not backwards. ScanBeams below does it properly.
+            -- sideways, not backwards. CollectBeams / FindEscape below
+            -- do it properly.
         end
     end
     return false, nil
@@ -2368,26 +2575,146 @@ end
 --  These need a different test: am I standing inside the rectangle?
 --  If so, leave across its NARROW axis, which is the shortest way out.
 -- ============================================================
-local function IsTelegraph(o)
+-- Everything from here to the end of HazardDiag sits in one `do` block
+-- so its two dozen helpers stop counting against Luau's limit of 200
+-- live locals in the main chunk. v8.6 crossed that limit, and an
+-- executor reports it as "attempt to call a nil value" on line 1 -
+-- loadstring returned nil and the loader called it. Only these three
+-- names, plus the forward-declared HazardAt, IsBeamShape and
+-- BeamShaped, are visible outside the block.
+local hazardCache, ScanHazards, HazardDiag
+do
+
+-- Set once per sweep by ScanHazards: is the scanner settled enough
+-- that a part first seen well inside its radius must have come to us?
+local sweepFresh = false
+local settledPos, settledAt = nil, 0
+
+-- A part's shape in WORLD terms: how tall it stands, and its two
+-- horizontal extents with their directions. Reading Size.Y for the
+-- height is wrong for anything rotated - a cylinder's axis is its X,
+-- so a ring painted on the floor is a cylinder lying on its side, and
+-- its Size.Y is the ring's diameter. The old test threw every one of
+-- those out as "a prop" for being too tall.
+local function Footprint(o)
+    local cf, s = o.CFrame, PartSize(o)
+    local rx = math.abs(cf.RightVector.Y)
+    local uy = math.abs(cf.UpVector.Y)
+    local lz = math.abs(cf.LookVector.Y)
+    local height = rx * s.X + uy * s.Y + lz * s.Z
+    -- Drop the most vertical axis; the other two are the footprint.
+    if rx >= uy and rx >= lz then
+        return height, s.Y, s.Z, cf.UpVector, cf.LookVector
+    elseif uy >= rx and uy >= lz then
+        return height, s.X, s.Z, cf.RightVector, cf.LookVector
+    else
+        return height, s.X, s.Y, cf.RightVector, cf.UpVector
+    end
+end
+
+-- The long axis of a part, as a segment plus a radius. For anything
+-- beam-shaped that is the beam; for anything else it is just its
+-- longest side, which NearDist below still finds useful.
+local function BeamSegment(o)
+    local s = PartSize(o)
+    local axis, half
+    if s.X >= s.Y and s.X >= s.Z then
+        axis = o.CFrame:VectorToWorldSpace(Vector3.new(1, 0, 0))
+        half = s.X / 2
+    elseif s.Y >= s.X and s.Y >= s.Z then
+        axis = o.CFrame:VectorToWorldSpace(Vector3.new(0, 1, 0))
+        half = s.Y / 2
+    else
+        axis = o.CFrame:VectorToWorldSpace(Vector3.new(0, 0, 1))
+        half = s.Z / 2
+    end
+    local thin = math.min(s.X, s.Y, s.Z)
+    return axis, half, thin / 2 + CONFIG.BeamPad
+end
+
+-- Horizontal distance from `p` to the segment a-b.
+local function SegDistFlat(p, a, b)
+    local ab = b - a
+    local len2 = ab:Dot(ab)
+    local t = len2 > 0.01 and math.clamp((p - a):Dot(ab) / len2, 0, 1) or 0
+    local n = a + ab * t
+    local dx, dz = p.X - n.X, p.Z - n.Z
+    return math.sqrt(dx * dx + dz * dz)
+end
+
+-- How near a part really is: distance to the closest point of its long
+-- axis, not to its centre. The centre of a 150-stud spoke sits 80
+-- studs off while the spoke itself runs under our feet, so every gate
+-- that compared centres was throwing the spokes away.
+local function NearDist(o, pos)
+    local axis, half = BeamSegment(o)
+    return SegDistFlat(pos, o.Position - axis * half, o.Position + axis * half)
+end
+
+-- `pos`/`radius` (optional) enable the first-sight rule in LooksActive:
+-- scenery enters the scan at its edge as we walk, so a part first seen
+-- well inside the radius appeared there.
+-- HazardDebug: a red part the size caps threw out, named once every few
+-- seconds, so a red ring the bot walked through can be traced to the
+-- cap that rejected it.
+local redRejectAt = setmetatable({}, {__mode = "k"})
+local function RedReject(o, red, why)
+    if red and CONFIG.HazardDebug then
+        local now = tick()
+        if not redRejectAt[o] or now - redRejectAt[o] > 5 then
+            redRejectAt[o] = now
+            print(("[DQR] Red part rejected (%s): %s size=%s")
+                :format(why, o:GetFullName(), tostring(PartSize(o))))
+        end
+    end
+    return false
+end
+
+local function IsTelegraph(o, pos, radius)
     if not o:IsA("BasePart") then return false end
     if IsOurs(o) then return false end
-    if o.Transparency > 0.95 then return false end
-    local s = o.Size
-    if s.Y > CONFIG.TelegraphMaxY then return false end          -- a prop
-    if math.max(s.X, s.Z) < CONFIG.TelegraphMinLen then return false end
-
+    -- Red is trusted further than any other colour: see RedMaxY.
     local c = o.Color
-    if c.R > 0.55 and c.G < 0.45 and c.B < 0.45 then return true end -- red
+    local red = c.R > 0.55 and c.G < 0.45 and c.B < 0.45
+    local maxY    = red and CONFIG.RedMaxY    or CONFIG.TelegraphMaxY
+    local maxWide = red and CONFIG.RedMaxWide or CONFIG.TelegraphMaxWide
+    local s = PartSize(o)
+    -- Cheap rejections before touching the CFrame: nothing whose
+    -- smallest side is taller than the limit can lie flat any way up.
+    if math.min(s.X, s.Y, s.Z) > maxY then return RedReject(o, red, "too thick") end
+    if math.max(s.X, s.Y, s.Z) < CONFIG.TelegraphMinLen then return false end
+    local height, a, b = Footprint(o)
+    if height > maxY then return RedReject(o, red, "too tall") end   -- a prop
+    if math.max(a, b) < CONFIG.TelegraphMinLen then return false end
+    -- A marker is a strip or a ring: narrow one way, or small. Wide
+    -- both ways is a floor, and a whole room floor was being flagged.
+    if math.min(a, b) > maxWide then return RedReject(o, red, "too wide") end
 
     -- Colour alone is not enough: the Ice Elemental paints CYAN rings,
     -- and cyan is also the colour of half the Winter Outpost scenery.
     -- What separates them is behaviour - the map is already there when
     -- we arrive and never moves; an attack marker either spawns or gets
-    -- moved into place mid-fight.
-    return LooksActive(o)
+    -- moved into place mid-fight. Asked BEFORE the visibility test, so
+    -- a ring that fades in from invisible has a parked reading on
+    -- record to be compared against.
+    local fresh = sweepFresh and pos ~= nil
+                  and NearDist(o, pos) < radius * 0.6
+    local active, why = LooksActive(o, fresh)
+    if o.Transparency > 0.95 then return false end
+
+    if red then return true end
+    if not active then return false end
+
+    -- You stand ON floors, so a solid part is map unless the evidence
+    -- is unambiguous: it was not here a moment ago, or it has just
+    -- been moved into place. Fading in, or turning up in the query
+    -- results, is not enough - a glowing floor inlay does both. (A
+    -- ring marker laid flush with the floor is very often left
+    -- collidable, so rejecting every solid part lost the rings.)
+    if o.CanCollide and why ~= "new" and why ~= "moved" then return false end
+    return true
 end
 
--- Returns a world position to run to, or nil when we are standing clear.
 -- ============================================================
 --  HAZARD FOOTPRINTS
 --  The scanners below already walk every nearby hazard part to answer
@@ -2401,125 +2728,172 @@ end
 -- ============================================================
 local hazardShapes = {}
 
-local function NoteDisc(cx, cy, cz, r)
-    hazardShapes[#hazardShapes + 1] =
-        {kind = "disc", x = cx, y = cy, z = cz, r = r}
+-- A footprint this far across in its narrow direction cannot be
+-- stepped out of within an escape's reach, and while it is in the
+-- list every point around us reads as "inside", which hides the
+-- hazards that CAN be dodged. Kept, but skipped when that happens.
+local HUGE = 35
+
+-- HazardDebug: a census. Every footprint names the instance it came
+-- from, once every few seconds per instance, so a slab on screen that
+-- matches nothing visible can be traced to what produced it. Copy the
+-- log while the slab is there, or press F9 for the current list.
+local censusAt = setmetatable({}, {__mode = "k"})
+local function Census(src, what)
+    if not CONFIG.HazardDebug or not src then return end
+    local now = tick()
+    if censusAt[src] and now - censusAt[src] < 5 then return end
+    censusAt[src] = now
+    print(("[DQR] Hazard %s <- %s (%s)")
+        :format(what, src:GetFullName(), src.ClassName))
 end
 
-local function NoteBox(cf, hx, hz, cy)
-    hazardShapes[#hazardShapes + 1] =
-        {kind = "box", cf = cf, hx = hx, hz = hz, y = cy}
+local function Describe(h)
+    if h.kind == "disc" then
+        return ("disc r=%d"):format(h.r)
+    elseif h.kind == "box" then
+        return ("box %dx%d"):format(h.hx * 2, h.hz * 2)
+    end
+    return ("line len=%d r=%d"):format((h.b - h.a).Magnitude, h.r)
 end
 
-local function NoteLine(a, b, r)
-    hazardShapes[#hazardShapes + 1] = {kind = "line", a = a, b = b, r = r}
+local function NoteDisc(cx, cy, cz, r, src)
+    local h = {kind = "disc", x = cx, y = cy, z = cz, r = r,
+               huge = r > HUGE, src = src}
+    hazardShapes[#hazardShapes + 1] = h
+    Census(src, Describe(h))
 end
 
--- Is this world point inside a known hazard? Pure maths over a short
--- list - typically a handful of entries.
-function HazardAt(p)
+local function NoteBox(cf, hx, hz, cy, src)
+    local h = {kind = "box", cf = cf, hx = hx, hz = hz, y = cy,
+               huge = math.min(hx, hz) > HUGE, src = src}
+    hazardShapes[#hazardShapes + 1] = h
+    Census(src, Describe(h))
+end
+
+local function NoteLine(a, b, r, src)
+    local h = {kind = "line", a = a, b = b, r = r, huge = r > HUGE, src = src}
+    hazardShapes[#hazardShapes + 1] = h
+    Census(src, Describe(h))
+end
+
+-- How far this world point is from the nearest hazard edge: negative
+-- means inside one, by that much. Pure maths over a short list -
+-- typically a handful of entries.
+local function HazardClearance(p, ignoreHuge)
+    local best = math.huge
     for _, h in ipairs(hazardShapes) do
-        if h.kind == "disc" then
-            local dx, dz = p.X - h.x, p.Z - h.z
-            if (dx * dx + dz * dz) < (h.r * h.r)
-            and math.abs(p.Y - h.y) < 14 then return true end
+        local c = nil
+        -- The vertical tolerance is a body's worth: a ring sits at
+        -- foot level, a laser at chest height. Fourteen studs also
+        -- took in effect parts parked under the floor between casts.
+        if ignoreHuge and h.huge then
+            -- skip
+        elseif h.kind == "disc" then
+            if math.abs(p.Y - h.y) < 8 then
+                local dx, dz = p.X - h.x, p.Z - h.z
+                c = math.sqrt(dx * dx + dz * dz) - h.r
+            end
         elseif h.kind == "box" then
             local rel = h.cf:PointToObjectSpace(p)
-            if math.abs(rel.X) < h.hx and math.abs(rel.Z) < h.hz
-            and math.abs(rel.Y) < 14 then return true end
+            if math.abs(rel.Y) < 8 then
+                c = math.max(math.abs(rel.X) - h.hx, math.abs(rel.Z) - h.hz)
+            end
         else
             local ab = h.b - h.a
             local len2 = ab:Dot(ab)
             if len2 > 0.01 then
                 local t = math.clamp((p - h.a):Dot(ab) / len2, 0, 1)
                 local n = h.a + ab * t
-                local dx, dz = p.X - n.X, p.Z - n.Z
-                if (dx * dx + dz * dz) < (h.r * h.r)
-                and math.abs(p.Y - n.Y) < 12 then return true end
+                if math.abs(p.Y - n.Y) < 8 then
+                    local dx, dz = p.X - n.X, p.Z - n.Z
+                    c = math.sqrt(dx * dx + dz * dz) - h.r
+                end
             end
         end
+        if c and c < best then best = c end
+    end
+    return best
+end
+
+-- Is this world point inside a known hazard?
+function HazardAt(p)
+    return HazardClearance(p) < 0
+end
+
+-- Our own character and other players' throw off parts constantly -
+-- weapon trails, spell effects - and none of it is a thing to run from.
+local function PlayerOwned(o)
+    for _, pl in ipairs(Players:GetPlayers()) do
+        local c = pl.Character
+        if c and o:IsDescendantOf(c) then return true end
     end
     return false
 end
 
-local function ScanTelegraphs()
-    if not CONFIG.DodgeTelegraph then return nil end
-    local root = GetRoot()
-    if not root then return nil end
-    local char = GetChar()
-    local pos  = root.Position
+-- Everything near `pos` that could be a hazard. The broadphase never
+-- returns a part with CanQuery off - and effect parts very often have
+-- it off so they stay out of the game's own raycasts - but the spawn
+-- registry saw those arrive regardless, so add them to what it found.
+local function HazardCandidates(pos, radius)
+    -- The wide query is capped at MaxQueryParts and truncates
+    -- arbitrarily past that, so in a busy arena the ring under our
+    -- feet could be missing from it for a sweep - which stopped an
+    -- escape dead in the middle of the ring. A small query cannot
+    -- overflow, so anything actually touching us is guaranteed.
+    local list = NearbyParts(pos, 10)
+    local done = {}
+    for _, o in ipairs(list) do done[o] = true end
+    for _, o in ipairs(NearbyParts(pos, radius)) do
+        if not done[o] then
+            done[o] = true
+            list[#list + 1] = o
+        end
+    end
+    local now = tick()
+    for p, born in pairs(recentParts) do
+        if not p.Parent or now - born > CONFIG.RecentWindow then
+            recentParts[p] = nil
+        elseif not done[p] and not p.CanQuery and NearDist(p, pos) < radius then
+            list[#list + 1] = p
+        end
+    end
+    return list
+end
 
-    local worstDepth, escape = 0, nil
-
-    for _, o in ipairs(NearbyParts(pos, CONFIG.DodgeRange)) do
-        if IsTelegraph(o) then
-            local s = o.Size
+-- Records the footprint of every ground telegraph near `pos`. Just the
+-- shapes: deciding where to go is done afterwards, over all of them.
+local function CollectTelegraphs(pos)
+    if not CONFIG.DodgeTelegraph then return end
+    local radius = CONFIG.DodgeRange
+    for _, o in ipairs(HazardCandidates(pos, radius)) do
+        if IsTelegraph(o, pos, radius) and not PlayerOwned(o) then
+            local _, a, b, va = Footprint(o)
             -- A ring AoE is as wide as it is long. Treating it as a box
             -- would pick one of its axes and walk us along a chord;
             -- the way out of a circle is straight outward from the
             -- centre, and that is also the shortest exit.
-            -- Shape exists only on Part; reading it on a MeshPart or a
-            -- Union throws, and an error in here kills the scan thread.
-            local round = false
-            if o:IsA("Part") then
-                round = o.Shape == Enum.PartType.Cylinder
-                     or o.Shape == Enum.PartType.Ball
-            end
-            if math.abs(s.X - s.Z) < 2 or round then
-                local r = math.max(s.X, s.Z) / 2 + CONFIG.TelegraphPad
-                NoteDisc(o.Position.X, o.Position.Y, o.Position.Z, r)
-                local away = Vector3.new(pos.X - o.Position.X, 0,
-                                         pos.Z - o.Position.Z)
-                local d = away.Magnitude
-                if d < r and math.abs(o.Position.Y - pos.Y) < 14 then
-                    local depth = r - d
-                    if depth > worstDepth then
-                        local dir = d < 0.5 and Vector3.new(1, 0, 0)
-                                            or away.Unit
-                        local p = SafeStep(pos, dir, depth + CONFIG.HazardMargin)
-                        if p then
-                            worstDepth = depth
-                            escape = p
-                            if CONFIG.HazardDebug then
-                                print(("[DQR] Ring AoE: %s r=%d depth=%d")
-                                    :format(o:GetFullName(), r, depth))
-                            end
-                        end
-                    end
-                end
+            -- Judged by the footprint alone. "A cylinder Part is a
+            -- ring" used to short-circuit this, and the Frost Wizard's
+            -- laser hitbox is a cylinder lying along the beam - 50 long,
+            -- 2 across - which became a ring 56 studs wide: the huge
+            -- slab that covered the room every time a wizard fired.
+            if math.abs(a - b) < 2 then
+                NoteDisc(o.Position.X, o.Position.Y, o.Position.Z,
+                         math.max(a, b) / 2 + CONFIG.TelegraphPad, o)
             else
-                -- Where do we stand in the strip's own axes?
-                local rel = o.CFrame:PointToObjectSpace(pos)
-                local hx  = o.Size.X / 2 + CONFIG.TelegraphPad
-                local hz  = o.Size.Z / 2 + CONFIG.TelegraphPad
-                NoteBox(o.CFrame, hx, hz, o.Position.Y)
-                if math.abs(rel.X) < hx and math.abs(rel.Z) < hz
-                and math.abs(rel.Y) < 14 then
-                    local outX = hx - math.abs(rel.X)  -- cost to leave sideways
-                    local outZ = hz - math.abs(rel.Z)  -- cost to leave endwise
-                    local depth = math.min(outX, outZ)
-                    if depth > worstDepth then
-                        local axis, sign
-                        if outX <= outZ then
-                            axis = o.CFrame:VectorToWorldSpace(Vector3.new(1, 0, 0))
-                            sign = rel.X >= 0 and 1 or -1
-                        else
-                            axis = o.CFrame:VectorToWorldSpace(Vector3.new(0, 0, 1))
-                            sign = rel.Z >= 0 and 1 or -1
-                        end
-                        local d = Vector3.new(axis.X, 0, axis.Z) * sign
-                        -- Only accept an exit we can actually walk.
-                        local p = SafeStep(pos, d, depth + CONFIG.HazardMargin)
-                        if p then
-                            worstDepth = depth
-                            escape = p
-                        end
-                    end
-                end
+                -- A level frame whose X runs along the strip's first
+                -- horizontal axis, so the box test can use it directly
+                -- whichever way up the part happens to be built.
+                local ax = Vector3.new(va.X, 0, va.Z)
+                if ax.Magnitude < 0.01 then ax = Vector3.new(1, 0, 0) end
+                local cf = CFrame.fromMatrix(o.Position, ax.Unit,
+                                             Vector3.new(0, 1, 0))
+                NoteBox(cf, a / 2 + CONFIG.TelegraphPad,
+                        b / 2 + CONFIG.TelegraphPad, o.Position.Y, o)
             end
         end
     end
-    return escape
 end
 
 -- ============================================================
@@ -2548,92 +2922,87 @@ end
 local function AtBodyHeight(o)
     local root = GetRoot()
     if not root then return true end
-    local top  = o.Position.Y + o.Size.Y / 2
+    local height = Footprint(o)
+    local top  = o.Position.Y + height / 2
     local foot = root.Position.Y - CONFIG.FootOffset
     return top > foot + CONFIG.BeamMinHeight
 end
 
--- Shape and look only - no height rule. Used for parts we already know
--- are new, where "it just appeared" is the evidence that it is an attack.
-local function IsBeamShape(o)
+-- Geometry only: long in exactly one axis, thin in the other two.
+-- Declared at the top of the file: the spawn watcher and SurfaceRadius
+-- use it too.
+function BeamShaped(o)
     if not o:IsA("BasePart") then return false end
     if IsOurs(o) then return false end
-    if o.Transparency > 0.9 then return false end
+    local s = PartSize(o)
+    local x, y, z = s.X, s.Y, s.Z
+    local minLen, maxThick = CONFIG.BeamMinLen, CONFIG.BeamMaxThick
+    local long = (x >= minLen and 1 or 0) + (y >= minLen and 1 or 0)
+               + (z >= minLen and 1 or 0)
+    local thin = (x <= maxThick and 1 or 0) + (y <= maxThick and 1 or 0)
+               + (z <= maxThick and 1 or 0)
+    return long == 1 and thin >= 2
+end
 
-    local s = o.Size
-    local long, thin = 0, 0
-    for _, d in ipairs({s.X, s.Y, s.Z}) do
-        if d >= CONFIG.BeamMinLen   then long = long + 1 end
-        if d <= CONFIG.BeamMaxThick then thin = thin + 1 end
-    end
-    if long ~= 1 or thin < 2 then return false end
-
+-- Shape and look - no height rule, and no visibility rule either: this
+-- is what the spawn watcher at the top of the file uses to register
+-- hidden (CanQuery off) beams, and a pooled beam is parked at
+-- Transparency 1 until the moment it fires.
+function IsBeamShape(o)
+    if not BeamShaped(o) then return false end
     return o.Material == Enum.Material.Neon or ColorIsBeam(o.Color)
 end
 
--- For parts that have been sitting there. Adds the height rule, because
--- with no evidence of activity a floor stripe and a laser are otherwise
--- indistinguishable - unless the thing has just moved, which scenery
--- never does.
-local function IsBeamPart(o)
-    if not IsBeamShape(o) then return false end
-    return AtBodyHeight(o) or LooksActive(o)
+-- For a part that has JUST appeared, "it is long and thin and it was
+-- not here a moment ago" is all the evidence needed. The colour test
+-- exists to tell a laser from the scenery, and scenery does not spawn
+-- mid-fight - which is also why a pale blue or white laser was being
+-- ignored. An invisible one is a hitbox and counts too, unless it is
+-- solid, in which case it is a wall that has just gone up.
+local function IsNewBeam(o)
+    if not BeamShaped(o) then return false end
+    -- Solid means a bar, a rail, a gate that has just closed: map.
+    if o.CanCollide then return false end
+    -- Invisible used to count too, as a hitbox. But an attack also
+    -- spawns invisible helpers - aim guides, sound carriers - and one
+    -- of those became a hazard with nothing on screen to match it.
+    -- Every beam that has actually hit us has been visible.
+    if o.Transparency > 0.9 then return false end
+    return true
 end
 
--- Sideways escape from a line through `c` along `axis`, half-length `half`.
-local function EscapeFromLine(pos, c, axis, half, clear)
-    local toUs  = pos - c
-    local along = toUs:Dot(axis)
-    if math.abs(along) > half + CONFIG.BeamPad then return nil end  -- past the end
-
-    local perp = toUs - axis * along
-    perp = Vector3.new(perp.X, 0, perp.Z)
-    local d = perp.Magnitude
-    if d > clear then return nil end
-
-    local out
-    if d < 0.1 then
-        -- Standing dead on the line: any perpendicular will do.
-        out = Vector3.new(-axis.Z, 0, axis.X)
-        if out.Magnitude < 0.01 then out = Vector3.new(1, 0, 0) end
-    else
-        out = perp
-    end
-    -- Sidestep only somewhere there is actually room to stand.
-    return SafeStep(pos, out, clear - d + CONFIG.HazardMargin)
-end
-
--- Escape from a long thin part, treating it as a line.
--- The long axis of a beam-shaped part, as a segment plus a radius.
-local function BeamSegment(o)
-    local s = o.Size
-    local axis, half
-    if s.X >= s.Y and s.X >= s.Z then
-        axis = o.CFrame:VectorToWorldSpace(Vector3.new(1, 0, 0))
-        half = s.X / 2
-    elseif s.Y >= s.X and s.Y >= s.Z then
-        axis = o.CFrame:VectorToWorldSpace(Vector3.new(0, 1, 0))
-        half = s.Y / 2
-    else
-        axis = o.CFrame:VectorToWorldSpace(Vector3.new(0, 0, 1))
-        half = s.Z / 2
-    end
-    local thin = math.min(s.X, s.Y, s.Z)
-    return axis, half, thin / 2 + CONFIG.BeamPad
-end
-
-local function EscapeFromBeamPart(pos, o)
+local function NoteBeamPart(o)
     local axis, half, r = BeamSegment(o)
-    NoteLine(o.Position - axis * half, o.Position + axis * half, r)
-    return EscapeFromLine(pos, o.Position, axis, half, r)
+    NoteLine(o.Position - axis * half, o.Position + axis * half, r, o)
 end
 
-local function ScanBeams()
-    if not CONFIG.DodgeBeams then return nil end
-    local root = GetRoot()
-    if not root then return nil end
-    local pos  = root.Position
-    local now  = tick()
+-- A Beam instance that could actually be a laser. Games use Beams for
+-- all sorts - a wide flat texture strip under a mob, an invisible one
+-- left Enabled with its transparency at 1 - and taking every Beam's
+-- Width as a laser's thickness produced a hazard many times the size
+-- of anything on screen. A laser is thin, visible and not absurdly
+-- long.
+local function BeamIsLaser(beam, a, b)
+    local w = math.max(beam.Width0, beam.Width1)
+    if w <= 0 or w > CONFIG.BeamMaxThick + 2 then return false end
+    if (b - a).Magnitude > 300 then return false end
+    local ok, visible = pcall(function()
+        local minT = 1
+        for _, k in ipairs(beam.Transparency.Keypoints) do
+            if k.Value < minT then minT = k.Value end
+        end
+        return minT < 0.9
+    end)
+    return ok and visible
+end
+
+-- Records every beam near `pos` as a line footprint. Shapes only, no
+-- decisions: an exit chosen while only half the beams were known was
+-- an exit straight into the other half.
+local function CollectBeams(pos)
+    if not CONFIG.DodgeBeams then return end
+    local now   = tick()
+    local reach = CONFIG.DodgeRange
 
     -- 1. Every Beam object in the world, from the live registry.
     --
@@ -2644,22 +3013,14 @@ local function ScanBeams()
     -- away and out of the query. That is why real beams were missed.
     for beam in pairs(beamObjects) do
         if beam.Parent and beam.Enabled
-        and beam.Attachment0 and beam.Attachment1 then
+        and beam.Attachment0 and beam.Attachment1
+        and not PlayerOwned(beam) then
             local okA, a = pcall(function() return beam.Attachment0.WorldPosition end)
             local okB, b = pcall(function() return beam.Attachment1.WorldPosition end)
-            if okA and okB then
-                local seg = b - a
-                if seg.Magnitude > 1 then
-                    NoteLine(a, b, CONFIG.BeamPad)
-                    local esc = EscapeFromLine(pos, (a + b) / 2,
-                        seg.Unit, seg.Magnitude / 2, CONFIG.BeamPad)
-                    if esc then
-                        if CONFIG.HazardDebug then
-                            print("[DQR] Beam object: " .. beam:GetFullName())
-                        end
-                        return esc
-                    end
-                end
+            if okA and okB and (b - a).Magnitude > 1
+            and SegDistFlat(pos, a, b) < reach and BeamIsLaser(beam, a, b) then
+                local w = math.max(beam.Width0, beam.Width1) / 2
+                NoteLine(a, b, w + CONFIG.BeamPad, beam)
             end
         end
     end
@@ -2671,55 +3032,579 @@ local function ScanBeams()
     for p, born in pairs(recentParts) do
         if not p.Parent or now - born > CONFIG.RecentWindow then
             recentParts[p] = nil
-        elseif IsBeamShape(p) and (p.Position - pos).Magnitude
-               < CONFIG.DodgeRange * 2 then
-            local esc = EscapeFromBeamPart(pos, p)
-            if esc then
-                if CONFIG.HazardDebug then
-                    print(("[DQR] New beam part: %s size=%s mat=%s age=%.1fs")
-                        :format(p:GetFullName(), tostring(p.Size),
-                                tostring(p.Material), now - born))
-                end
-                return esc
-            end
+        elseif IsNewBeam(p) and NearDist(p, pos) < reach
+        and not PlayerOwned(p) then
+            NoteBeamPart(p)
         end
     end
 
-    -- 3. Persistent beam-shaped parts at body height (a channelled
-    --    laser that was already there when we arrived).
-    for _, o in ipairs(NearbyParts(pos, CONFIG.DodgeRange * 2)) do
-        if IsBeamPart(o) then
-            local esc = EscapeFromBeamPart(pos, o)
-            if esc then
-                if CONFIG.HazardDebug then
-                    print("[DQR] Standing beam: " .. o:GetFullName())
+    -- 3. Everything beam-shaped that has been sitting there, plus the
+    --    ones the broadphase cannot see. Two ways in:
+    --      * it has just been moved, resized, faded in or has turned up
+    --        beside us - a pooled effect being fired, whatever colour
+    --        it is. The Ice Elemental's telegraph spokes are hairline
+    --        and near-white, and the blue test threw them all away;
+    --      * or it is a standing laser at body height, which DOES have
+    --        to look like one, since a blue ice crystal is the same
+    --        shape and never moves.
+    --    The activity test runs before the visibility one so a parked,
+    --    invisible spoke is on record when it fades in.
+    local done = {}
+    local function Consider(o)
+        if done[o] or not BeamShaped(o) or PlayerOwned(o) then return end
+        done[o] = true
+        -- Solid means a bar, a rail, a floor strip you stand on: map.
+        if o.CanCollide then return end
+        -- Scenery enters the scan at its edge as we walk; a part first
+        -- seen well inside it appeared there.
+        local fresh  = sweepFresh and NearDist(o, pos) < reach * 0.6
+        local active = LooksActive(o, fresh)
+        if recentParts[o] then return end           -- noted above already
+        if o.Transparency > 0.9 then return end     -- parked, not firing
+        if active or (IsBeamShape(o) and AtBodyHeight(o)) then
+            NoteBeamPart(o)
+        end
+    end
+    -- The broadphase query is CAPPED at MaxQueryParts and truncates
+    -- arbitrarily past that - not by distance - so in a busy arena a
+    -- spoke under our feet could simply be missing from the wide query
+    -- while a pillar 70 studs off was included. A small query first
+    -- cannot overflow, so anything actually touching us is guaranteed.
+    -- The wide one is as far as we plan escapes; a long spoke is
+    -- returned by either as long as any part of it is inside, since
+    -- the query is against bounds, not centres.
+    for _, o in ipairs(NearbyParts(pos, 10)) do Consider(o) end
+    for _, o in ipairs(NearbyParts(pos, reach)) do Consider(o) end
+    for o in pairs(hiddenBeams) do
+        if not o.Parent then
+            hiddenBeams[o] = nil
+        elseif NearDist(o, pos) < reach then
+            Consider(o)
+        end
+    end
+
+    -- 4. Handle adornments - drawn, not built, so nothing above can see
+    --    them. World placement is the adornee's frame times the
+    --    adornment's own. A line runs from its origin along its
+    --    LookVector for Length studs (CFrame.new(from, to) plus
+    --    Length = distance is the idiom everyone uses to draw one); a
+    --    cylinder is centred, along the same axis; a sphere or a flat
+    --    image is a ring on the floor; a box is a beam if it is thin
+    --    and a strip or ring telegraph if it is flat.
+    for ad in pairs(adornObjects) do
+        pcall(function()
+            local adornee = ad.Adornee
+            if not ad.Parent or not ad.Visible or not adornee
+            or ad.Transparency > 0.9 then return end
+            local acf = adornee:IsA("Model") and adornee:GetPivot()
+                     or adornee.CFrame
+            local cf = acf * ad.CFrame
+            local a, b, r
+            if ad:IsA("LineHandleAdornment") then
+                a = cf.Position
+                b = cf.Position + cf.LookVector * ad.Length
+                r = CONFIG.BeamPad
+            elseif ad:IsA("CylinderHandleAdornment") then
+                local h = ad.Height / 2
+                if math.abs(cf.LookVector.Y) > 0.7 then
+                    -- Standing on end: a disc painted on the floor -
+                    -- the ring under the boss that the spokes fan out
+                    -- across. As a "line" this covered the whole
+                    -- arena in one footprint.
+                    if (cf.Position - pos).Magnitude < reach + ad.Radius then
+                        NoteDisc(cf.Position.X, cf.Position.Y, cf.Position.Z,
+                                 ad.Radius + CONFIG.TelegraphPad, ad)
+                    end
+                    return
                 end
-                return esc
+                a = cf.Position - cf.LookVector * h
+                b = cf.Position + cf.LookVector * h
+                r = ad.Radius + CONFIG.BeamPad
+            elseif ad:IsA("SphereHandleAdornment") then
+                -- A ring on the floor drawn as a squashed sphere.
+                if ad.Radius * 2 >= CONFIG.TelegraphMinLen
+                and (cf.Position - pos).Magnitude < reach + ad.Radius then
+                    NoteDisc(cf.Position.X, cf.Position.Y, cf.Position.Z,
+                             ad.Radius + CONFIG.TelegraphPad, ad)
+                end
+                return
+            elseif ad:IsA("ImageHandleAdornment") then
+                -- A picture in the adornment's XY plane: on the floor
+                -- when its Z axis points up. Ring or strip by shape.
+                if math.abs(cf.LookVector.Y) < 0.7 then return end
+                local sx, sy = ad.Size.X, ad.Size.Y
+                if math.max(sx, sy) < CONFIG.TelegraphMinLen
+                or SegDistFlat(pos, cf.Position - cf.RightVector * sx / 2,
+                                    cf.Position + cf.RightVector * sx / 2)
+                   > reach + sy then return end
+                if math.abs(sx - sy) < 2 then
+                    NoteDisc(cf.Position.X, cf.Position.Y, cf.Position.Z,
+                             math.max(sx, sy) / 2 + CONFIG.TelegraphPad, ad)
+                else
+                    local ax = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z)
+                    if ax.Magnitude < 0.01 then ax = Vector3.new(1, 0, 0) end
+                    NoteBox(CFrame.fromMatrix(cf.Position, ax.Unit,
+                                              Vector3.new(0, 1, 0)),
+                            sx / 2 + CONFIG.TelegraphPad,
+                            sy / 2 + CONFIG.TelegraphPad, cf.Position.Y, ad)
+                end
+                return
+            else
+                local s = ad.Size
+                local axis, half, thin
+                if s.X >= s.Y and s.X >= s.Z then
+                    axis, half = cf.RightVector, s.X / 2
+                elseif s.Y >= s.X and s.Y >= s.Z then
+                    axis, half = cf.UpVector, s.Y / 2
+                else
+                    axis, half = cf.LookVector, s.Z / 2
+                end
+                thin = math.min(s.X, s.Y, s.Z)
+                if thin > CONFIG.BeamMaxThick or half * 2 < CONFIG.BeamMinLen then
+                    -- Not a beam. A flat wide box lying on the floor is
+                    -- a strip or a ring telegraph, same as a flat part.
+                    local height = math.abs(cf.RightVector.Y) * s.X
+                                 + math.abs(cf.UpVector.Y) * s.Y
+                                 + math.abs(cf.LookVector.Y) * s.Z
+                    if height > CONFIG.RedMaxY then return end
+                    local fa, fb, va
+                    if math.abs(cf.RightVector.Y) >= 0.7 then
+                        fa, fb, va = s.Y, s.Z, cf.UpVector
+                    elseif math.abs(cf.UpVector.Y) >= 0.7 then
+                        fa, fb, va = s.X, s.Z, cf.RightVector
+                    else
+                        fa, fb, va = s.X, s.Y, cf.RightVector
+                    end
+                    if math.max(fa, fb) < CONFIG.TelegraphMinLen
+                    or (cf.Position - pos).Magnitude > reach + math.max(fa, fb) then
+                        return
+                    end
+                    if math.abs(fa - fb) < 2 then
+                        NoteDisc(cf.Position.X, cf.Position.Y, cf.Position.Z,
+                                 math.max(fa, fb) / 2 + CONFIG.TelegraphPad, ad)
+                    else
+                        local ax = Vector3.new(va.X, 0, va.Z)
+                        if ax.Magnitude < 0.01 then ax = Vector3.new(1, 0, 0) end
+                        NoteBox(CFrame.fromMatrix(cf.Position, ax.Unit,
+                                                  Vector3.new(0, 1, 0)),
+                                fa / 2 + CONFIG.TelegraphPad,
+                                fb / 2 + CONFIG.TelegraphPad, cf.Position.Y, ad)
+                    end
+                    return
+                end
+                a = cf.Position - axis * half
+                b = cf.Position + axis * half
+                r = thin / 2 + CONFIG.BeamPad
+            end
+            if (b - a).Magnitude >= CONFIG.BeamMinLen
+            and SegDistFlat(pos, a, b) < reach then
+                NoteLine(a, b, r, ad)
+            end
+        end)
+    end
+end
+
+-- Are the line hazards spokes radiating from `c`? Returns how many
+-- are, the smallest angle between two neighbouring spokes (nil when
+-- there are fewer than three to measure), and the widest spoke's
+-- radius, pad included.
+local function RadialSpokes(c)
+    local angs = {}
+    local rMax = CONFIG.BeamPad
+    local function Spoke(a, b, r)
+        if r and r > rMax then rMax = r end
+        local ab = b - a
+        local len2 = ab:Dot(ab)
+        if len2 < 0.01 then return end
+        local t = (c - a):Dot(ab) / len2
+        if t < -0.3 or t > 1.3 then return end      -- c is off the end
+        local n = a + ab * t
+        local dx, dz = c.X - n.X, c.Z - n.Z
+        if dx * dx + dz * dz > 49 then return end   -- misses c by > 7
+        local ra = Vector3.new(a.X - c.X, 0, a.Z - c.Z)
+        local rb = Vector3.new(b.X - c.X, 0, b.Z - c.Z)
+        if ra:Dot(rb) < 0 then
+            -- Straight through the centre: a spoke each way.
+            if ra.Magnitude > 4 then angs[#angs + 1] = math.atan2(ra.Z, ra.X) end
+            if rb.Magnitude > 4 then angs[#angs + 1] = math.atan2(rb.Z, rb.X) end
+        else
+            local far = ra.Magnitude > rb.Magnitude and ra or rb
+            if far.Magnitude > 4 then angs[#angs + 1] = math.atan2(far.Z, far.X) end
+        end
+    end
+    for _, h in ipairs(hazardShapes) do
+        if h.kind == "line" and not h.huge then
+            Spoke(h.a, h.b, h.r)
+        elseif h.kind == "box"
+        and math.max(h.hx, h.hz) > 3 * math.min(h.hx, h.hz) then
+            -- A long strip is a beam painted on the floor.
+            local axis = h.hx >= h.hz and h.cf.RightVector
+                       or h.cf:VectorToWorldSpace(Vector3.new(0, 0, 1))
+            local half = math.max(h.hx, h.hz)
+            Spoke(h.cf.Position - axis * half, h.cf.Position + axis * half,
+                  math.min(h.hx, h.hz))
+        end
+    end
+    if #angs < 3 then return #angs, nil, rMax end
+    table.sort(angs)
+    -- Drop duplicates: the same beam seen as both a Beam and a part.
+    local u = {angs[1]}
+    for i = 2, #angs do
+        if angs[i] - u[#u] > 0.05 then u[#u + 1] = angs[i] end
+    end
+    if #u > 1 and u[1] + 2 * math.pi - u[#u] <= 0.05 then table.remove(u) end
+    if #u < 3 then return #u, nil, rMax end
+    local minGap = u[1] + 2 * math.pi - u[#u]
+    for i = 2, #u do
+        local g = u[i] - u[i - 1]
+        if g < minGap then minGap = g end
+    end
+    return #u, minGap, rMax
+end
+
+local ESCAPE_DIRS = {}
+for i = 0, 15 do
+    local a = i * math.pi / 8
+    ESCAPE_DIRS[i + 1] = Vector3.new(math.cos(a), 0, math.sin(a))
+end
+
+-- Somewhere near `pos` that is outside every known hazard, with room to
+-- spare, and reachable without walking through another one on the way.
+-- The old escape stepped sideways out of ONE beam with no idea what
+-- else was on the floor, which between two radial beams meant stepping
+-- straight into the next one - and back, and forth. `mobPos` biases the
+-- pick outward when the hazards radiate from the mob (the gaps widen
+-- with distance) and keeps it inside `keepWithin` of the mob so we can
+-- go on casting.
+-- `ignoreHuge` drops footprints too big to step out of (see HUGE):
+-- with one of those under everything, every sample reads "inside" and
+-- the spokes that CAN be dodged are invisible behind it. The last
+-- resort is the least-bad point: still inside something, but deeper
+-- into a gap than where we stand.
+local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
+    local clean, crossing = {}, {}
+    local bestBad, bestBadC = nil, HazardClearance(pos, ignoreHuge) + 2
+    local flatNow = 0
+    if mobPos then
+        flatNow = Vector3.new(pos.X - mobPos.X, 0, pos.Z - mobPos.Z).Magnitude
+    end
+    for _, dir in ipairs(ESCAPE_DIRS) do
+        local wasClear, crossed = false, false
+        for d = 3, CONFIG.EscapeMaxDist, 3 do
+            local p = pos + dir * d
+            local c = HazardClearance(p, ignoreHuge)
+            if c <= 0 then
+                -- Back inside something after having been clear: this
+                -- heading crosses a second hazard to get anywhere.
+                if wasClear then crossed = true end
+                if c > bestBadC then bestBad, bestBadC = p, c end
+            else
+                wasClear = true
+                local score = math.min(c, CONFIG.EscapeClearWant) * 2 - d * 0.5
+                if mobPos then
+                    local flatNew = Vector3.new(p.X - mobPos.X, 0,
+                                                p.Z - mobPos.Z).Magnitude
+                    if outward then
+                        score = score + math.clamp(flatNew - flatNow, -10, 15) * 0.6
+                    end
+                    if keepWithin and flatNew > keepWithin then
+                        score = score - (flatNew - keepWithin)
+                    end
+                end
+                local list = crossed and crossing or clean
+                list[#list + 1] = {p = p, score = score}
             end
         end
+    end
+    -- Maths first, raycasts only for the front-runners.
+    local function ByScore(a, b) return a.score > b.score end
+    for _, list in ipairs({clean, crossing}) do
+        table.sort(list, ByScore)
+        for i = 1, math.min(#list, 6) do
+            local p = list[i].p
+            if LineClear(pos, p) and HasGround(p) then return p end
+        end
+    end
+    if bestBad and LineClear(pos, bestBad) and HasGround(bestBad) then
+        return bestBad
     end
     return nil
 end
 
--- One call for every "get out of the way" test, in priority order.
--- Cached: two 20Hz threads poll this, and re-running both scans 40
--- times a second was a large part of the in-combat lag.
-local hazardCache = {t = 0, escape = nil}
-local function ScanHazards()
+-- HazardDebug only: draws every footprint from the last sweep as a red
+-- slab on the floor, so what the bot thinks is dangerous can be held
+-- up against what is actually on screen. Named DQR_ so the scanners
+-- ignore them; CanQuery off so no query or raycast sees them.
+local drawPool = {}
+local function DrawHazards()
+    local n = 0
+    for _, h in ipairs(hazardShapes) do
+        if n >= 40 then break end
+        n = n + 1
+        local p = drawPool[n]
+        if not p or not p.Parent then
+            p = Instance.new("Part")
+            p.Name         = "DQR_Hz"
+            p.Anchored     = true
+            p.CanCollide   = false
+            p.CanQuery     = false
+            p.CanTouch     = false
+            p.CastShadow   = false
+            p.Material     = Enum.Material.Neon
+            p.Color        = Color3.fromRGB(255, 60, 60)
+            p.Transparency = 0.45
+            p.Parent       = workspace
+            drawPool[n] = p
+        end
+        -- Drawn at the hazard's own height (a touch above, so it is
+        -- not z-fighting with the floor) - not ours, or it bobs about
+        -- every time the character jumps.
+        if h.kind == "line" then
+            local a, b = h.a, h.b
+            local d = (b - a).Magnitude
+            if d > 0.1 then
+                p.Size   = Vector3.new(h.r * 2, 0.3, d)
+                p.CFrame = CFrame.lookAt((a + b) / 2 + Vector3.new(0, 0.3, 0), b)
+            end
+        elseif h.kind == "disc" then
+            p.Size   = Vector3.new(h.r * 2, 0.3, h.r * 2)
+            p.CFrame = CFrame.new(h.x, h.y + 0.3, h.z)
+        else
+            local c = h.cf.Position
+            p.Size   = Vector3.new(h.hx * 2, 0.3, h.hz * 2)
+            p.CFrame = CFrame.new(c.X, h.y + 0.3, c.Z) * (h.cf - h.cf.Position)
+        end
+    end
+    -- Park the rest out of sight rather than churn instances.
+    for i = n + 1, #drawPool do
+        local p = drawPool[i]
+        if p and p.Parent and p.Position.Y > -400 then
+            p.CFrame = CFrame.new(0, -500, 0)
+        end
+    end
+end
+
+-- One call for every "get out of the way" test. Cached: two 20Hz
+-- threads poll this, and re-running the scans 40 times a second was a
+-- large part of the in-combat lag.
+hazardCache = {t = 0, escape = nil, radial = false, radialN = 0,
+               backoffR = nil, backoffFor = nil,
+               holdP = nil, holdUntil = 0, commitUntil = 0}
+
+function ScanHazards()
     local now = tick()
     if now - hazardCache.t < CONFIG.HazardTTL then
         return hazardCache.escape
     end
+    local lastSweep = hazardCache.t
     hazardCache.t = now
-    -- Rebuilt every sweep. The two scanners fill it as they go, so the
-    -- footprint list is a free by-product of work already being done.
-    table.clear(hazardShapes)
-    hazardCache.escape = ScanTelegraphs() or ScanBeams()
-    if CONFIG.HazardDebug and #hazardShapes > 0 then
-        print(("[DQR] %d hazard footprint(s)."):format(#hazardShapes))
+    local root = GetRoot()
+    if not root then
+        hazardCache.escape = nil
+        return nil
     end
-    return hazardCache.escape
+    local pos = root.Position
+
+    -- First-sight activity (see LooksActive) is off for a few seconds
+    -- after the scanner starts or resumes, and after any teleport - a
+    -- respawn, a room change - because then EVERYTHING is new, at
+    -- every distance.
+    if not settledPos or (pos - settledPos).Magnitude > 30
+    or now - lastSweep > 2 then
+        settledAt = now
+    end
+    settledPos = pos
+    sweepFresh = (now - settledAt) > 3
+
+    -- Rebuilt every sweep, and completely, before anything is decided.
+    table.clear(hazardShapes)
+    CollectTelegraphs(pos)
+    CollectBeams(pos)
+    if CONFIG.HazardDebug then pcall(DrawHazards) end
+
+    -- Is the target fanning beams out around itself? Measured every
+    -- sweep, not only once we are hit: the main loop keeps its
+    -- distance for as long as the spokes are on the floor, and the
+    -- old "six seconds after the last hit" walked the bot back into a
+    -- fan that was still there.
+    local mobPos, keep = nil, nil
+    local tgt = cachedTarget
+    hazardCache.radialN = 0
+    if tgt and tgt.Root and tgt.Root.Parent then
+        mobPos = tgt.Root.Position
+        keep   = CONFIG.AttackRange + (tgt.Radius or 0) - 3
+        -- A standoff measured against one boss says nothing about the
+        -- next one.
+        if hazardCache.backoffFor ~= tgt.Model then
+            hazardCache.backoffFor, hazardCache.backoffR = tgt.Model, nil
+        end
+        if #hazardShapes > 0 then
+            local n, gap, rMax = RadialSpokes(mobPos)
+            hazardCache.radialN = n
+            if gap then
+                -- Far enough out that neighbouring beams leave
+                -- BeamGapWant studs of floor between their pads - the
+                -- pads of the beams as they actually are, since the
+                -- thick ones need more room than the hairlines.
+                hazardCache.backoffR = math.min(CONFIG.BeamBackoffMax,
+                    (2 * rMax + CONFIG.BeamGapWant) / gap)
+            end
+        end
+    end
+    -- Outward bias for the exit only against a boss's fan; a wizard's
+    -- beam is left sideways, and the fight stays where it was.
+    local outward = hazardCache.radialN >= 2 and tgt ~= nil and tgt.Boss == true
+    hazardCache.radial = outward
+
+    local esc = nil
+    local held = hazardCache.holdP
+    if #hazardShapes > 0 and HazardAt(pos) then
+        -- Keep a chosen exit for a moment rather than re-picking every
+        -- sweep and zig-zagging between two equally good ones.
+        if held and now < hazardCache.holdUntil
+        and HazardClearance(held, true) > 0 then
+            esc = held
+        else
+            local how = "clear"
+            esc = FindEscape(pos, mobPos, keep, outward)
+            if not esc then
+                how = "clear of what can be dodged"
+                esc = FindEscape(pos, mobPos, keep, outward, true)
+            end
+            hazardCache.holdP, hazardCache.holdUntil = esc, now + 0.8
+            hazardCache.commitUntil = now + 2.5
+            if CONFIG.HazardDebug then
+                print(("[DQR] In a hazard (%d footprint(s), %d spokes) - %s")
+                    :format(#hazardShapes, hazardCache.radialN,
+                            esc and ("moving " .. how) or "NO EXIT FOUND"))
+            end
+        end
+    elseif held and now < hazardCache.commitUntil
+    and Vector3.new(held.X - pos.X, 0, held.Z - pos.Z).Magnitude > 2.5
+    and HazardClearance(held, true) > 0 then
+        -- Out of the footprint but not yet at the exit: see it
+        -- through. The footprint ends where the PART ends, which is
+        -- not necessarily where the damage does, and stopping the
+        -- instant the root crossed the padded edge left the bot
+        -- standing on the rim of a ring it had all but escaped.
+        esc = held
+    else
+        hazardCache.holdP = nil
+    end
+    hazardCache.escape = esc
+    return esc
 end
+
+-- ============================================================
+--  HAZARD DIAGNOSTIC  (F9)
+--  Lists what the beam and telegraph scanners can see near you and
+--  the verdict each test gives, so an attack that is NOT being dodged
+--  says why instead of leaving us to guess at how it is built.
+-- ============================================================
+function HazardDiag()
+    local root = GetRoot()
+    if not root then print("[DQR] No character.") return end
+    local pos, now = root.Position, tick()
+    local reach = CONFIG.DodgeRange * 2
+    print("[DQR] === HAZARD DIAG ===")
+
+    -- What the last sweep is treating as dangerous right now, and
+    -- what each footprint was made from. The first thing to read when
+    -- a red slab matches nothing on screen.
+    for i, h in ipairs(hazardShapes) do
+        if i > 40 then break end
+        local src = h.src
+        print(("[Hazard] %s <- %s"):format(Describe(h),
+            src and (src:GetFullName() .. " (" .. src.ClassName .. ")")
+                or "?"))
+    end
+    print(("[DQR] %d footprint(s) in the last sweep."):format(#hazardShapes))
+
+    local function Line(tag, o, extra)
+        local height = Footprint(o)
+        print(("[%s] %s | size=%s drawn=%s h=%.1f near=%d | col=%s mat=%s tr=%.2f | query=%s collide=%s anch=%s | shape=%s look=%s tele=%s active=%s%s")
+            :format(tag, o:GetFullName(), tostring(o.Size),
+                    tostring(PartSize(o)), height, NearDist(o, pos),
+                    tostring(o.Color),
+                    (tostring(o.Material):gsub("Enum%.Material%.", "")),
+                    o.Transparency, tostring(o.CanQuery),
+                    tostring(o.CanCollide), tostring(o.Anchored),
+                    tostring(BeamShaped(o)), tostring(IsBeamShape(o)),
+                    tostring(IsTelegraph(o)), tostring(LooksActive(o)),
+                    extra or ""))
+    end
+
+    local n = 0
+    for p, born in pairs(recentParts) do
+        if p.Parent and NearDist(p, pos) < reach then
+            n = n + 1
+            if n <= 40 then Line(("new %.1fs"):format(now - born), p) end
+        end
+    end
+    print(("[DQR] %d part(s) spawned in the last %ds within %d studs.")
+        :format(n, CONFIG.RecentWindow, reach))
+
+    n = 0
+    for beam in pairs(beamObjects) do
+        if beam.Parent and beam.Attachment0 and beam.Attachment1 then
+            local okA, a = pcall(function() return beam.Attachment0.WorldPosition end)
+            local okB, b = pcall(function() return beam.Attachment1.WorldPosition end)
+            if okA and okB and SegDistFlat(pos, a, b) < reach then
+                n = n + 1
+                print(("[Beam] %s | enabled=%s len=%d w=%.1f/%.1f dist=%d")
+                    :format(beam:GetFullName(), tostring(beam.Enabled),
+                            (b - a).Magnitude, beam.Width0, beam.Width1,
+                            SegDistFlat(pos, a, b)))
+            end
+        end
+    end
+    print(("[DQR] %d Beam object(s) within %d studs."):format(n, reach))
+
+    n = 0
+    for ad in pairs(adornObjects) do
+        pcall(function()
+            local adornee = ad.Adornee
+            if not ad.Parent or not adornee then return end
+            local acf = adornee:IsA("Model") and adornee:GetPivot()
+                     or adornee.CFrame
+            local cf = acf * ad.CFrame
+            local len = ad:IsA("LineHandleAdornment") and ad.Length
+                     or ad:IsA("CylinderHandleAdornment") and ad.Height
+                     or ad.Size.Magnitude
+            local a = cf.Position
+            local b = cf.Position + cf.LookVector * len
+            local near = math.min(SegDistFlat(pos, a, b),
+                                  (a - pos).Magnitude)
+            if near < reach then
+                n = n + 1
+                print(("[Adorn] %s | %s | adornee=%s visible=%s tr=%.2f len=%d from=%s look=%s near=%d")
+                    :format(ad:GetFullName(), ad.ClassName,
+                            adornee:GetFullName(), tostring(ad.Visible),
+                            ad.Transparency, len, tostring(a),
+                            tostring(cf.LookVector), near))
+            end
+        end)
+    end
+    print(("[DQR] %d handle adornment(s) within %d studs."):format(n, reach))
+
+    -- Beam-shaped parts that were here before we were: pooled effects,
+    -- and the scenery that looks like one. Full walk - it is a keypress.
+    n = 0
+    for _, o in ipairs(workspace:GetDescendants()) do
+        if o:IsA("BasePart") and not recentParts[o] and BeamShaped(o)
+        and NearDist(o, pos) < reach then
+            n = n + 1
+            if n <= 40 then
+                Line("old", o, " body=" .. tostring(AtBodyHeight(o)))
+            end
+        end
+    end
+    print(("[DQR] %d older beam-shaped part(s) within %d studs.")
+        :format(n, reach))
+    print("[DQR] === END HAZARD DIAG ===")
+end
+
+end -- of the hazard block (see the note above Footprint)
 
 -- ============================================================
 --  CIRCULAR ORBIT
@@ -2734,11 +3619,58 @@ local lastStartCheck = 0
 local startVisible = false
 local lastNoTarget = 0
 local lastLobbyWarn = 0
+local hazardBackoff = 0   -- fight from further out until this tick()
+local bossSeen = setmetatable({}, {__mode = "k"})  -- model -> logged
 
 -- Tracks how long the current target has held position
 local stillModel = nil
 local stillPos   = Vector3.zero
 local stillSince = 0
+
+-- How far the target's BODY sits from its root, along the line from us.
+-- GetExtentsSize spans everything in the model - a boss's own beam and
+-- ring effects included, if they were parented to it when it was first
+-- seen - so the cached radius can be far bigger than the body, and the
+-- bot then fights a phantom well outside it. One ray at the root says
+-- where the body actually begins. Smoothed, since the ray lands on a
+-- different limb from frame to frame.
+-- (Block-scoped for the same local-count reason as the hazard section.)
+local SurfaceRadius
+do
+
+-- Renamed from Whitelist in 2022; support both.
+local INCLUDE = (function()
+    local ok, v = pcall(function() return Enum.RaycastFilterType.Include end)
+    if ok and v then return v end
+    return Enum.RaycastFilterType.Whitelist
+end)()
+
+local bodyRadius = setmetatable({}, {__mode = "k"})  -- model -> studs
+
+function SurfaceRadius(target, from)
+    local model, mroot = target.Model, target.Root
+    local ok, r = pcall(function()
+        local p = RaycastParams.new()
+        p.FilterType = INCLUDE
+        p.FilterDescendantsInstances = {model}
+        local to  = mroot.Position
+        local hit = workspace:Raycast(from, to - from, p)
+        if not hit then return nil end
+        -- A beam effect parented to the boss sits nearer than its body,
+        -- and an invisible hitbox may be far bigger than it.
+        local inst = hit.Instance
+        if inst.Transparency > 0.5 or BeamShaped(inst) then return nil end
+        return math.max(0, (to - from).Magnitude
+                           - (hit.Position - from).Magnitude - 1)
+    end)
+    if not ok or not r then return bodyRadius[model] end
+    local prev = bodyRadius[model]
+    r = prev and (prev * 0.7 + r * 0.3) or r
+    bodyRadius[model] = r
+    return r
+end
+
+end -- of the SurfaceRadius block
 
 local function SeedOrbit(mobPos)
     local root = GetRoot()
@@ -2759,6 +3691,22 @@ end
 local function AngleTo(mobPos, radius, a)
     return Vector3.new(mobPos.X + math.cos(a) * radius, mobPos.Y,
                        mobPos.Z + math.sin(a) * radius)
+end
+
+-- The ring angle nearest `natural` whose spot - and the walk to it
+-- from `from` - is clear of every known hazard, trying either side in
+-- turn. nil when the whole ring is covered.
+local function ClearRingAngle(mobPos, r, natural, from)
+    for k = 1, 12 do
+        for _, s in ipairs({1, -1}) do
+            local a = natural + s * k * math.pi / 12
+            local p = AngleTo(mobPos, r, a)
+            if not HazardAt(p) and not HazardAt((from + p) * 0.5) then
+                return a
+            end
+        end
+    end
+    return nil
 end
 
 -- ============================================================
@@ -2918,14 +3866,59 @@ local function MainLoop()
         local dist   = target.Distance
         pathTargetModel = target.Model   -- so the path worker can blacklist it
 
-        -- A boss is physically enormous, so root-to-root distance badly
-        -- understates how close we are - 9 studs from an Ice Elemental's
-        -- centre is inside the thing. Push the whole engagement envelope
-        -- out for bosses.
-        local bonus  = target.Boss and CONFIG.BossStandoff or 0
-        local ringR  = CONFIG.CircleRadius + bonus
-        local minR   = CONFIG.MinRange     + bonus
-        local maxR   = CONFIG.MaxRange     + bonus
+        -- Distance is measured root-to-root, so for a big model its
+        -- SURFACE is much nearer than its centre. Add the target's own
+        -- radius to every range so they stay consistent.
+        --
+        -- The previous version added a flat +10 to the orbit, the
+        -- retreat threshold and the approach range - but NOT to
+        -- MeleeRange. So against a boss it held station at 19 studs
+        -- while the swing only fired inside 16: it circled forever and
+        -- never actually hit anything.
+        local tRad = target.Radius or 0
+        -- Never trust a radius bigger than where the body actually is.
+        local surf = SurfaceRadius(target, root.Position)
+        if surf and surf < tRad then tRad = surf end
+        target.Radius = tRad   -- the hazard scanner reads this record too
+        if target.Boss and not bossSeen[target.Model] then
+            bossSeen[target.Model] = true
+            print(("[DQR] Boss %s: body radius %d (extents said %d) - fighting from %d.")
+                :format(target.Model.Name, tRad, mobRadius[target.Model] or 0,
+                        CONFIG.CircleRadius + tRad))
+        end
+
+        local ringR  = CONFIG.CircleRadius + tRad
+        local minR   = CONFIG.MinRange     + tRad
+        local maxR   = CONFIG.MaxRange     + tRad
+        local meleeR = CONFIG.MeleeRange   + tRad
+        local spellR = CONFIG.AttackRange  + tRad
+
+        -- Radial beams fan out from a BOSS, so the gaps between them
+        -- are narrow up close and wide further out. While the spokes
+        -- are on the floor - and for a moment after - fight from where
+        -- there is room to step between them, and raise MinRange with
+        -- it so the retreat branch below actually walks us out there.
+        -- Not capped at spell range: with twenty spokes the first
+        -- clear ring can lie outside it, and capping walked the bot
+        -- straight back into the fan. Standing safe and idle beats
+        -- casting from inside a beam.
+        -- Bosses only, and a real fan: one beam straight through a
+        -- mob's root reads as a spoke each way, so two "spokes" is a
+        -- single laser, not something to stand back from.
+        if target.Boss and hazardCache.radialN >= 3 then
+            hazardBackoff = now + CONFIG.BeamBackoffTime
+        end
+        if hazardBackoff > now then
+            local want = math.min(
+                hazardCache.backoffR or (ringR + CONFIG.BeamSpread),
+                CONFIG.BeamBackoffMax)
+            if want > ringR then
+                ringR = want
+                maxR  = math.max(maxR, ringR + 6)
+                minR  = math.max(minR, ringR - 4)
+            end
+        end
+        engageRing = ringR
 
         -- Positioning uses HORIZONTAL distance. target.Distance is 3D, so
         -- a mob standing on a ledge above reads as far away even when it
@@ -2943,12 +3936,12 @@ local function MainLoop()
         end
 
         -- MELEE when very close
-        if dist <= CONFIG.MeleeRange then
+        if dist <= meleeR then
             DoMelee()
         end
 
         -- SPELLS when in range
-        DoSpell(dist)
+        DoSpell(dist, spellR)
 
         -- Seed orbit on new target
         if not seeded then SeedOrbit(mobPos) end
@@ -2957,11 +3950,21 @@ local function MainLoop()
         -- there is no point orbiting prettily inside the damage zone.
         local escape = ScanHazards()
         if escape then
+            -- Any hazard at all from a boss: for the next few seconds
+            -- fight from further back. (A beam fan keeps the backoff
+            -- alive by itself, above, for as long as it is there.)
+            -- Without this the hold branch walked us straight back
+            -- into the hazard the moment the escape had us clear of it.
+            if target.Boss then
+                hazardBackoff = now + CONFIG.BeamBackoffTime
+            end
             currentDest = Vector3.new(escape.X, root.Position.Y, escape.Z)
             ShowRangeBar(root, mobPos, dist)
             if now - lastTeleWarn > 2 then
                 lastTeleWarn = now
-                print("[DQR] In a hazard (telegraph/beam) - moving clear.")
+                print(hazardCache.radial
+                    and "[DQR] In a beam fan - stepping clear and backing out."
+                    or  "[DQR] In a hazard - moving clear.")
             end
             S(CONFIG.ScanRate)
             continue
@@ -3035,19 +4038,41 @@ local function MainLoop()
             stillModel, stillPos, stillSince = target.Model, mobPos, now
         end
 
-        -- Only hold once we are actually AT the fighting distance.
-        -- Allowing anything inside MaxRange meant the bot could park
-        -- itself 20+ studs out - on an obstacle, say - and stand there
-        -- "holding" while the mob walked over and hit it.
+        local still = CONFIG.HoldWhenStill
+                  and (now - stillSince) > CONFIG.MobStillTime
+
+        -- A target that is going nowhere - a boss, or any mob that has
+        -- stopped - gets walked up to in a straight line and hit from a
+        -- standstill. The orbit is for mobs that move.
         --
-        -- Never hold against a boss. A boss is stationary by nature, so
-        -- this triggered constantly, and standing rooted next to
-        -- something that paints AoE rings under you means every dodge
-        -- starts from a standstill and arrives too late.
-        if CONFIG.HoldWhenStill and not target.Boss
-        and (now - stillSince) > CONFIG.MobStillTime
-        and flat <= ringR * 1.3 then
-            currentDest = nil          -- stand still, keep attacking
+        -- Against a boss the orbit point itself travels at
+        -- CircleSpeed * ringR studs a second, which for a 15-stud-wide
+        -- model is faster than we walk: the bot chased a spot it could
+        -- never catch, round and round, and never settled at fighting
+        -- distance at all. The old hold only kicked in once "close
+        -- enough", which the chase never was.
+        --
+        -- Hazard escapes have already run above and outrank this, so
+        -- standing still only ever lasts until something is incoming.
+        if still or target.Boss then
+            if flat > ringR + CONFIG.HoldSlack then
+                -- Walk in to the nearest point on the ring - or to the
+                -- nearest clear one, if that spot is inside a hazard.
+                local ang = math.atan2(root.Position.Z - mobPos.Z,
+                                       root.Position.X - mobPos.X)
+                local spot = AngleTo(mobPos, ringR, ang)
+                if CONFIG.AvoidHazardPaths and HazardAt(spot) then
+                    local clear = ClearRingAngle(mobPos, ringR, ang,
+                                                 root.Position)
+                    if clear then
+                        ang, spot = clear, AngleTo(mobPos, ringR, clear)
+                    end
+                end
+                orbitAngle  = ang
+                currentDest = spot
+            else
+                currentDest = nil      -- stand still, keep attacking
+            end
             ShowRangeBar(root, mobPos, dist)
             S(CONFIG.ScanRate)
             continue
@@ -3497,7 +4522,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v8.5 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
+    print("[DQR] v9.5 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
@@ -3554,6 +4579,8 @@ UserInputService.InputBegan:Connect(function(inp, gpe)
         if LogGui then LogGui.Enabled = not LogGui.Enabled end
     elseif inp.KeyCode == Enum.KeyCode.F8 then
         MobDiag()
+    elseif inp.KeyCode == Enum.KeyCode.F9 then
+        HazardDiag()
     end
 end)
 
@@ -3564,3 +4591,4 @@ getgenv().DQR_Lobby = InLobby
 getgenv().DQR_Queue = RunLobbyFlow
 getgenv().DQR_Log   = function() return table.concat(LOG, "\n") end
 getgenv().DQR_Mobs  = MobDiag
+getgenv().DQR_Hazards = HazardDiag
