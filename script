@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v8.8
+--  DQR AUTO FARM v8.9
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log
@@ -74,6 +74,15 @@ local CONFIG = {
     TelegraphPad   = 4,      -- treat this much beyond the edge as unsafe
     TelegraphMinLen= 6,      -- ignore red parts smaller than this
     TelegraphMaxY  = 2,      -- ...and anything taller than this (props)
+    TelegraphMaxWide= 30,    -- ...and anything wider than this in its
+                             -- NARROW direction: a strip is narrow, a
+                             -- ring is small, a room floor is neither
+    -- A part first seen well inside the scan radius (rather than
+    -- entering at its edge as we walk) counts as an attack that was
+    -- just moved in from an effect pool. Catches pooled effects parked
+    -- out of range; also catches map parts the capped broadphase query
+    -- happened to drop for a while, so it is off unless needed.
+    FreshSightRule = false,
 
     -- Crowd handling: keep clear of mobs other than the one being hit
     AvoidOtherMobs = true,
@@ -606,15 +615,15 @@ end
 -- is a pooled effect just brought in from wherever it is parked. The
 -- beam and ring pools sit far under the map between casts, so there
 -- is no "parked" reading on record to compare against, and first
--- sight is the only chance to notice them. Anything solid is exempt
--- unless the caller says otherwise (`solidOk`): a damage effect never
--- blocks movement, floor decoration often does - but a line lying
--- flush with the floor is walked over whether or not it collides, and
--- nobody bothers to untick CanCollide on one.
-function LooksActive(o, fresh, solidOk)
+-- sight is the only chance to notice them. Off unless FreshSightRule
+-- is set: the capped broadphase query drops parts arbitrarily when an
+-- area is busy, and a floor strip that flickers back into the results
+-- looks exactly like something that just arrived.
+function LooksActive(o, fresh)
     local now  = tick()
     local born = recentParts[o]
     local new  = born ~= nil and now - born < CONFIG.RecentWindow
+    fresh = fresh == true and CONFIG.FreshSightRule == true
 
     local rec = effectSeen[o]
     -- Out of sight for a while and now back? As good as never seen: a
@@ -624,7 +633,7 @@ function LooksActive(o, fresh, solidOk)
     -- record never goes stale.
     if rec and now - rec.seen > 3 then rec = nil end
     if not rec then
-        local hit = new or (fresh == true and (solidOk or not o.CanCollide))
+        local hit = new or fresh
         effectSeen[o] = {pos = o.Position, tr = o.Transparency,
                          size = PartSize(o), moved = hit and now or 0,
                          seen = now}
@@ -634,15 +643,17 @@ function LooksActive(o, fresh, solidOk)
         return hit
     end
     rec.seen = now
-    -- Movement - or a pooled effect being faded in, or stretched out
-    -- from nothing. Scenery does none of these.
-    local size = PartSize(o)
+    -- Movement, or a pooled effect being stretched out from nothing or
+    -- faded in from INVISIBLE. Scenery does none of these. Any change
+    -- of transparency used to count, and that flagged every glowing
+    -- inlay in the map that pulses between bright and dim.
+    local size, tr = PartSize(o), o.Transparency
     if (o.Position - rec.pos).Magnitude > 1
-    or math.abs(o.Transparency - rec.tr) > 0.3
+    or (rec.tr > 0.9 and tr <= 0.9)
     or (size - rec.size).Magnitude > 1 then
-        rec.pos, rec.tr, rec.size = o.Position, o.Transparency, size
         rec.moved = now
     end
+    rec.pos, rec.tr, rec.size = o.Position, tr, size
     return new or (now - rec.moved) < CONFIG.RecentWindow
 end
 
@@ -987,7 +998,16 @@ local function PathWorker(getDestFn)
                                   + d.Unit * math.min(d.Magnitude, 12)
                         end
                     end
-                    if ahead and HazardAt(ahead) then
+                    -- Only when there is something to route AROUND. If
+                    -- we are already standing in it, the escape logic
+                    -- owns the problem; if the destination itself is
+                    -- in it, no route avoids it. Dropping the path in
+                    -- either case just meant dropping it again 0.4s
+                    -- later, forever - the bot paced at a doorway for
+                    -- as long as a false hazard covered the room.
+                    if ahead and HazardAt(ahead)
+                    and not HazardAt(root.Position)
+                    and not HazardAt(dest) then
                         -- Drop it and recompute. A path made before the
                         -- beam appeared points straight through it.
                         ClearPath()
@@ -2605,9 +2625,17 @@ local function IsTelegraph(o, pos, radius)
     local height, a, b = Footprint(o)
     if height > CONFIG.TelegraphMaxY then return false end       -- a prop
     if math.max(a, b) < CONFIG.TelegraphMinLen then return false end
+    -- A marker is a strip or a ring: narrow one way, or small. Wide
+    -- both ways is a floor, and a whole room floor was being flagged.
+    if math.min(a, b) > CONFIG.TelegraphMaxWide then return false end
 
     local c = o.Color
     if c.R > 0.55 and c.G < 0.45 and c.B < 0.45 then return true end -- red
+
+    -- You stand ON floors and never on an attack marker: anything
+    -- solid is map, whatever else it does. This is what kept the
+    -- corridor's floor strips out of the hazard list.
+    if o.CanCollide then return false end
 
     -- Colour alone is not enough: the Ice Elemental paints CYAN rings,
     -- and cyan is also the colour of half the Winter Outpost scenery.
@@ -2616,7 +2644,7 @@ local function IsTelegraph(o, pos, radius)
     -- moved into place mid-fight.
     local fresh = sweepFresh and pos ~= nil
                   and NearDist(o, pos) < radius * 0.6
-    return LooksActive(o, fresh, true)   -- flat: solid or not, it is walked over
+    return LooksActive(o, fresh)
 end
 
 -- ============================================================
@@ -2814,7 +2842,8 @@ end
 -- solid, in which case it is a wall that has just gone up.
 local function IsNewBeam(o)
     if not BeamShaped(o) then return false end
-    if o.Transparency > 0.9 and o.CanCollide then return false end
+    -- Solid means a bar, a rail, a gate that has just closed: map.
+    if o.CanCollide then return false end
     return true
 end
 
@@ -2880,12 +2909,12 @@ local function CollectBeams(pos)
     local function Consider(o)
         if done[o] or not BeamShaped(o) or PlayerOwned(o) then return end
         done[o] = true
+        -- Solid means a bar, a rail, a floor strip you stand on: map.
+        if o.CanCollide then return end
         -- Scenery enters the scan at its edge as we walk; a part first
-        -- seen well inside it appeared there. A flat one counts even if
-        -- it collides: a line flush with the floor is walked over.
+        -- seen well inside it appeared there.
         local fresh  = sweepFresh and NearDist(o, pos) < reach * 0.6
-        local flat   = (Footprint(o)) <= CONFIG.TelegraphMaxY
-        local active = LooksActive(o, fresh, flat)
+        local active = LooksActive(o, fresh)
         if recentParts[o] then return end           -- noted above already
         if o.Transparency > 0.9 then return end     -- parked, not firing
         if active or (IsBeamShape(o) and AtBodyHeight(o)) then
@@ -3077,8 +3106,7 @@ end
 -- up against what is actually on screen. Named DQR_ so the scanners
 -- ignore them; CanQuery off so no query or raycast sees them.
 local drawPool = {}
-local function DrawHazards(pos)
-    local y = pos.Y - CONFIG.FootOffset + 0.4
+local function DrawHazards()
     local n = 0
     for _, h in ipairs(hazardShapes) do
         if n >= 40 then break end
@@ -3098,21 +3126,23 @@ local function DrawHazards(pos)
             p.Parent       = workspace
             drawPool[n] = p
         end
+        -- Drawn at the hazard's own height (a touch above, so it is
+        -- not z-fighting with the floor) - not ours, or it bobs about
+        -- every time the character jumps.
         if h.kind == "line" then
-            local a = Vector3.new(h.a.X, y, h.a.Z)
-            local b = Vector3.new(h.b.X, y, h.b.Z)
+            local a, b = h.a, h.b
             local d = (b - a).Magnitude
             if d > 0.1 then
                 p.Size   = Vector3.new(h.r * 2, 0.3, d)
-                p.CFrame = CFrame.lookAt((a + b) / 2, b)
+                p.CFrame = CFrame.lookAt((a + b) / 2 + Vector3.new(0, 0.3, 0), b)
             end
         elseif h.kind == "disc" then
             p.Size   = Vector3.new(h.r * 2, 0.3, h.r * 2)
-            p.CFrame = CFrame.new(h.x, y, h.z)
+            p.CFrame = CFrame.new(h.x, h.y + 0.3, h.z)
         else
             local c = h.cf.Position
             p.Size   = Vector3.new(h.hx * 2, 0.3, h.hz * 2)
-            p.CFrame = CFrame.new(c.X, y, c.Z) * (h.cf - h.cf.Position)
+            p.CFrame = CFrame.new(c.X, h.y + 0.3, c.Z) * (h.cf - h.cf.Position)
         end
     end
     -- Park the rest out of sight rather than churn instances.
@@ -3160,7 +3190,7 @@ function ScanHazards()
     table.clear(hazardShapes)
     CollectTelegraphs(pos)
     CollectBeams(pos)
-    if CONFIG.HazardDebug then pcall(DrawHazards, pos) end
+    if CONFIG.HazardDebug then pcall(DrawHazards) end
 
     local esc = nil
     if #hazardShapes > 0 and HazardAt(pos) then
