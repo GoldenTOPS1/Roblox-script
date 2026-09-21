@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v6.5
+--  DQR AUTO FARM v6.6
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -106,7 +106,7 @@ local CONFIG = {
     HazardTTL      = 0.1,    -- telegraph/beam scan at most 10x a second
     ThreatTTL      = 0.1,    -- projectile scan at most 10x a second
     PathGiveUp     = 6,      -- failed paths before abandoning a mob
-    UnreachableFor = 12,     -- seconds to ignore an abandoned mob
+    UnreachableFor = 8,      -- seconds to ignore an abandoned mob
 
     -- Range bar
     ShowRangeBar   = true,
@@ -717,13 +717,22 @@ local function PathWorker(getDestFn)
                                                   or "no clear heading."))
                             end
                             -- Give up on this mob and let the scanner
-                            -- pick another one it can actually reach.
+                            -- pick another one it can actually reach -
+                            -- but never one that is already close. If it
+                            -- is next to us the answer is to fight it,
+                            -- not to walk off to something further away.
+                            local mk = pathTargetModel
+                                and pathTargetModel:FindFirstChild("HumanoidRootPart")
+                            local howFar = mk
+                                and (mk.Position - root.Position).Magnitude
+                                or math.huge
                             if pathFail >= CONFIG.PathGiveUp
-                            and pathTargetModel then
+                            and pathTargetModel
+                            and howFar > CONFIG.MaxRange * 1.5 then
                                 unreachable[pathTargetModel] =
                                     tick() + CONFIG.UnreachableFor
-                                print("[DQR] " .. pathTargetModel.Name
-                                    .. " is unreachable - trying another mob.")
+                                print(("[DQR] %s unreachable at %d studs - switching.")
+                                    :format(pathTargetModel.Name, howFar))
                                 pathFail = 0
                             end
                         end
@@ -744,28 +753,37 @@ local function PathWorker(getDestFn)
                     end
                 end
 
-                -- Progress watchdog. Whatever the cause - a flickering
-                -- line, a path that loops, a doorway too narrow - if we
-                -- are not actually getting closer then something is
-                -- wrong, so repath and eventually give up on this mob.
+                -- Progress watchdog, for travel only.
+                --
+                -- This must NOT run while we are in engagement range. A
+                -- bot standing its ground to hit a stationary mob, or
+                -- holding a standoff, or circling, is not "closing
+                -- distance" - and the first version counted that as
+                -- failure, so it eventually blacklisted the very mob it
+                -- was busy killing and wandered off to a distant one.
                 local mark = pathTargetModel
                     and pathTargetModel:FindFirstChild("HumanoidRootPart")
                 local far = mark
                     and (mark.Position - root.Position).Magnitude
                     or (dest - root.Position).Magnitude
 
-                if far < bestFar - 3 then
+                if far <= CONFIG.MaxRange + 5 then
+                    -- In range: we are fighting, not travelling.
+                    bestFar, bestFarAt = far, tick()
+                elseif far < bestFar - 3 then
                     bestFar, bestFarAt = far, tick()
                 elseif tick() - bestFarAt > CONFIG.NoProgressTime then
                     bestFar, bestFarAt = far, tick()
                     forceRepath = true
                     pathFail = pathFail + 1
                     print("[DQR] No progress toward target - repathing.")
-                    if pathFail >= CONFIG.PathGiveUp and pathTargetModel then
+                    -- Never abandon something standing right next to us.
+                    if pathFail >= CONFIG.PathGiveUp and pathTargetModel
+                    and far > CONFIG.MaxRange * 1.5 then
                         unreachable[pathTargetModel] =
                             tick() + CONFIG.UnreachableFor
-                        print("[DQR] " .. pathTargetModel.Name
-                            .. " unreachable - switching target.")
+                        print(("[DQR] %s unreachable at %d studs - switching.")
+                            :format(pathTargetModel.Name, far))
                         pathFail = 0
                     end
                 end
@@ -1787,6 +1805,23 @@ local function GetNearestMob()
         end
     end
 
+    -- Failsafe: if everything in range is blacklisted we would return
+    -- nil and the bot would stand idle being beaten on. Mobs being
+    -- present but all "unreachable" means the blacklist is wrong, not
+    -- that there is nothing to fight - so drop it and take the nearest.
+    if not best and #mobList > 0 then
+        table.clear(unreachable)
+        for _, rec in ipairs(mobList) do
+            if rec.Distance < bestD then
+                bestD, best = rec.Distance, rec
+            end
+        end
+        if best then
+            print("[DQR] All targets were blacklisted - clearing and "
+                .. "taking the nearest.")
+        end
+    end
+
     cachedMobs  = mobList
     cachedTarget = best
     return best
@@ -2382,9 +2417,13 @@ local function MainLoop()
             stillModel, stillPos, stillSince = target.Model, mobPos, now
         end
 
+        -- Only hold once we are actually AT the fighting distance.
+        -- Allowing anything inside MaxRange meant the bot could park
+        -- itself 20+ studs out - on an obstacle, say - and stand there
+        -- "holding" while the mob walked over and hit it.
         if CONFIG.HoldWhenStill
         and (now - stillSince) > CONFIG.MobStillTime
-        and flat <= CONFIG.MaxRange then
+        and flat <= CONFIG.CircleRadius * 1.3 then
             currentDest = nil          -- stand still, keep attacking
             ShowRangeBar(root, mobPos, dist)
             S(CONFIG.ScanRate)
@@ -2770,7 +2809,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v6.5 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v6.6 loaded.  F5 farm  F6 dump  F7 show/hide log")
     ApplyClass()
     NukeGraphics()
     S(2.5)
