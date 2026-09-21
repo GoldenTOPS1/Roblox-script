@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v6.9
+--  DQR AUTO FARM v7.0
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -93,6 +93,9 @@ local CONFIG = {
     StuckTime      = 1.5,    -- ...for this long = stuck
     UnstickTime    = 0.9,    -- secs spent backing out of a snag
     UnstickDist    = 12,     -- how far to back out
+    PaceRadius     = 10,     -- confined to this circle...
+    PaceTime       = 5,      -- ...for this long = pacing, going nowhere
+    PaceGiveUp     = 2,      -- pacing bouts before abandoning the target
     AgentMaxSlope  = 45,     -- steeper than this = route around, not up
     AgentWidth     = 2.5,    -- half body width for clearance raycasts
     PathHoldClear  = 3,      -- clear readings needed to drop a live path
@@ -527,6 +530,9 @@ local steerUntil = 0     -- keep that heading at least this long
 local wpStuck    = 0     -- seconds spent failing to reach pathQueue[1]
 local clearStreak = 0    -- consecutive "line is clear" readings
 local stuckCount  = 0    -- consecutive stuck events at one spot
+local paceAnchor  = nil  -- where we were when the pacing window opened
+local paceSince   = 0
+local paceCount   = 0
 local unstickDir  = nil  -- temporary "get out of here" heading
 local unstickUntil = 0
 local bestFar    = math.huge  -- closest we have got to the target
@@ -773,8 +779,12 @@ local function PathWorker(getDestFn)
                     and (mark.Position - root.Position).Magnitude
                     or (dest - root.Position).Magnitude
 
-                if far <= CONFIG.MaxRange + 5 then
-                    -- In range: we are fighting, not travelling.
+                -- "Engaged" means at our actual fighting distance, not
+                -- merely inside MaxRange. Using MaxRange+5 (25 studs)
+                -- meant a mob on a ledge 18 studs away counted as
+                -- engaged, so the watchdog reset forever while the bot
+                -- paced below it, unable to reach it.
+                if far <= CONFIG.CircleRadius * 1.5 then
                     bestFar, bestFarAt = far, tick()
                 elseif far < bestFar - 3 then
                     bestFar, bestFarAt = far, tick()
@@ -884,6 +894,7 @@ local function StartMoving(getDestFn)
     moveMode, commandSince, diagCount = "humanoid", 0, 0
     clearStreak, wpStuck = 0, 0
     stuckCount, unstickDir, unstickUntil = 0, nil, 0
+    paceAnchor, paceSince, paceCount = nil, tick(), 0
     bestFar, bestFarAt = math.huge, tick()
 
     wantDisabled = true
@@ -1074,6 +1085,55 @@ local function StartMoving(getDestFn)
         else
             stuckAt = nil
             stuckCount = 0
+        end
+
+        -- PACING check, which is a different failure from being wedged.
+        -- The stuck test above measures displacement from an anchor, so
+        -- walking back and forth resets it every swing and it never
+        -- fires. This one asks a harder question: over several seconds,
+        -- have we actually GONE anywhere? Staying inside a small circle
+        -- while still having somewhere to be means no.
+        if dest and (dest - pos).Magnitude > CONFIG.WaypointReach then
+            local now2 = tick()
+            if not paceAnchor
+            or (pos - paceAnchor).Magnitude > CONFIG.PaceRadius then
+                paceAnchor, paceSince = pos, now2
+            elseif now2 - paceSince > CONFIG.PaceTime then
+                paceAnchor, paceSince = pos, now2
+                paceCount = paceCount + 1
+
+                ClearPath()
+                forceRepath = true
+                local back = root.CFrame.LookVector * -1
+                back = Vector3.new(back.X, 0, back.Z)
+                if back.Magnitude < 0.01 then back = Vector3.new(1, 0, 0) end
+                local sign = (paceCount % 2 == 0) and 1 or -1
+                local side = Vector3.new(-back.Unit.Z, 0, back.Unit.X) * sign
+                local spot = SafeStep(pos, (back.Unit * 0.5 + side).Unit,
+                                      CONFIG.UnstickDist)
+                unstickDir = spot
+                    and (Vector3.new(spot.X - pos.X, 0, spot.Z - pos.Z)).Unit
+                    or back.Unit
+                unstickUntil = now2 + CONFIG.UnstickTime
+
+                print(("[DQR] Pacing on the spot (%d) - breaking off.")
+                    :format(paceCount))
+
+                -- Demonstrably unreachable, whatever the distance says.
+                -- The distance guard elsewhere deliberately protects
+                -- nearby mobs from being abandoned, but a mob we have
+                -- paced at for 10 seconds is exactly the case where
+                -- that protection is wrong.
+                if paceCount >= CONFIG.PaceGiveUp and pathTargetModel then
+                    unreachable[pathTargetModel] = tick() + CONFIG.UnreachableFor
+                    print("[DQR] " .. pathTargetModel.Name
+                        .. " cannot be reached - switching target.")
+                    paceCount = 0
+                end
+            end
+        else
+            paceAnchor = nil
+            paceCount  = 0
         end
 
         -- Rotation only: position is the Humanoid's business now.
@@ -2896,7 +2956,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v6.9 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v7.0 loaded.  F5 farm  F6 dump  F7 show/hide log")
     ApplyClass()
     NukeGraphics()
     S(2.5)
