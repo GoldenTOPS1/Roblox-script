@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v7.8
+--  DQR AUTO FARM v7.9
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -77,6 +77,11 @@ local CONFIG = {
     CrowdRadius    = 22,     -- mobs this near count as part of the pack
     CrowdCount     = 3,      -- this many = stop orbiting, back off
 
+    -- Bosses: huge models, so root-to-root distance understates how
+    -- close you are. Fight them from further out, and never stand still.
+    BossStandoff   = 10,
+    HazardMargin   = 8,      -- extra studs to clear a hazard edge by
+
     -- Stand and fight when the mob is not moving
     HoldWhenStill  = true,
     MobStillTime   = 1.0,    -- mob still for this long...
@@ -117,7 +122,7 @@ local CONFIG = {
                              -- even without a health bar over its head
     MaxQueryParts  = 2000,   -- cap per query; low values TRUNCATE results
                              -- non-deterministically and hide near mobs
-    HazardTTL      = 0.1,    -- telegraph/beam scan at most 10x a second
+    HazardTTL      = 0.06,   -- telegraph/beam scan rate cap
     ThreatTTL      = 0.1,    -- projectile scan at most 10x a second
     PathGiveUp     = 3,      -- failed paths before abandoning a mob
     UnreachableFor = 8,      -- seconds to ignore an abandoned mob
@@ -488,6 +493,30 @@ task.spawn(function()
         if o:IsA("Beam") then beamObjects[o] = true end
     end
 end)
+
+-- Games pool their effect parts: the ring is created once at map load
+-- and then re-positioned and shown each time it is cast. Such a part is
+-- never "new", so DescendantAdded never sees it and the recent-spawn
+-- test misses it entirely. Movement is the giveaway - scenery never
+-- moves, a pooled effect gets CFramed into place the moment it fires.
+local effectSeen = setmetatable({}, {__mode = "k"})
+
+local function LooksActive(o)
+    local now = tick()
+    local born = recentParts[o]
+    if born and now - born < CONFIG.RecentWindow then return true end
+
+    local rec = effectSeen[o]
+    if not rec then
+        effectSeen[o] = {pos = o.Position, moved = 0}
+        return false
+    end
+    if (o.Position - rec.pos).Magnitude > 1 then
+        rec.pos   = o.Position
+        rec.moved = now
+    end
+    return (now - rec.moved) < CONFIG.RecentWindow
+end
 
 -- ============================================================
 --  ARMOUR / COSMETIC STRIPPING
@@ -2001,7 +2030,8 @@ local function GetNearestMob()
 
                     if verdict then
                         local d = (mr.Position - root.Position).Magnitude
-                        local rec = {Model=obj, Root=mr, Humanoid=hum, Distance=d}
+                        local rec = {Model=obj, Root=mr, Humanoid=hum,
+                                     Distance=d, Boss=bossy}
                         -- Every live mob goes in the list, blacklisted or
                         -- not: we still need to steer around one we have
                         -- given up on attacking.
@@ -2276,12 +2306,10 @@ local function IsTelegraph(o)
 
     -- Colour alone is not enough: the Ice Elemental paints CYAN rings,
     -- and cyan is also the colour of half the Winter Outpost scenery.
-    -- What separates them is timing - the map is already there when we
-    -- arrive, an attack marker appears mid-fight. Anything flat and
-    -- large that spawned in the last few seconds is an attack marker
-    -- whatever colour it is.
-    local born = recentParts[o]
-    return born ~= nil and (tick() - born) < CONFIG.RecentWindow
+    -- What separates them is behaviour - the map is already there when
+    -- we arrive and never moves; an attack marker either spawns or gets
+    -- moved into place mid-fight.
+    return LooksActive(o)
 end
 
 -- Returns a world position to run to, or nil when we are standing clear.
@@ -2318,7 +2346,7 @@ local function ScanTelegraphs()
                     if depth > worstDepth then
                         local dir = d < 0.5 and Vector3.new(1, 0, 0)
                                             or away.Unit
-                        local p = SafeStep(pos, dir, depth + 4)
+                        local p = SafeStep(pos, dir, depth + CONFIG.HazardMargin)
                         if p then
                             worstDepth = depth
                             escape = p
@@ -2350,7 +2378,7 @@ local function ScanTelegraphs()
                         end
                         local d = Vector3.new(axis.X, 0, axis.Z) * sign
                         -- Only accept an exit we can actually walk.
-                        local p = SafeStep(pos, d, depth + 4)
+                        local p = SafeStep(pos, d, depth + CONFIG.HazardMargin)
                         if p then
                             worstDepth = depth
                             escape = p
@@ -2413,10 +2441,12 @@ local function IsBeamShape(o)
 end
 
 -- For parts that have been sitting there. Adds the height rule, because
--- with no "it just appeared" evidence, a floor stripe and a laser are
--- otherwise indistinguishable.
+-- with no evidence of activity a floor stripe and a laser are otherwise
+-- indistinguishable - unless the thing has just moved, which scenery
+-- never does.
 local function IsBeamPart(o)
-    return IsBeamShape(o) and AtBodyHeight(o)
+    if not IsBeamShape(o) then return false end
+    return AtBodyHeight(o) or LooksActive(o)
 end
 
 -- Sideways escape from a line through `c` along `axis`, half-length `half`.
@@ -2439,7 +2469,7 @@ local function EscapeFromLine(pos, c, axis, half, clear)
         out = perp
     end
     -- Sidestep only somewhere there is actually room to stand.
-    return SafeStep(pos, out, clear - d + 4)
+    return SafeStep(pos, out, clear - d + CONFIG.HazardMargin)
 end
 
 -- Escape from a long thin part, treating it as a line.
@@ -2732,6 +2762,15 @@ local function MainLoop()
         local dist   = target.Distance
         pathTargetModel = target.Model   -- so the path worker can blacklist it
 
+        -- A boss is physically enormous, so root-to-root distance badly
+        -- understates how close we are - 9 studs from an Ice Elemental's
+        -- centre is inside the thing. Push the whole engagement envelope
+        -- out for bosses.
+        local bonus  = target.Boss and CONFIG.BossStandoff or 0
+        local ringR  = CONFIG.CircleRadius + bonus
+        local minR   = CONFIG.MinRange     + bonus
+        local maxR   = CONFIG.MaxRange     + bonus
+
         -- Positioning uses HORIZONTAL distance. target.Distance is 3D, so
         -- a mob standing on a ledge above reads as far away even when it
         -- is right on top of us - which flipped the range checks on and
@@ -2802,8 +2841,8 @@ local function MainLoop()
         -- Deadband, or it flips between retreating and advancing on
         -- every frame while hovering right at MinRange.
         if retreating then
-            if flat >= CONFIG.CircleRadius * 0.95 then retreating = false end
-        elseif flat < CONFIG.MinRange then
+            if flat >= ringR * 0.95 then retreating = false end
+        elseif flat < minR then
             retreating = true
         end
 
@@ -2819,7 +2858,7 @@ local function MainLoop()
                 -- wall, stop retreating and fight instead of grinding
                 -- into it - otherwise the mob pins us there.
                 local spot = SafeStep(root.Position, away,
-                                      CONFIG.CircleRadius - flat)
+                                      ringR - flat)
                 if spot then
                     currentDest = spot
                     ShowRangeBar(root, mobPos, dist)
@@ -2844,9 +2883,14 @@ local function MainLoop()
         -- Allowing anything inside MaxRange meant the bot could park
         -- itself 20+ studs out - on an obstacle, say - and stand there
         -- "holding" while the mob walked over and hit it.
-        if CONFIG.HoldWhenStill
+        --
+        -- Never hold against a boss. A boss is stationary by nature, so
+        -- this triggered constantly, and standing rooted next to
+        -- something that paints AoE rings under you means every dodge
+        -- starts from a standstill and arrives too late.
+        if CONFIG.HoldWhenStill and not target.Boss
         and (now - stillSince) > CONFIG.MobStillTime
-        and flat <= CONFIG.CircleRadius * 1.3 then
+        and flat <= ringR * 1.3 then
             currentDest = nil          -- stand still, keep attacking
             ShowRangeBar(root, mobPos, dist)
             S(CONFIG.ScanRate)
@@ -2867,7 +2911,7 @@ local function MainLoop()
                     away = Vector3.new(away.X, 0, away.Z)
                 end
                 if away.Magnitude > 0.01 then
-                    local standoff = math.max(CONFIG.CircleRadius,
+                    local standoff = math.max(ringR,
                                               CONFIG.MobAvoidRadius)
                     local fromCentre = (Vector3.new(root.Position.X, 0, root.Position.Z)
                                       - Vector3.new(centre.X, 0, centre.Z)).Magnitude
@@ -2902,9 +2946,9 @@ local function MainLoop()
         -- Closing in from far away: aim a little inside the standoff so
         -- we actually arrive at it. Being too CLOSE is handled by the
         -- retreat branch above, which exits before reaching here.
-        local radius = CONFIG.CircleRadius
-        if flat > CONFIG.MaxRange then
-            radius = CONFIG.CircleRadius * 0.85
+        local radius = ringR
+        if flat > maxR then
+            radius = ringR * 0.85
         end
 
         -- Keep the orbit point's own Y (the mob's ground level). This
@@ -3280,7 +3324,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v7.8 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
+    print("[DQR] v7.9 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
