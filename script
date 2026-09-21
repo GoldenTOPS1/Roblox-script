@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v8.9
+--  DQR AUTO FARM v9.0
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log
@@ -111,6 +111,15 @@ local CONFIG = {
     HoldSlack      = 2,      -- within CircleRadius + this = at fighting distance
     EscapeMaxDist  = 30,     -- furthest one hazard escape will move us
     EscapeClearWant= 7,      -- clearance from a hazard edge that counts as safe
+    -- Hazard escapes: hop straight to the nearest safe spot when it is
+    -- close, walk when it is not. The hop is a CFrame write - a short
+    -- one, never more often than the cooldown - because a game may
+    -- treat larger or constant jumps as teleporting. The bot then
+    -- walks the last few studs to the fuller-clearance exit as usual.
+    HazardTeleport = true,
+    TeleportMax    = 14,     -- hop at most this far; further = walk
+    TeleportClear  = 2,      -- land this far outside the hazard's pad
+    TeleportCooldown = 0.6,
     -- Route around beams instead of only escaping once standing in one.
     -- Costs two maths lookups per orbit candidate and a couple more on
     -- the path worker's thread; nothing is added to the frame handler.
@@ -3120,14 +3129,17 @@ end
 -- the spokes that CAN be dodged are invisible behind it. The last
 -- resort is the least-bad point: still inside something, but deeper
 -- into a gap than where we stand.
+-- Returns the exit, and the NEAREST safe point along the same heading
+-- (TeleportClear studs outside the pad) for a short hop to.
 local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
     local clean, crossing = {}, {}
+    local firstClear = {}      -- heading index -> nearest safe sample
     local bestBad, bestBadC = nil, HazardClearance(pos, ignoreHuge) + 2
     local flatNow = 0
     if mobPos then
         flatNow = Vector3.new(pos.X - mobPos.X, 0, pos.Z - mobPos.Z).Magnitude
     end
-    for _, dir in ipairs(ESCAPE_DIRS) do
+    for di, dir in ipairs(ESCAPE_DIRS) do
         local wasClear, crossed = false, false
         for d = 3, CONFIG.EscapeMaxDist, 3 do
             local p = pos + dir * d
@@ -3139,6 +3151,9 @@ local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
                 if c > bestBadC then bestBad, bestBadC = p, c end
             else
                 wasClear = true
+                if not firstClear[di] and c >= CONFIG.TeleportClear then
+                    firstClear[di] = p
+                end
                 local score = math.min(c, CONFIG.EscapeClearWant) * 2 - d * 0.5
                 if mobPos then
                     local flatNew = Vector3.new(p.X - mobPos.X, 0,
@@ -3151,7 +3166,7 @@ local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
                     end
                 end
                 local list = crossed and crossing or clean
-                list[#list + 1] = {p = p, score = score}
+                list[#list + 1] = {p = p, score = score, dir = di}
             end
         end
     end
@@ -3161,13 +3176,15 @@ local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
         table.sort(list, ByScore)
         for i = 1, math.min(#list, 6) do
             local p = list[i].p
-            if LineClear(pos, p) and HasGround(p) then return p end
+            if LineClear(pos, p) and HasGround(p) then
+                return p, firstClear[list[i].dir]
+            end
         end
     end
     if bestBad and LineClear(pos, bestBad) and HasGround(bestBad) then
-        return bestBad
+        return bestBad, nil
     end
-    return nil
+    return nil, nil
 end
 
 -- HazardDebug only: draws every footprint from the last sweep as a red
@@ -3221,6 +3238,28 @@ local function DrawHazards()
             p.CFrame = CFrame.new(0, -500, 0)
         end
     end
+end
+
+-- A short hop straight to a safe spot, for when the exit is close
+-- enough that walking there is the slow way. One CFrame write:
+-- rotation kept, velocity zeroed so physics does not carry us on,
+-- dropped onto whatever floor is under the spot - and refused if
+-- there is none, rather than hopping out over a pit.
+local lastBlink = 0
+local function Blink(root, target)
+    local rp = RaycastParams.new()
+    rp.FilterType = EXCLUDE
+    rp.FilterDescendantsInstances = {GetChar(), RangeBarPart}
+    local hit = workspace:Raycast(target + Vector3.new(0, 6, 0),
+                                  Vector3.new(0, -CONFIG.GroundProbe, 0), rp)
+    if not hit then return false end
+    local ok = pcall(function()
+        local rot = root.CFrame - root.CFrame.Position
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(target.X, hit.Position.Y + CONFIG.FootOffset,
+                                 target.Z) * rot
+    end)
+    return ok
 end
 
 -- One call for every "get out of the way" test. Cached: two 20Hz
@@ -3302,18 +3341,32 @@ function ScanHazards()
         and HazardClearance(held, true) > 0 then
             esc = held
         else
-            local how = "clear"
-            esc = FindEscape(pos, mobPos, keep, outward)
+            local how, near = "clear", nil
+            esc, near = FindEscape(pos, mobPos, keep, outward)
             if not esc then
                 how = "clear of what can be dodged"
-                esc = FindEscape(pos, mobPos, keep, outward, true)
+                esc, near = FindEscape(pos, mobPos, keep, outward, true)
             end
             hazardCache.holdP, hazardCache.holdUntil = esc, now + 0.8
             hazardCache.commitUntil = now + 2.5
+
+            -- Close enough to hop? Straight to the nearest safe spot
+            -- on that heading, then walk the rest. Too far, and it is
+            -- a walk from the start, as quick as the legs allow.
+            local hopped = false
+            if esc and near and CONFIG.HazardTeleport
+            and now - lastBlink > CONFIG.TeleportCooldown then
+                local hop = Vector3.new(near.X - pos.X, 0, near.Z - pos.Z).Magnitude
+                if hop <= CONFIG.TeleportMax and Blink(root, near) then
+                    lastBlink, hopped = now, true
+                end
+            end
+
             if CONFIG.HazardDebug then
-                print(("[DQR] In a hazard (%d footprint(s), %d spokes) - %s")
+                print(("[DQR] In a hazard (%d footprint(s), %d spokes) - %s%s")
                     :format(#hazardShapes, hazardCache.radialN,
-                            esc and ("moving " .. how) or "NO EXIT FOUND"))
+                            esc and ("moving " .. how) or "NO EXIT FOUND",
+                            hopped and " (hopped)" or ""))
             end
         end
     elseif held and now < hazardCache.commitUntil
@@ -4344,7 +4397,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v8.9 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
+    print("[DQR] v9.0 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
