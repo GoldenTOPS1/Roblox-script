@@ -1,8 +1,7 @@
 -- ============================================================
---  DQR AUTO FARM v4.1
---  Axiom Build — stricter mob detection, no false lobby starts
---  Circular kiting, face lock, spell casting, auto queue,
---  hardcoded playButton path, graphics nuke, walk line
+--  DQR AUTO FARM v4.2
+--  Axiom Build — GuiService click fix, WalkTo velocity push,
+--  range-gated casting, strict mob detection, no false starts
 -- ============================================================
 
 -- ============================================================
@@ -14,7 +13,6 @@ local CONFIG = {
     LowerGraphics  = true,
 
     -- Combat
-    IdealRange     = 20,
     MinRange       = 12,
     MaxRange       = 28,
     DodgeRange     = 45,
@@ -82,7 +80,31 @@ local function GetHuman()
 end
 
 -- ============================================================
---  SPELL CASTING
+--  WALK TO — velocity pushed so Delta cant stall movement
+-- ============================================================
+local function WalkTo(pos)
+    local human = GetHuman()
+    local root  = GetRoot()
+    if not human or not root then return end
+
+    -- Standard MoveTo
+    human:MoveTo(pos)
+
+    -- Force velocity toward target so Delta cant stall it
+    pcall(function()
+        local dir = Vector3.new(
+            pos.X - root.Position.X,
+            0,
+            pos.Z - root.Position.Z
+        )
+        if dir.Magnitude > 0.5 then
+            root.AssemblyLinearVelocity = dir.Unit * CONFIG.WalkSpeed * 1.5
+        end
+    end)
+end
+
+-- ============================================================
+--  SPELL CASTING — range gated, no casting at empty air
 -- ============================================================
 local spellSlot  = false
 local lastAttack = 0
@@ -93,9 +115,64 @@ local function FireKey(kc)
     pcall(function() VIM:SendKeyEvent(false, kc, false, game) end)
 end
 
+local function GetNearestMob()
+    local root = GetRoot()
+    if not root then return nil end
+    local best, bestDist = nil, math.huge
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") then
+            local hum = obj:FindFirstChildOfClass("Humanoid")
+            local mr  = obj:FindFirstChild("HumanoidRootPart")
+            if hum and mr and hum.Health > 0 and hum.MaxHealth > 0 then
+                -- Not a player
+                local isPlayer = false
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if p.Character == obj then isPlayer = true break end
+                end
+                if not isPlayer and not mr.Anchored then
+                    -- Part count check
+                    local pc = 0
+                    for _, c in ipairs(obj:GetChildren()) do
+                        if c:IsA("BasePart") or c:IsA("MeshPart")
+                        or c:IsA("UnionOperation") then
+                            pc = pc + 1
+                        end
+                    end
+                    -- Billboard check
+                    local hasBB = false
+                    for _, c in ipairs(obj:GetDescendants()) do
+                        if c:IsA("BillboardGui") or c:IsA("Highlight") then
+                            hasBB = true break
+                        end
+                    end
+                    if pc >= 2 and hasBB then
+                        local d = (mr.Position - root.Position).Magnitude
+                        if d < bestDist then
+                            bestDist = d
+                            best = {
+                                Model    = obj,
+                                Root     = mr,
+                                Humanoid = hum,
+                                Distance = d,
+                            }
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
 local function TryCast()
     local now = tick()
     if now - lastAttack < CONFIG.AttackRate then return end
+
+    -- Only cast when a mob is within attack range
+    local target = GetNearestMob()
+    if not target then return end
+    if target.Distance > CONFIG.MaxRange then return end
+
     lastAttack = now
     spellSlot  = not spellSlot
     task.spawn(function()
@@ -104,7 +181,7 @@ local function TryCast()
 end
 
 -- ============================================================
---  FACE LOCK
+--  FACE LOCK — heartbeat thread, always faces nearest mob
 -- ============================================================
 local FaceLock = { Active = false, Thread = nil }
 
@@ -123,7 +200,8 @@ local function StartFaceLock(getPos)
                 )
                 if dir.Magnitude > 0.5 then
                     root.CFrame = CFrame.new(root.Position)
-                        * CFrame.Angles(0, math.atan2(dir.X, dir.Z) + math.pi, 0)
+                        * CFrame.Angles(0,
+                            math.atan2(dir.X, dir.Z) + math.pi, 0)
                 end
             end
             RunService.Heartbeat:Wait()
@@ -200,96 +278,6 @@ local function ObstacleCheck(from, to)
 end
 
 -- ============================================================
---  STRICT MOB DETECTION
--- ============================================================
-local function IsMob(model)
-    if not model:IsA("Model") then return false end
-
-    local hum  = model:FindFirstChildOfClass("Humanoid")
-    local root = model:FindFirstChild("HumanoidRootPart")
-    if not hum or not root then return false end
-
-    -- Must be alive with valid health values
-    if hum.Health    <= 0 then return false end
-    if hum.MaxHealth <= 0 then return false end
-
-    -- Must not be a player character
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p.Character == model then return false end
-    end
-
-    -- Must have multiple parts (lobby decorations are usually minimal)
-    local partCount = 0
-    for _, obj in ipairs(model:GetChildren()) do
-        if obj:IsA("BasePart") or obj:IsA("MeshPart")
-        or obj:IsA("UnionOperation") then
-            partCount = partCount + 1
-        end
-    end
-    if partCount < 2 then return false end
-
-    -- Must have a BillboardGui or Highlight (DQR mobs always do)
-    local hasBillboard = false
-    for _, obj in ipairs(model:GetDescendants()) do
-        if obj:IsA("BillboardGui") or obj:IsA("Highlight") then
-            hasBillboard = true
-            break
-        end
-    end
-    if not hasBillboard then return false end
-
-    -- Root must not be anchored (lobby decorations are anchored)
-    if root.Anchored then return false end
-
-    return true
-end
-
-local function GetNearestMob()
-    local root = GetRoot()
-    if not root then return nil end
-    local best, bestDist = nil, math.huge
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("Model") and IsMob(obj) then
-            local mr = obj:FindFirstChild("HumanoidRootPart")
-            if mr then
-                local d = (mr.Position - root.Position).Magnitude
-                if d < bestDist then
-                    bestDist = d
-                    best     = {
-                        Model    = obj,
-                        Root     = mr,
-                        Humanoid = obj:FindFirstChildOfClass("Humanoid"),
-                        Distance = d,
-                    }
-                end
-            end
-        end
-    end
-    return best
-end
-
--- ============================================================
---  STRICT DUNGEON DETECTION
--- ============================================================
-local function IsInDungeon()
-    local count = 0
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("Model") and IsMob(obj) then
-            count = count + 1
-            if count >= 2 then return true end
-        end
-    end
-    return false
-end
-
--- Boot-time version — double checks after a settle delay
-local function IsInDungeonSafe()
-    if not IsInDungeon() then return false end
-    task.wait(2)
-    return IsInDungeon()
-end
-
--- ============================================================
 --  THREAT DETECTION
 -- ============================================================
 local function ColorIsThreat(c)
@@ -331,6 +319,45 @@ local function ScanThreats()
         end
     end
     return false, nil
+end
+
+-- ============================================================
+--  DUNGEON DETECTION
+-- ============================================================
+local function IsInDungeon()
+    local count = 0
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") then
+            local hum = obj:FindFirstChildOfClass("Humanoid")
+            local mr  = obj:FindFirstChild("HumanoidRootPart")
+            if hum and mr and hum.Health > 0
+            and hum.MaxHealth > 0 and not mr.Anchored then
+                local isPlayer = false
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if p.Character == obj then isPlayer = true break end
+                end
+                if not isPlayer then
+                    local hasBB = false
+                    for _, c in ipairs(obj:GetDescendants()) do
+                        if c:IsA("BillboardGui") or c:IsA("Highlight") then
+                            hasBB = true break
+                        end
+                    end
+                    if hasBB then
+                        count = count + 1
+                        if count >= 2 then return true end
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function IsInDungeonSafe()
+    if not IsInDungeon() then return false end
+    task.wait(2)
+    return IsInDungeon()
 end
 
 -- ============================================================
@@ -396,7 +423,7 @@ local function MainLoop()
         if not target then
             ClearWalkLine()
             StopFaceLock()
-            human:MoveTo(root.Position)
+            WalkTo(root.Position)
             task.wait(CONFIG.ScanRate)
             continue
         end
@@ -404,7 +431,7 @@ local function MainLoop()
         local mobPos = target.Root.Position
         local dist   = target.Distance
 
-        -- Start face lock if not already running
+        -- Face lock ON
         if not FaceLock.Active then
             StartFaceLock(function()
                 local t = GetNearestMob()
@@ -412,16 +439,16 @@ local function MainLoop()
             end)
         end
 
-        -- Always try to cast
+        -- Range-gated cast
         TryCast()
 
-        -- Seed orbit once per new target
+        -- Seed orbit once per target
         if not seeded then
             SeedOrbit(mobPos)
             seeded = true
         end
 
-        -- Dodge check
+        -- Dodge check — highest movement priority
         local threatened, threatOrigin = ScanThreats()
         if threatened and (now - lastDodge) > CONFIG.DodgeCooldown then
             lastDodge  = now
@@ -436,19 +463,19 @@ local function MainLoop()
             dodge       = ObstacleCheck(root.Position, dodge)
             dodge       = Vector3.new(dodge.X, root.Position.Y, dodge.Z)
             ShowWalkLine(root.Position, dodge)
-            human:MoveTo(dodge)
+            WalkTo(dodge)
             orbitAngle  = orbitAngle + sign * 0.6
             task.wait(CONFIG.ScanRate)
             continue
         end
 
-        -- Advance orbit
+        -- Advance orbit angle
         orbitAngle = orbitAngle + CONFIG.CircleSpeed * dt
         if orbitAngle > math.pi * 2 then
             orbitAngle = orbitAngle - math.pi * 2
         end
 
-        -- Radius scaling based on current distance
+        -- Scale radius by distance
         local radius = CONFIG.CircleRadius
         if dist < CONFIG.MinRange then
             radius = CONFIG.CircleRadius * 1.6
@@ -456,12 +483,12 @@ local function MainLoop()
             radius = CONFIG.CircleRadius * 0.5
         end
 
-        -- Compute and walk to orbit point
+        -- Compute orbit destination and walk
         local dest = GetOrbitPos(mobPos, radius)
         dest = ObstacleCheck(root.Position, dest)
         dest = Vector3.new(dest.X, root.Position.Y, dest.Z)
         ShowWalkLine(root.Position, dest)
-        human:MoveTo(dest)
+        WalkTo(dest)
 
         task.wait(CONFIG.ScanRate)
     end
@@ -492,7 +519,7 @@ local function DodgeWatcher()
             local perp  = Vector3.new(-toward.Z, 0, toward.X)
             local sign  = math.cos(orbitAngle) > 0 and 1 or -1
             local dodge = root.Position + perp * sign * CONFIG.DodgeStep
-            human:MoveTo(dodge)
+            WalkTo(dodge)
         end
     end
 end
@@ -515,7 +542,7 @@ function Farm.Stop()
     StopFaceLock()
     local hum  = GetHuman()
     local root = GetRoot()
-    if hum and root then hum:MoveTo(root.Position) end
+    if hum and root then WalkTo(root.Position) end
     print("[DQR] Farm stopped.")
 end
 
@@ -543,25 +570,26 @@ local DUNGEON_DATA = {
 }
 
 -- ============================================================
---  BUTTON CLICKER
+--  BUTTON CLICKER — GuiService stripped out, position only
 -- ============================================================
 local function ClickButton(btn)
     if not btn then return false end
+
+    -- Kill GuiService navigation so it cant hijack the click
+    pcall(function() GuiService.SelectedObject = nil end)
+
+    -- Primary: position-based mouse event
     pcall(function()
         local pos = btn.AbsolutePosition + btn.AbsoluteSize / 2
-        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true,  game, 0)
-        task.wait(0.1)
-        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true,  game, 1)
+        task.wait(0.12)
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
     end)
-    task.wait(0.3)
-    pcall(function() btn.MouseButton1Click:Fire() end)
     task.wait(0.2)
-    pcall(function()
-        GuiService.SelectedObject = btn
-        VIM:SendKeyEvent(true,  Enum.KeyCode.Return, false, game)
-        task.wait(0.1)
-        VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
-    end)
+
+    -- Fallback: fire signal directly
+    pcall(function() btn.MouseButton1Click:Fire() end)
+
     return true
 end
 
@@ -673,7 +701,7 @@ local function TryQueueDungeon()
         print("[DQR] Found playButton — clicking.")
         ClickButton(playBtn)
         task.wait(0.8)
-        -- Re-click loop for vote-based lobbies
+        -- Re-click for vote lobbies
         for i = 1, 4 do
             task.wait(0.8)
             local again = FindPlayBtn()
@@ -720,15 +748,14 @@ end
 --  BOOT SEQUENCE
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v4.1 loaded.")
+    print("[DQR] v4.2 loaded.")
     NukeGraphics()
-    task.wait(2.5)  -- let lobby fully settle before any detection
+    task.wait(2.5)
 
     if IsInDungeonSafe() then
         print("[DQR] Already in dungeon — starting farm.")
         Farm.Start()
     elseif CONFIG.AutoRunDungeon then
-        -- Check if Play button already visible (on title/lobby screen)
         local existingPlay = FindPlayBtn()
         if existingPlay then
             print("[DQR] Play button visible on boot — clicking.")
@@ -737,13 +764,12 @@ task.spawn(function()
         else
             TryQueueDungeon()
         end
-        -- Wait for dungeon to load
         local w = 0
         repeat task.wait(2) w = w + 2 until IsInDungeon() or w > 90
         if IsInDungeon() then
             Farm.Start()
         else
-            print("[DQR] Timed out. Go into dungeon manually then press F5.")
+            print("[DQR] Timed out. Enter dungeon manually then press F5.")
         end
     else
         print("[DQR] AutoRunDungeon off — waiting for dungeon...")
@@ -755,7 +781,7 @@ task.spawn(function()
 end)
 
 -- ============================================================
---  F5 — toggle farm
+--  F5 — toggle farm on/off
 -- ============================================================
 UserInputService.InputBegan:Connect(function(inp, gpe)
     if gpe then return end
