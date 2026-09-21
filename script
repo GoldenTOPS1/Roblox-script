@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v8.2
+--  DQR AUTO FARM v8.3
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -81,9 +81,9 @@ local CONFIG = {
     -- close you are. Fight them from further out, and never stand still.
     BossStandoff   = 10,
     HazardMargin   = 8,      -- extra studs to clear a hazard edge by
-    HazardLookahead= 10,     -- studs of walk to check before stepping
-    AvoidDwell     = 0.25,   -- hold a hazard-avoidance heading this long
     MaxHazards     = 24,     -- cap the tracked hazard list
+    EmptyScanTTL   = 0.6,    -- don't re-search an empty room constantly
+    FullScanEvery  = 4,      -- seconds between last-resort full scans
 
     -- Stand and fight when the mob is not moving
     HoldWhenStill  = true,
@@ -467,7 +467,7 @@ local RangeBarPart = nil
 -- movement code up here has to consult it: knowing where the beams are
 -- is useless if the bot still routes its walk straight through one.
 local PointInHazard   -- (Vector3) -> hazard, reference point
-local SegBlocked      -- (from, to) -> true if that walk crosses a hazard
+local SegBlocked      -- (from, to) -> crosses a hazard? (kept for reuse)
 
 -- ============================================================
 --  HAZARD REGISTRIES  (event driven, no polling)
@@ -609,8 +609,6 @@ local steerDir   = nil   -- fallback heading when no path exists
 local steerUntil = 0     -- keep that heading at least this long
 local wpStuck    = 0     -- seconds spent failing to reach pathQueue[1]
 local clearStreak = 0    -- consecutive "line is clear" readings
-local avoidDir   = nil   -- held heading while walking around a hazard
-local avoidUntil = 0
 local stuckCount  = 0    -- consecutive stuck events at one spot
 local paceAnchor  = nil  -- where we were when the pacing window opened
 local paceSince   = 0
@@ -717,8 +715,11 @@ local function SafeStep(pos, dir, dist)
             dir.X * math.cos(a) - dir.Z * math.sin(a), 0,
             dir.X * math.sin(a) + dir.Z * math.cos(a))
         local p = pos + d * dist
+        -- Do not land inside another hazard, but do NOT sweep the whole
+        -- path: that check was run for every candidate of every dodge
+        -- and was far too expensive to do at this rate.
         if LineClear(pos, p) and HasGround(p)
-        and not (SegBlocked and SegBlocked(pos, p)) then return p end
+        and not (PointInHazard and PointInHazard(p)) then return p end
     end
 
     -- Nothing clean. Rather than refuse to move, take the best of a bad
@@ -1097,39 +1098,14 @@ local function StartMoving(getDestFn)
             if d.Magnitude > 1 then dir = d.Unit end
         end
 
-        -- Last line of defence: do not step into a beam even if the
-        -- path was computed before it appeared.
-        --
-        -- THROTTLED AND STICKY. Running this every frame cost ~160
-        -- hazard tests per frame (8 alternate headings x 20 samples),
-        -- which was the lag - and re-picking a heading 60 times a
-        -- second made the bot flick left and right between two beams
-        -- and clip one. Decide a few times a second and hold it.
-        if dir and SegBlocked then
-            local nowT = tick()
-            if nowT >= avoidUntil then
-                avoidUntil = nowT + CONFIG.AvoidDwell
-                avoidDir   = nil
-                if SegBlocked(pos, pos + dir * CONFIG.HazardLookahead) then
-                    for _, deg in ipairs({40, -40, 80, -80, 120, -120}) do
-                        local a = math.rad(deg)
-                        local alt = Vector3.new(
-                            dir.X * math.cos(a) - dir.Z * math.sin(a), 0,
-                            dir.X * math.sin(a) + dir.Z * math.cos(a))
-                        local to = pos + alt * CONFIG.HazardLookahead
-                        if not SegBlocked(pos, to) and LineClear(pos, to) then
-                            avoidDir = alt break
-                        end
-                    end
-                    -- Everything ahead is blocked. Keep walking anyway:
-                    -- standing still here froze the bot for seconds at
-                    -- a time, and the escape logic moves us out next
-                    -- tick regardless.
-                    if not avoidDir then avoidDir = dir end
-                end
-            end
-            if avoidDir then dir = avoidDir end
-        end
+        -- NOTE: v8.1 added a per-frame "does this step cross a beam?"
+        -- check here. It ran 60 times a second, cost ~160 hazard tests
+        -- per frame, re-picked a heading every frame (so the bot flicked
+        -- between two beams and clipped one), and froze the character
+        -- outright whenever it judged every direction blocked. It made
+        -- things worse than not having it, so it is gone. Hazards are
+        -- handled by escaping when we are IN one, which is cheap and
+        -- was working.
 
         if dir then
             if commandSince == 0 then commandSince = tick() end
@@ -1981,6 +1957,7 @@ end
 local cachedTarget = nil
 local cachedMobs   = nil
 local lastScan     = 0
+local lastFullScan = 0
 local CACHE_TTL    = 0.15
 -- Weak keys: entries vanish when the mob model is collected.
 local mobShape = setmetatable({}, {__mode = "k"})
@@ -1989,6 +1966,15 @@ local function GetNearestMob()
     local root = GetRoot()
     if not root then return nil end
     local now = tick()
+
+    -- Nothing found last time? Do not re-run the whole search every
+    -- 0.15s. With an empty room that meant three rings, two passes each,
+    -- plus a full workspace walk, six times a second - which is exactly
+    -- when the bot would stall in the open for a second or two.
+    if cachedMobs and #cachedMobs == 0 and not cachedTarget
+    and (now - lastScan) < CONFIG.EmptyScanTTL then
+        return nil
+    end
 
     -- Return cache if valid
     if cachedTarget and (now - lastScan) < CACHE_TTL then
@@ -2125,7 +2111,8 @@ local function GetNearestMob()
     -- models directly, which is slow but only happens when the map
     -- genuinely looks empty - and standing idle with a boss still alive
     -- is far worse than one expensive scan.
-    if #mobList == 0 then
+    if #mobList == 0 and (now - lastFullScan) > CONFIG.FullScanEvery then
+        lastFullScan = now
         seen = {}
         for _, obj in ipairs(workspace:GetDescendants()) do
             if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") then
@@ -2451,29 +2438,30 @@ local function BuildHazards()
         end
     end
 
-    for _, o in ipairs(NearbyParts(pos, CONFIG.DodgeRange * 2)) do
-        if #list >= CONFIG.MaxHazards then break end
-
-        -- Never treat a creature's own body as a hazard. Mob parts move
-        -- constantly, so the "it moved, therefore it is an attack" rule
-        -- matched them and filled the list with false positives - which
-        -- made the bot think it was boxed in everywhere and stop
-        -- dodging the things that actually mattered.
+    -- Never treat a creature's own body as a hazard: mob parts move
+    -- constantly, so "it moved, therefore it is an attack" matched them.
+    -- Checked AFTER the shape tests - v8.2 ran this ancestor walk on
+    -- every nearby part before anything else, which meant thousands of
+    -- FindFirstChildOfClass calls per second and was itself a big
+    -- source of the lag it was supposed to help with.
+    local function IsCreaturePart(o)
         local owner = o.Parent
-        local isCreature = false
         for _ = 1, 3 do
-            if not owner or owner == workspace then break end
-            if owner:IsA("Model") and owner:FindFirstChildOfClass("Humanoid") then
-                isCreature = true break
-            end
+            if not owner or owner == workspace then return false end
+            if owner:IsA("Model")
+            and owner:FindFirstChildOfClass("Humanoid") then return true end
             owner = owner.Parent
         end
+        return false
+    end
 
-        if isCreature then
-            -- skip
-        elseif CONFIG.DodgeBeams and IsBeamPart(o) then
+    for _, o in ipairs(NearbyParts(pos, CONFIG.DodgeRange)) do
+        if #list >= CONFIG.MaxHazards then break end
+
+        if CONFIG.DodgeBeams and IsBeamPart(o) and not IsCreaturePart(o) then
             AddBeamPart(list, o)
-        elseif CONFIG.DodgeTelegraph and IsTelegraph(o) then
+        elseif CONFIG.DodgeTelegraph and IsTelegraph(o)
+        and not IsCreaturePart(o) then
             local s = o.Size
             local round = false
             if o:IsA("Part") then
@@ -2697,16 +2685,11 @@ local function BestOrbitAngle(mobPos, radius, targetModel, pos, natural)
         -- And prefer somewhere we can actually walk to.
         if not LineClear(pos, p) then score = score - 25 end
 
-        -- Heavily prefer an orbit leg that does not cross a beam. This
-        -- is the fix for walking through hazards while circling: the
-        -- destination was checked for walls but never for damage.
-        -- Endpoint first (one test); only pay for the full sweep when
-        -- the endpoint itself is clean.
-        if PointInHazard and PointInHazard(p) then
-            score = score - 300
-        elseif SegBlocked and SegBlocked(pos, p) then
-            score = score - 200
-        end
+        -- Avoid parking the orbit inside a hazard. One cheap endpoint
+        -- test only - the v8.1 version also swept the whole leg for
+        -- every one of the twelve candidates, every tick, which is a
+        -- large part of what made the game lag.
+        if PointInHazard and PointInHazard(p) then score = score - 300 end
 
         if score > bestScore then bestA, bestScore = a, score end
     end
@@ -3363,7 +3346,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v8.2 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
+    print("[DQR] v8.3 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
