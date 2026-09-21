@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v7.6
+--  DQR AUTO FARM v7.7
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -2254,12 +2254,22 @@ end
 local function IsTelegraph(o)
     if not o:IsA("BasePart") then return false end
     if IsOurs(o) then return false end
-    if o.Transparency > 0.9 then return false end
+    if o.Transparency > 0.95 then return false end
     local s = o.Size
     if s.Y > CONFIG.TelegraphMaxY then return false end          -- a prop
     if math.max(s.X, s.Z) < CONFIG.TelegraphMinLen then return false end
+
     local c = o.Color
-    return c.R > 0.55 and c.G < 0.45 and c.B < 0.45              -- red-ish
+    if c.R > 0.55 and c.G < 0.45 and c.B < 0.45 then return true end -- red
+
+    -- Colour alone is not enough: the Ice Elemental paints CYAN rings,
+    -- and cyan is also the colour of half the Winter Outpost scenery.
+    -- What separates them is timing - the map is already there when we
+    -- arrive, an attack marker appears mid-fight. Anything flat and
+    -- large that spawned in the last few seconds is an attack marker
+    -- whatever colour it is.
+    local born = recentParts[o]
+    return born ~= nil and (tick() - born) < CONFIG.RecentWindow
 end
 
 -- Returns a world position to run to, or nil when we are standing clear.
@@ -2274,7 +2284,40 @@ local function ScanTelegraphs()
 
     for _, o in ipairs(NearbyParts(pos, CONFIG.DodgeRange)) do
         if IsTelegraph(o) then
-            do
+            local s = o.Size
+            -- A ring AoE is as wide as it is long. Treating it as a box
+            -- would pick one of its axes and walk us along a chord;
+            -- the way out of a circle is straight outward from the
+            -- centre, and that is also the shortest exit.
+            -- Shape exists only on Part; reading it on a MeshPart or a
+            -- Union throws, and an error in here kills the scan thread.
+            local round = false
+            if o:IsA("Part") then
+                round = o.Shape == Enum.PartType.Cylinder
+                     or o.Shape == Enum.PartType.Ball
+            end
+            if math.abs(s.X - s.Z) < 2 or round then
+                local r = math.max(s.X, s.Z) / 2 + CONFIG.TelegraphPad
+                local away = Vector3.new(pos.X - o.Position.X, 0,
+                                         pos.Z - o.Position.Z)
+                local d = away.Magnitude
+                if d < r and math.abs(o.Position.Y - pos.Y) < 14 then
+                    local depth = r - d
+                    if depth > worstDepth then
+                        local dir = d < 0.5 and Vector3.new(1, 0, 0)
+                                            or away.Unit
+                        local p = SafeStep(pos, dir, depth + 4)
+                        if p then
+                            worstDepth = depth
+                            escape = p
+                            if CONFIG.HazardDebug then
+                                print(("[DQR] Ring AoE: %s r=%d depth=%d")
+                                    :format(o:GetFullName(), r, depth))
+                            end
+                        end
+                    end
+                end
+            else
                 -- Where do we stand in the strip's own axes?
                 local rel = o.CFrame:PointToObjectSpace(pos)
                 local hx  = o.Size.X / 2 + CONFIG.TelegraphPad
@@ -3213,7 +3256,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v7.6 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
+    print("[DQR] v7.7 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
