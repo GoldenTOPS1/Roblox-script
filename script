@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v4.4
+--  DQR AUTO FARM v4.5
 --  Axiom Build — No mouse clicks, CFrame movement,
 --  melee + spells, full speed, remote-based dungeon queue
 -- ============================================================
@@ -8,6 +8,7 @@ local CONFIG = {
     TargetDungeon  = "Desert Temple",
     Difficulty     = "Easy",
     AutoRunDungeon = true,
+    UseRemotes     = false,  -- blind-firing guessed remotes; off by default
     LowerGraphics  = true,
 
     MeleeRange     = 8,      -- swing left click when closer than this
@@ -23,6 +24,9 @@ local CONFIG = {
     CircleRadius   = 18,
     CircleSpeed    = 0.85,
     ScanRate       = 0.05,
+    AimCamera      = true,   -- point the camera at the mob (DQR aims from camera)
+    CameraHeight   = 12,
+    CameraBack     = 14,
 }
 
 local Players          = game:GetService("Players")
@@ -74,32 +78,71 @@ end
 --  Delta blocks MoveTo in dungeons — CFrame teleport is
 --  the only reliable way to move in executor context
 -- ============================================================
-local moveConn = nil
+--  ONE connection owns the root CFrame. Two connections both writing
+--  root.CFrame fight each other every frame — that was why the character
+--  ended up staring off into space instead of at the mob.
+local moveConn   = nil
+local faceTarget = nil   -- function returning the Vector3 to look at, or nil
 
 local function StartMoving(getDestFn)
     if moveConn then moveConn:Disconnect() end
+
+    -- Humanoid.AutoRotate re-orients the character from its own move
+    -- direction every frame and overwrites our facing. Kill it.
+    local h0 = GetHuman()
+    if h0 then pcall(function() h0.AutoRotate = false end) end
+
     moveConn = RunService.Heartbeat:Connect(function(dt)
         local root  = GetRoot()
         local human = GetHuman()
         if not root or not human then return end
+        if human.AutoRotate then human.AutoRotate = false end
 
+        local pos = root.Position
+
+        -- Step toward destination at WalkSpeed (position only)
         local dest = getDestFn()
-        if not dest then return end
+        if dest then
+            local dir  = Vector3.new(dest.X - pos.X, 0, dest.Z - pos.Z)
+            local dist = dir.Magnitude
+            if dist > 1 then
+                local step = math.min(dist, CONFIG.WalkSpeed * dt)
+                local np   = pos + dir.Unit * step
+                pos = Vector3.new(np.X, pos.Y, np.Z)
+            end
+        end
 
-        local dir = dest - root.Position
-        dir = Vector3.new(dir.X, 0, dir.Z)
-        local dist = dir.Magnitude
-        if dist < 1 then return end
+        -- Look direction: at the mob if we have one, else along travel
+        local look = nil
+        local fp = faceTarget and faceTarget() or nil
+        if fp then
+            local d = Vector3.new(fp.X - pos.X, 0, fp.Z - pos.Z)
+            if d.Magnitude > 0.5 then look = d.Unit end
+        end
+        if not look and dest then
+            local d = Vector3.new(dest.X - pos.X, 0, dest.Z - pos.Z)
+            if d.Magnitude > 0.5 then look = d.Unit end
+        end
 
-        -- Step toward destination at WalkSpeed
-        local step = math.min(dist, CONFIG.WalkSpeed * dt)
-        local newPos = root.Position + dir.Unit * step
+        if look then
+            root.CFrame = CFrame.lookAt(pos, pos + look)
+        else
+            root.CFrame = root.CFrame - root.CFrame.Position + pos
+        end
 
-        -- Keep Y — let physics handle elevation
-        root.CFrame = CFrame.new(
-            Vector3.new(newPos.X, root.Position.Y, newPos.Z),
-            Vector3.new(newPos.X + dir.Unit.X, root.Position.Y, newPos.Z + dir.Unit.Z)
-        )
+        -- Aim the camera at the mob too — DQR resolves attacks from the
+        -- camera/mouse ray, not from the character's own facing.
+        if CONFIG.AimCamera and fp then
+            local cam = workspace.CurrentCamera
+            if cam then
+                if cam.CameraType ~= Enum.CameraType.Scriptable then
+                    cam.CameraType = Enum.CameraType.Scriptable
+                end
+                local back = Vector3.new(-look.X, 0, -look.Z) * CONFIG.CameraBack
+                cam.CFrame = CFrame.lookAt(
+                    pos + back + Vector3.new(0, CONFIG.CameraHeight, 0), fp)
+            end
+        end
     end)
 end
 
@@ -108,30 +151,20 @@ local function StopMoving()
         moveConn:Disconnect()
         moveConn = nil
     end
+    local h = GetHuman()
+    if h then pcall(function() h.AutoRotate = true end) end
+    local cam = workspace.CurrentCamera
+    if cam and cam.CameraType == Enum.CameraType.Scriptable then
+        cam.CameraType = Enum.CameraType.Custom
+        pcall(function() cam.CameraSubject = GetHuman() end)
+    end
 end
 
 -- ============================================================
---  FACE MOB — separate from movement so it doesn't conflict
+--  FACE MOB — feeds the single movement connection above
 -- ============================================================
-local faceConn = nil
-
-local function StartFacing(getPosFn)
-    if faceConn then faceConn:Disconnect() end
-    faceConn = RunService.Heartbeat:Connect(function()
-        local root = GetRoot()
-        local pos  = getPosFn()
-        if not root or not pos then return end
-        local dir = Vector3.new(pos.X - root.Position.X, 0, pos.Z - root.Position.Z)
-        if dir.Magnitude < 0.5 then return end
-        -- Only rotate — preserve position
-        root.CFrame = CFrame.new(root.Position,
-            root.Position + dir)
-    end)
-end
-
-local function StopFacing()
-    if faceConn then faceConn:Disconnect() faceConn = nil end
-end
+local function StartFacing(getPosFn) faceTarget = getPosFn end
+local function StopFacing()          faceTarget = nil     end
 
 -- ============================================================
 --  WALK LINE
@@ -244,6 +277,75 @@ end
 -- ============================================================
 --  DUNGEON QUEUE — fallback button fire (no click, direct signal)
 -- ============================================================
+-- ============================================================
+--  BUTTON PRESS — the real one.
+--  `signal:Fire()` does NOT exist on RBXScriptSignal; every
+--  `pcall(function() btn.MouseButton1Click:Fire() end)` in v4.3
+--  threw and was silently swallowed, so nothing was ever clicked.
+--  Three real strategies, in order of reliability:
+--    1. executor firesignal()
+--    2. executor getconnections() -> :Fire() on each connection
+--    3. VirtualInputManager click at the button's real screen position
+-- ============================================================
+local GuiService = game:GetService("GuiService")
+
+local function VisibleOnScreen(gui)
+    if not gui.Visible or gui.AbsoluteSize.X < 1 then return false end
+    local p = gui.Parent
+    while p and not p:IsA("PlayerGui") do
+        if p:IsA("GuiObject") and not p.Visible then return false end
+        if p:IsA("ScreenGui") and not p.Enabled then return false end
+        p = p.Parent
+    end
+    return true
+end
+
+local function Env(name)
+    local ok, v = pcall(function()
+        if getfenv then return getfenv()[name] end
+        return (_G)[name]
+    end)
+    if ok then return v end
+    return nil
+end
+
+local function ClickButton(btn)
+    local fs = Env("firesignal")
+    if typeof(fs) == "function" then
+        local ok = pcall(fs, btn.MouseButton1Click)
+        pcall(fs, btn.Activated)
+        if ok then return true end
+    end
+
+    local gc = Env("getconnections")
+    if typeof(gc) == "function" then
+        local fired = false
+        for _, sig in ipairs({btn.MouseButton1Click, btn.Activated}) do
+            pcall(function()
+                for _, c in ipairs(gc(sig)) do
+                    c:Fire()
+                    fired = true
+                end
+            end)
+        end
+        if fired then return true end
+    end
+
+    -- Real mouse input at the button's centre (needs it on screen)
+    if not VisibleOnScreen(btn) then return false end
+    local inset = GuiService:GetGuiInset()
+    local x = btn.AbsolutePosition.X + btn.AbsoluteSize.X / 2
+    local y = btn.AbsolutePosition.Y + btn.AbsoluteSize.Y / 2 + inset.Y
+    pcall(function()
+        VIM:SendMouseMoveEvent(x, y, game)
+        S(0.05)
+        VIM:SendMouseButtonEvent(x, y, 0, true,  game, 0)
+        S(0.05)
+        VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end)
+    return true
+end
+
 local function FindAndFireBtn(matches, timeout)
     timeout = timeout or 8
     local elapsed = 0
@@ -264,12 +366,7 @@ local function FindAndFireBtn(matches, timeout)
                         print("[DQR] Firing button: " .. obj.Name
                             .. " Text: '" .. (obj:IsA("TextButton")
                             and obj.Text or "") .. "'")
-                        -- Fire signal directly — no mouse, no position
-                        pcall(function() obj.MouseButton1Click:Fire() end)
-                        pcall(function() obj.Activated:Fire() end)
-                        S(0.1)
-                        pcall(function() obj.MouseButton1Click:Fire() end)
-                        return true
+                        if ClickButton(obj) then return true end
                     end
                 end
             end
@@ -282,18 +379,20 @@ local function RunLobbyFlow()
     if not CONFIG.AutoRunDungeon then return end
     print("[DQR] Starting lobby flow — no mouse clicks.")
 
-    -- First try remote-based queue (cleanest)
-    print("[DQR] Scanning for dungeon remotes...")
-    PrintRemotes()
-    S(0.5)
-
-    local firedRemote = TryFireDungeonRemote()
-    if firedRemote then
-        print("[DQR] Remote fired — waiting for dungeon load.")
-        return
+    -- Remotes are only a hint here. TryFireDungeonRemote returned true as
+    -- soon as it found *any* name-matching remote and blind-fired guessed
+    -- arguments at it — and the old code then `return`ed, skipping the whole
+    -- button flow. That is why the match never started. Now it is opt-in and
+    -- never short-circuits the UI path.
+    if CONFIG.UseRemotes then
+        print("[DQR] Scanning for dungeon remotes...")
+        PrintRemotes()
+        S(0.5)
+        TryFireDungeonRemote()
+        S(2)
     end
 
-    print("[DQR] No matching remote — falling back to button signal fires.")
+    print("[DQR] Driving the lobby UI.")
 
     -- Step 1: Play button
     print("[DQR] Step 1: Play button")
@@ -304,8 +403,7 @@ local function RunLobbyFlow()
             :WaitForChild("mainInterface", 4)
             :WaitForChild("buttons", 4)
             :WaitForChild("playButton", 4)
-        btn.MouseButton1Click:Fire()
-        playFired = true
+        playFired = ClickButton(btn)
         print("[DQR] playButton fired via direct path.")
     end)
     if not playFired then
@@ -341,10 +439,11 @@ local function RunLobbyFlow()
                 local t = obj:IsA("TextButton") and obj.Text:lower() or ""
                 local n = obj.Name:lower()
                 if t:find(kw) or n:find(kw) then
-                    pcall(function() obj.MouseButton1Click:Fire() end)
-                    print("[DQR] Dungeon via keyword: " .. kw)
-                    dunFired = true
-                    break
+                    if ClickButton(obj) then
+                        print("[DQR] Dungeon via keyword: " .. kw)
+                        dunFired = true
+                        break
+                    end
                 end
             end
         end
@@ -507,9 +606,15 @@ local function DoMelee()
     lastMelee = now
     task.spawn(function()
         pcall(function()
-            VIM:SendMouseButtonEvent(0, 0, 0, true,  game, 1)
+            -- Aim at screen centre, not (0,0). The camera is pointed at the
+            -- mob, so the centre of the viewport is the mob.
+            local cam = workspace.CurrentCamera
+            local vp  = cam and cam.ViewportSize or Vector2.new(800, 600)
+            local x, y = vp.X / 2, vp.Y / 2
+            VIM:SendMouseMoveEvent(x, y, game)
+            VIM:SendMouseButtonEvent(x, y, 0, true,  game, 0)
             S(0.05)
-            VIM:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+            VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
         end)
     end)
 end
@@ -635,7 +740,7 @@ local function MainLoop()
         local dist   = target.Distance
 
         -- Always face mob
-        if not faceConn then
+        if not faceTarget then
             StartFacing(function()
                 local t = GetNearestMob()
                 return t and t.Root.Position or nil
