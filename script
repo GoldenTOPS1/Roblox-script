@@ -45,7 +45,7 @@ local CONFIG = {
 
     -- Walk speed: SetWalkSpeed=false leaves whatever the game gives you
     SetWalkSpeed   = true,
-    WalkSpeed      = 19,
+    WalkSpeed      = 21,
 
     -- Beams / lasers (the blue line the Frost Wizards fire)
     DodgeBeams     = true,
