@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v5.9
+--  DQR AUTO FARM v6.0
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -10,7 +10,7 @@ local CONFIG = {
     -- Picks the engagement distances below. Anything you set by hand in
     -- the ENGAGEMENT DISTANCE block is overwritten by this at boot, so
     -- set Class to "" if you want to tune the numbers yourself.
-    Class          = "Mage",
+    Class          = "Warrior",
 
     TargetDungeon  = "Winter Outpost",
     Difficulty     = "Easy",
@@ -52,7 +52,7 @@ local CONFIG = {
 
     -- Walk speed: SetWalkSpeed=false leaves whatever the game gives you
     SetWalkSpeed   = true,
-    WalkSpeed      = 21,
+    WalkSpeed      = 19,
 
     -- Beams / lasers (the blue line the Frost Wizards fire)
     DodgeBeams     = true,
@@ -65,6 +65,12 @@ local CONFIG = {
     TelegraphPad   = 4,      -- treat this much beyond the edge as unsafe
     TelegraphMinLen= 6,      -- ignore red parts smaller than this
     TelegraphMaxY  = 2,      -- ...and anything taller than this (props)
+
+    -- Crowd handling: keep clear of mobs other than the one being hit
+    AvoidOtherMobs = true,
+    MobAvoidRadius = 12,     -- "too close to another mob" distance
+    CrowdRadius    = 22,     -- mobs this near count as part of the pack
+    CrowdCount     = 3,      -- this many = stop orbiting, back off
 
     -- Stand and fight when the mob is not moving
     HoldWhenStill  = true,
@@ -1521,6 +1527,7 @@ end
 --  MOB DETECTION - strict, cached
 -- ============================================================
 local cachedTarget = nil
+local cachedMobs   = nil
 local lastScan     = 0
 local CACHE_TTL    = 0.15
 
@@ -1541,6 +1548,7 @@ local function GetNearestMob()
 
     lastScan = now
     local best, bestD = nil, math.huge
+    local mobList = {}
 
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("Model") then
@@ -1573,11 +1581,16 @@ local function GetNearestMob()
                         blocked = nil
                     end
 
-                    if hasBB and pc >= 2 and not blocked then
+                    if hasBB and pc >= 2 then
                         local d = (mr.Position - root.Position).Magnitude
-                        if d < bestD then
+                        local rec = {Model=obj, Root=mr, Humanoid=hum, Distance=d}
+                        -- Every live mob goes in the list, blacklisted or
+                        -- not: we still need to steer around one we have
+                        -- given up on attacking.
+                        mobList[#mobList + 1] = rec
+                        if not blocked and d < bestD then
                             bestD = d
-                            best = {Model=obj, Root=mr, Humanoid=hum, Distance=d}
+                            best  = rec
                         end
                     end
                 end
@@ -1585,8 +1598,15 @@ local function GetNearestMob()
         end
     end
 
+    cachedMobs  = mobList
     cachedTarget = best
     return best
+end
+
+-- Everything the last scan saw. Shares the scan with GetNearestMob so
+-- crowd avoidance costs nothing extra.
+local function GetMobs()
+    return cachedMobs or {}
 end
 
 -- ============================================================
@@ -1900,6 +1920,7 @@ local orbitAngle = 0
 local seeded     = false
 local lastDodge  = 0
 local lastTeleWarn = 0
+local lastCrowdWarn = 0
 
 -- Tracks how long the current target has held position
 local stillModel = nil
@@ -1920,6 +1941,70 @@ local function GetOrbitPos(mobPos, radius)
         mobPos.X + math.cos(orbitAngle) * radius,
         mobPos.Y,
         mobPos.Z + math.sin(orbitAngle) * radius)
+end
+
+local function AngleTo(mobPos, radius, a)
+    return Vector3.new(mobPos.X + math.cos(a) * radius, mobPos.Y,
+                       mobPos.Z + math.sin(a) * radius)
+end
+
+-- ============================================================
+--  CROWD HANDLING
+--  Orbiting was computed blind: advance an angle around the target and
+--  walk there, with no idea what else was standing in the way. With a
+--  pack chasing you that walks straight through the mobs beside the
+--  one being hit, which is free damage taken for nothing.
+-- ============================================================
+
+-- Mobs within `radius` of `pos`, and where the pack's centre is.
+local function Crowd(pos, radius)
+    local list, sum, n = {}, Vector3.zero, 0
+    for _, m in ipairs(GetMobs()) do
+        if m.Root and m.Root.Parent then
+            local d = (m.Root.Position - pos).Magnitude
+            if d < radius then
+                list[#list + 1] = m
+                sum = sum + m.Root.Position
+                n = n + 1
+            end
+        end
+    end
+    if n == 0 then return list, nil end
+    return list, sum / n
+end
+
+-- Instead of taking whatever angle the orbit reached, sample around the
+-- target and pick the spot that keeps the most room from OTHER mobs,
+-- while still preferring to keep circling the way we already were.
+local function BestOrbitAngle(mobPos, radius, targetModel, pos, natural)
+    local mobs = GetMobs()
+    local bestA, bestScore = natural, -math.huge
+
+    for i = 0, 11 do
+        local a = natural + (i * math.pi / 6)
+        local p = AngleTo(mobPos, radius, a)
+        local score = 0
+
+        for _, m in ipairs(mobs) do
+            if m.Model ~= targetModel and m.Root and m.Root.Parent then
+                local d = (m.Root.Position - p).Magnitude
+                if d < CONFIG.MobAvoidRadius then
+                    -- The closer that spot puts us to another mob, the worse
+                    score = score - (CONFIG.MobAvoidRadius - d) * 3
+                end
+            end
+        end
+
+        -- Prefer continuing the current direction over teleport-jumping
+        -- the orbit across the mob, which looks and plays badly.
+        score = score - i * 1.5
+
+        -- And prefer somewhere we can actually walk to.
+        if not LineClear(pos, p) then score = score - 25 end
+
+        if score > bestScore then bestA, bestScore = a, score end
+    end
+    return bestA
 end
 
 -- ============================================================
@@ -2046,6 +2131,35 @@ local function MainLoop()
             continue
         end
 
+        -- Surrounded? Then orbiting is the wrong idea entirely - any
+        -- circle around one mob runs through the others. Back out to the
+        -- edge of the pack and fight from there instead.
+        if CONFIG.AvoidOtherMobs then
+            local pack, centre = Crowd(root.Position, CONFIG.CrowdRadius)
+            if centre and #pack >= CONFIG.CrowdCount then
+                local away = Vector3.new(root.Position.X - centre.X, 0,
+                                         root.Position.Z - centre.Z)
+                if away.Magnitude < 0.5 then
+                    -- Dead centre of the pack: any way out will do.
+                    away = root.CFrame.LookVector * -1
+                    away = Vector3.new(away.X, 0, away.Z)
+                end
+                if away.Magnitude > 0.01 then
+                    local standoff = math.max(CONFIG.CircleRadius,
+                                              CONFIG.MobAvoidRadius)
+                    currentDest = centre + away.Unit * standoff
+                    ShowRangeBar(root, mobPos, dist)
+                    if now - lastCrowdWarn > 3 then
+                        lastCrowdWarn = now
+                        print(("[DQR] %d mobs on me - backing to the edge.")
+                            :format(#pack))
+                    end
+                    S(CONFIG.ScanRate)
+                    continue
+                end
+            end
+        end
+
         -- Advance orbit
         orbitAngle = orbitAngle + CONFIG.CircleSpeed * dt
         if orbitAngle > math.pi * 2 then
@@ -2069,6 +2183,13 @@ local function MainLoop()
         -- goal at OUR elevation - floating above the mob or buried
         -- inside a mountain - so ComputeAsync returned NoPath every time
         -- and the bot fell back to walking straight into the slope.
+        -- Pick the orbit spot with the most clearance from other mobs
+        -- rather than blindly taking wherever the angle landed.
+        if CONFIG.AvoidOtherMobs then
+            orbitAngle = BestOrbitAngle(mobPos, radius, target.Model,
+                                        root.Position, orbitAngle)
+        end
+
         currentDest = GetOrbitPos(mobPos, radius)
         ShowRangeBar(root, mobPos, dist)
 
@@ -2378,7 +2499,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v5.9 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v6.0 loaded.  F5 farm  F6 dump  F7 show/hide log")
     ApplyClass()
     NukeGraphics()
     S(2.5)
