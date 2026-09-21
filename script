@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v5.6
+--  DQR AUTO FARM v5.8
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -75,6 +75,10 @@ local CONFIG = {
     WaypointReach  = 4,      -- waypoint counts as reached within this
     StuckDist      = 2.5,    -- moved less than this...
     StuckTime      = 1.5,    -- ...for this long = stuck
+    AgentMaxSlope  = 45,     -- steeper than this = route around, not up
+    ProbeDist      = 14,     -- how far ahead to test a clear heading
+    PathGiveUp     = 6,      -- failed paths before abandoning a mob
+    UnreachableFor = 12,     -- seconds to ignore an abandoned mob
 
     -- Range bar
     ShowRangeBar   = true,
@@ -453,6 +457,9 @@ local pathFail   = 0
 local stuckAt    = nil
 local stuckSince = 0
 local forceRepath = false
+local steerDir   = nil   -- fallback heading when no path exists
+local unreachable = {}   -- model -> tick() until which to ignore it
+local pathTargetModel = nil  -- what MainLoop is currently chasing
 
 local function ClearPath()
     pathQueue = {}
@@ -484,12 +491,31 @@ local function LineClear(from, to)
     return false
 end
 
+-- When there is no usable path and the direct line is blocked, fan out
+-- and take the most target-ward heading that is actually clear. Beats
+-- grinding into a mountainside at walking pace.
+local function ClearDirection(pos, target)
+    local base = Vector3.new(target.X - pos.X, 0, target.Z - pos.Z)
+    if base.Magnitude < 1 then return nil end
+    base = base.Unit
+    for _, deg in ipairs({0, 25, -25, 50, -50, 75, -75, 100, -100, 135, -135}) do
+        local a = math.rad(deg)
+        local d = Vector3.new(
+            base.X * math.cos(a) - base.Z * math.sin(a), 0,
+            base.X * math.sin(a) + base.Z * math.cos(a))
+        if LineClear(pos, pos + d * CONFIG.ProbeDist) then return d end
+    end
+    return nil
+end
+
 local function ComputePath(from, to)
     local path = PathfindingService:CreatePath({
         AgentRadius   = 3,
         AgentHeight   = 5,
         AgentCanJump  = true,
-        AgentMaxSlope = 60,
+        -- 60 let it try to climb mountainsides. 45 makes the pathfinder
+        -- route around steep terrain instead of up it.
+        AgentMaxSlope = CONFIG.AgentMaxSlope,
     })
     local ok = pcall(function() path:ComputeAsync(from, to) end)
     if not ok or path.Status ~= Enum.PathStatus.Success then return nil end
@@ -532,14 +558,32 @@ local function PathWorker(getDestFn)
                         else
                             pathFail = pathFail + 1
                             ClearPath()
+                            -- Do NOT just walk straight: that is what makes
+                            -- it grind along a mountainside. Steer around.
+                            steerDir = ClearDirection(root.Position, dest)
                             if pathFail % 5 == 1 then
                                 print("[DQR] No path to target ("
-                                    .. pathFail .. ") - walking straight.")
+                                    .. pathFail .. ") - "
+                                    .. (steerDir and "steering around it."
+                                                  or "no clear heading."))
+                            end
+                            -- Give up on this mob and let the scanner
+                            -- pick another one it can actually reach.
+                            if pathFail >= CONFIG.PathGiveUp
+                            and pathTargetModel then
+                                unreachable[pathTargetModel] =
+                                    tick() + CONFIG.UnreachableFor
+                                print("[DQR] " .. pathTargetModel.Name
+                                    .. " is unreachable - trying another mob.")
+                                pathFail = 0
                             end
                         end
                     end
-                elseif #pathQueue > 0 and LineClear(root.Position, dest) then
-                    ClearPath()  -- wall cleared, go direct again
+                else
+                    steerDir = nil
+                    if #pathQueue > 0 and LineClear(root.Position, dest) then
+                        ClearPath()  -- wall cleared, go direct again
+                    end
                 end
             end
         end
@@ -683,6 +727,10 @@ local function StartMoving(getDestFn)
                     human.Jump = true
                 end
             end
+        elseif steerDir then
+            -- No path and the direct line is blocked: follow the clear
+            -- heading the path worker probed instead of pressing into it.
+            step = pos + steerDir * CONFIG.ProbeDist
         end
 
         -- Walk. This is what makes the animation play.
@@ -1264,6 +1312,17 @@ local function InLobby()
         or PathVisible(UI.SelectPanel) ~= nil
         or PathVisible(UI.ChoosePanel) ~= nil
         or PathVisible(UI.LobbyInfo)   ~= nil
+        -- The end-of-run screen. When a dungeon is failed you land back
+        -- in the lobby with this showing and the normal lobby buttons
+        -- hidden behind it - which used to read as "not the lobby", so
+        -- the script sat there believing it was still in the dungeon.
+        or PathVisible(UI.Replay)      ~= nil
+end
+
+-- Do the lobby's GUIs exist at all, visible or not? Survives popups
+-- covering the whole lobby interface.
+local function InLobbyPlace()
+    return Path(UI.LobbyPlay) ~= nil or Path(UI.ChoosePanel) ~= nil
 end
 
 local lobbyFlowActive = false
@@ -1473,7 +1532,16 @@ local function GetNearestMob()
                         if c:IsA("BasePart") or c:IsA("MeshPart")
                         or c:IsA("UnionOperation") then pc = pc + 1 end
                     end
-                    if hasBB and pc >= 2 then
+                    -- Skip anything the path worker has given up on, so
+                    -- we stop pressing into a mountain at a mob on the
+                    -- far side of it and go fight something reachable.
+                    local blocked = unreachable[obj]
+                    if blocked and tick() > blocked then
+                        unreachable[obj] = nil
+                        blocked = nil
+                    end
+
+                    if hasBB and pc >= 2 and not blocked then
                         local d = (mr.Position - root.Position).Magnitude
                         if d < bestD then
                             bestD = d
@@ -1522,6 +1590,9 @@ end
 -- not the test: a cleared room has no mobs but you are still in the run.
 local function IsInDungeon()
     if InLobby() then return false end
+    -- Back in the lobby place with nothing to fight is not a dungeon,
+    -- even when a popup is hiding the lobby's own buttons.
+    if InLobbyPlace() and not MobsPresent() then return false end
     return MobsPresent()
 end
 
@@ -1872,6 +1943,7 @@ local function MainLoop()
 
         local mobPos = target.Root.Position
         local dist   = target.Distance
+        pathTargetModel = target.Model   -- so the path worker can blacklist it
 
         -- Always face mob
         if not faceTarget then
@@ -1959,8 +2031,13 @@ local function MainLoop()
             radius = CONFIG.CircleRadius * 0.7
         end
 
-        local dest = GetOrbitPos(mobPos, radius)
-        currentDest = Vector3.new(dest.X, root.Position.Y, dest.Z)
+        -- Keep the orbit point's own Y (the mob's ground level). This
+        -- used to be forced to root.Position.Y, a leftover from the
+        -- CFrame-teleport days. On a hilly map that put the pathfinding
+        -- goal at OUR elevation - floating above the mob or buried
+        -- inside a mountain - so ComputeAsync returned NoPath every time
+        -- and the bot fell back to walking straight into the slope.
+        currentDest = GetOrbitPos(mobPos, radius)
         ShowRangeBar(root, mobPos, dist)
 
         S(CONFIG.ScanRate)
@@ -2148,40 +2225,56 @@ local function StartWatcher()
     end
 end
 
+-- Only job: notice the run has ended and stop farming. Everything about
+-- what to do next belongs to Supervisor, which runs whether or not the
+-- farm is going. The old version did both here behind
+-- `if not Farm.Running then continue end`, so the moment it stopped the
+-- farm it disabled itself permanently - which is why a failed dungeon
+-- left the script sitting in the lobby doing nothing.
 local function DungeonWatcher()
-    local empty = 0
+    local quiet = 0
     while true do
         S(3)
-        if not Farm.Running then continue end
+        if not Farm.Running then quiet = 0 continue end
 
-        if GetNearestMob() then
-            empty = 0
+        -- The reliable "run is over" signal is the lobby coming back,
+        -- fail screen included. Absence of mobs is not: that happens
+        -- constantly between rooms.
+        if InLobby() then
+            print("[DQR] Lobby is up - run over, stopping farm.")
+            Farm.Stop()
+            quiet = 0
             continue
         end
 
-        -- No mobs. That alone does NOT mean the run is over - it happens
-        -- constantly between rooms. Only act on a long dry spell (30s),
-        -- and only queue once the lobby is actually back on screen.
-        empty = empty + 1
-        if empty < 10 then continue end
-        empty = 0
-
-        print("[DQR] No mobs for 30s - pausing farm.")
-        Farm.Stop()
-
-        -- Wait for the game to return us to the lobby on its own.
-        local w = 0
-        repeat
-            S(2) w = w + 2
-            if MobsPresent() then
-                print("[DQR] Mobs again - still in the run.")
-                Farm.Start()
-                break
+        if GetNearestMob() then
+            quiet = 0
+        else
+            quiet = quiet + 1
+            if quiet == 40 then   -- 2 minutes
+                print("[DQR] No mobs for 2 min and no lobby - still waiting.")
             end
-        until InLobby() or w > 60
+        end
+    end
+end
 
-        -- The game offers a Replay button at the end of a run. One click
-        -- beats redriving the whole six-step queue flow.
+-- ============================================================
+--  SUPERVISOR
+--  Runs forever, farm or no farm. Whenever we are idle it works out
+--  where we actually are and gets things moving again, so no single
+--  failed transition can park the script for good.
+-- ============================================================
+local function Supervisor()
+    local idleSince, reported = tick(), false
+    while true do
+        S(4)
+
+        if Farm.Running or lobbyFlowActive then
+            idleSince, reported = tick(), false
+            continue
+        end
+
+        -- End-of-run screen: one click beats redriving the queue flow.
         local replay = PathVisible(UI.Replay)
         if replay and CONFIG.AutoRunDungeon then
             print("[DQR] Replay Dungeon available - clicking it.")
@@ -2189,18 +2282,39 @@ local function DungeonWatcher()
             local t = 0
             repeat S(2) t = t + 2 until IsInDungeon() or t > 60
             if IsInDungeon() then Farm.Start() end
+            idleSince, reported = tick(), false
             continue
         end
 
-        if not Farm.Running and InLobby() and CONFIG.AutoRunDungeon then
-            print("[DQR] Back in the lobby - queueing next run.")
-            RunLobbyFlow()
-            local t = 0
-            repeat S(2) t = t + 2 until IsInDungeon() or t > 90
-            if IsInDungeon() then Farm.Start() end
-        elseif not Farm.Running and not InLobby() then
-            print("[DQR] Still in the dungeon, no lobby - resuming farm.")
+        if InLobby() then
+            if CONFIG.AutoRunDungeon then
+                print("[DQR] Idle in the lobby - queueing a run.")
+                RunLobbyFlow()
+                local t = 0
+                repeat S(2) t = t + 2 until IsInDungeon() or t > 90
+                if IsInDungeon() then Farm.Start() end
+                idleSince, reported = tick(), false
+            end
+            continue
+        end
+
+        -- Not the lobby and not farming: we are somewhere worth fighting.
+        if not InLobbyPlace() or MobsPresent() then
+            print("[DQR] Idle outside the lobby - resuming farm.")
             Farm.Start()
+            idleSince, reported = tick(), false
+            continue
+        end
+
+        -- In the lobby place, but no lobby UI we recognise. Say so once,
+        -- with the evidence, rather than sitting silent.
+        if tick() - idleSince > 20 and not reported then
+            reported = true
+            print(("[DQR] Idle and unsure. InLobby=%s InLobbyPlace=%s mobs=%s")
+                :format(tostring(InLobby()), tostring(InLobbyPlace()),
+                        tostring(MobsPresent())))
+            print("[DQR] Dumping buttons so this state can be identified.")
+            DumpGui()
         end
     end
 end
@@ -2209,7 +2323,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v5.6 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v5.8 loaded.  F5 farm  F6 dump  F7 show/hide log")
     NukeGraphics()
     S(2.5)
 
@@ -2234,6 +2348,7 @@ task.spawn(function()
     end
 
     task.spawn(DungeonWatcher)
+    task.spawn(Supervisor)
     task.spawn(StartWatcher)
     task.spawn(VanityWatcher)
 end)
