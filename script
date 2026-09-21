@@ -1,16 +1,28 @@
 -- ============================================================
---  DQR AUTO FARM v5.4
+--  DQR AUTO FARM v5.5
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
 
 local CONFIG = {
     TargetDungeon  = "Desert Temple",
-    Difficulty     = "Medium",
+    Difficulty     = "Hard",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
     UseRemotes     = false,  -- blind-firing guessed remotes; off by default
     DebugGui       = false,  -- full button dump on every queue (F6 does it too)
+
+    -- Local-only vanity. Changes what YOUR client draws, nothing else:
+    -- the server, other players and your actual save are untouched.
+    SpoofName      = true,
+    FakeName       = "WOAH2EZ",
+    SpoofLevel     = true,
+    FakeLevel      = "99999999",
+
+    -- Extra graphics stripping
+    HideArmour     = true,   -- hide accessories / armour meshes
+    HideWeapon     = false,  -- also hide the equipped weapon
+    StripTextures  = true,   -- kill decals and textures in the world
     ShowLog        = false,  -- log window starts hidden; F7 shows it
     LowerGraphics  = true,
 
@@ -325,11 +337,21 @@ local function NukeGraphics()
     for _, fx in ipairs(L:GetChildren()) do
         if fx:IsA("PostEffect") then fx.Enabled = false end
     end
+    local stripped = 0
     for _, o in ipairs(workspace:GetDescendants()) do pcall(function()
         if o:IsA("ParticleEmitter") or o:IsA("Trail") or o:IsA("Smoke")
-        or o:IsA("Fire") or o:IsA("Sparkles") then o.Enabled = false end
+        or o:IsA("Fire") or o:IsA("Sparkles") then
+            o.Enabled = false
+        elseif CONFIG.StripTextures
+        and (o:IsA("Decal") or o:IsA("Texture")) then
+            o.Transparency = 1
+            stripped = stripped + 1
+        elseif o:IsA("BasePart") then
+            o.CastShadow = false
+            o.Reflectance = 0
+        end
     end) end
-    print("[DQR] Graphics nuked.")
+    print("[DQR] Graphics nuked. " .. stripped .. " textures stripped.")
 end
 
 -- ============================================================
@@ -346,6 +368,60 @@ end
 
 -- Declared early: the raycast in LineClear has to exclude it.
 local RangeBarPart = nil
+
+-- ============================================================
+--  ARMOUR / COSMETIC STRIPPING
+--  Everything here is local rendering only - the parts still exist
+--  and the server still sees you fully equipped.
+-- ============================================================
+local BODY_PARTS = {
+    Head = true, Torso = true, HumanoidRootPart = true,
+    ["Left Arm"] = true, ["Right Arm"] = true,
+    ["Left Leg"] = true, ["Right Leg"] = true,
+    UpperTorso = true, LowerTorso = true,
+    LeftUpperArm = true, LeftLowerArm = true, LeftHand = true,
+    RightUpperArm = true, RightLowerArm = true, RightHand = true,
+    LeftUpperLeg = true, LeftLowerLeg = true, LeftFoot = true,
+    RightUpperLeg = true, RightLowerLeg = true, RightFoot = true,
+}
+
+local function InsideTool(o)
+    local p = o.Parent
+    while p and p ~= workspace do
+        if p:IsA("Tool") then return true end
+        p = p.Parent
+    end
+    return false
+end
+
+local function HideArmour(char)
+    if not CONFIG.HideArmour or not char then return end
+    for _, o in ipairs(char:GetDescendants()) do pcall(function()
+        if o:IsA("Accessory") or o:IsA("Hat") then
+            for _, d in ipairs(o:GetDescendants()) do pcall(function()
+                if d:IsA("BasePart") then
+                    d.Transparency = 1
+                    d.LocalTransparencyModifier = 1
+                elseif d:IsA("Decal") or d:IsA("Texture") then
+                    d.Transparency = 1
+                elseif d:IsA("ParticleEmitter") or d:IsA("Trail") then
+                    d.Enabled = false
+                end
+            end) end
+        elseif o:IsA("BasePart") and not BODY_PARTS[o.Name] then
+            -- Armour meshes are extra parts welded onto the rig.
+            if CONFIG.HideWeapon or not InsideTool(o) then
+                o.Transparency = 1
+                o.LocalTransparencyModifier = 1
+            end
+        elseif o:IsA("Decal") or o:IsA("Texture") then
+            o.Transparency = 1
+        elseif o:IsA("ParticleEmitter") or o:IsA("Trail")
+            or o:IsA("Fire") or o:IsA("Sparkles") then
+            o.Enabled = false
+        end
+    end) end
+end
 
 -- ============================================================
 --  MOVEMENT - real humanoid walking + PathfindingService
@@ -1824,6 +1900,91 @@ local function DodgeWatcher()
 end
 
 -- ============================================================
+--  LOCAL VANITY  (name / level on your own screen only)
+--
+--  Purely a client-side redraw. The server, every other player and
+--  your save file all still see the real values - nothing here sends
+--  anything anywhere. The game rewrites these labels constantly, so
+--  it has to be re-applied on a loop rather than set once.
+-- ============================================================
+local spoofSeen = {}
+
+local function CurrentLevel()
+    local ls = LP:FindFirstChild("leaderstats")
+    if ls then
+        for _, v in ipairs(ls:GetChildren()) do
+            local n = v.Name:lower()
+            if (n:find("level") or n:find("lvl")) and v:IsA("ValueBase") then
+                return tostring(v.Value)
+            end
+        end
+    end
+    for _, n in ipairs({"Level", "level", "Lvl"}) do
+        local v = LP:FindFirstChild(n)
+        if v and v:IsA("ValueBase") then return tostring(v.Value) end
+    end
+    return nil
+end
+
+local function SpoofPass()
+    local real = LP.Name
+    local disp = LP.DisplayName
+    local lvl  = CurrentLevel()
+
+    local roots = {}
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    if pg then roots[#roots + 1] = pg end
+    local ch = GetChar()
+    if ch then roots[#roots + 1] = ch end
+
+    for _, r in ipairs(roots) do
+        for _, o in ipairs(r:GetDescendants()) do
+            if (o:IsA("TextLabel") or o:IsA("TextButton"))
+            and not (LogGui and o:IsDescendantOf(LogGui)) then
+                pcall(function()
+                    local t = o.Text
+                    if t == "" then return end
+
+                    if CONFIG.SpoofName then
+                        if t == real or t == disp then
+                            o.Text = CONFIG.FakeName
+                        elseif t:find(real, 1, true) then
+                            o.Text = t:gsub(
+                                (real:gsub("%W", "%%%0")), CONFIG.FakeName)
+                        end
+                    end
+
+                    if CONFIG.SpoofLevel and t:match("^%d+$") then
+                        local nm = o.Name:lower()
+                        local pn = (o.Parent and o.Parent.Name or ""):lower()
+                        local named = nm:find("level") or nm:find("lvl")
+                                   or pn:find("level") or pn:find("lvl")
+                        -- Matching the real level value catches the labels
+                        -- that are not helpfully named.
+                        if named or (lvl and t == lvl) then
+                            o.Text = CONFIG.FakeLevel
+                            local path = o:GetFullName()
+                            if not spoofSeen[path] then
+                                spoofSeen[path] = true
+                                print("[DQR] Level label: " .. path)
+                            end
+                        end
+                    end
+                end)
+            end
+        end
+    end
+end
+
+local function VanityWatcher()
+    while true do
+        S(0.5)
+        if CONFIG.SpoofName or CONFIG.SpoofLevel then pcall(SpoofPass) end
+        if CONFIG.HideArmour then pcall(HideArmour, GetChar()) end
+    end
+end
+
+-- ============================================================
 --  START / STOP
 -- ============================================================
 function Farm.Start()
@@ -1845,6 +2006,7 @@ end
 
 LP.CharacterAdded:Connect(function()
     S(2)
+    pcall(HideArmour, GetChar())
     if Farm.Running then
         Farm.Stop() S(0.5) Farm.Start()
     end
@@ -1938,7 +2100,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v5.4 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v5.5 loaded.  F5 farm  F6 dump  F7 show/hide log")
     NukeGraphics()
     S(2.5)
 
@@ -1964,6 +2126,7 @@ task.spawn(function()
 
     task.spawn(DungeonWatcher)
     task.spawn(StartWatcher)
+    task.spawn(VanityWatcher)
 end)
 
 -- ============================================================
