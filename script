@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v9.0
+--  DQR AUTO FARM v9.1
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log
@@ -114,11 +114,11 @@ local CONFIG = {
     -- Hazard escapes: hop straight to the nearest safe spot when it is
     -- close, walk when it is not. The hop is a CFrame write - a short
     -- one, never more often than the cooldown - because a game may
-    -- treat larger or constant jumps as teleporting. The bot then
-    -- walks the last few studs to the fuller-clearance exit as usual.
+    -- treat larger or constant jumps as teleporting. The hop is the
+    -- whole escape: it lands just outside the hazard's pad and stays.
     HazardTeleport = true,
-    TeleportMax    = 14,     -- hop at most this far; further = walk
-    TeleportClear  = 2,      -- land this far outside the hazard's pad
+    TeleportMax    = 8,      -- hop at most this far; further = walk
+    TeleportClear  = 1,      -- land this far outside the hazard's pad
     TeleportCooldown = 0.6,
     -- Route around beams instead of only escaping once standing in one.
     -- Costs two maths lookups per orbit candidate and a couple more on
@@ -2696,20 +2696,40 @@ local hazardShapes = {}
 -- hazards that CAN be dodged. Kept, but skipped when that happens.
 local HUGE = 35
 
-local function NoteDisc(cx, cy, cz, r)
-    hazardShapes[#hazardShapes + 1] =
-        {kind = "disc", x = cx, y = cy, z = cz, r = r, huge = r > HUGE}
+-- HazardDebug: name the instance behind any footprint far bigger than
+-- a beam or a ring ought to be, once every few seconds per instance,
+-- so a phantom slab on screen can be traced to what produced it.
+local bigWarned = setmetatable({}, {__mode = "k"})
+local function WarnBig(src, what)
+    if not CONFIG.HazardDebug or not src then return end
+    local now = tick()
+    if bigWarned[src] and now - bigWarned[src] < 5 then return end
+    bigWarned[src] = now
+    print(("[DQR] Big hazard from %s (%s): %s")
+        :format(src:GetFullName(), src.ClassName, what))
 end
 
-local function NoteBox(cf, hx, hz, cy)
+local function NoteDisc(cx, cy, cz, r, src)
+    hazardShapes[#hazardShapes + 1] =
+        {kind = "disc", x = cx, y = cy, z = cz, r = r, huge = r > HUGE}
+    if r > 20 then WarnBig(src, ("disc r=%d"):format(r)) end
+end
+
+local function NoteBox(cf, hx, hz, cy, src)
     hazardShapes[#hazardShapes + 1] =
         {kind = "box", cf = cf, hx = hx, hz = hz, y = cy,
          huge = math.min(hx, hz) > HUGE}
+    if math.min(hx, hz) > 12 then
+        WarnBig(src, ("box %dx%d"):format(hx * 2, hz * 2))
+    end
 end
 
-local function NoteLine(a, b, r)
+local function NoteLine(a, b, r, src)
     hazardShapes[#hazardShapes + 1] =
         {kind = "line", a = a, b = b, r = r, huge = r > HUGE}
+    if r > 9 or (b - a).Magnitude > 250 then
+        WarnBig(src, ("line r=%d len=%d"):format(r, (b - a).Magnitude))
+    end
 end
 
 -- How far this world point is from the nearest hazard edge: negative
@@ -2719,16 +2739,19 @@ local function HazardClearance(p, ignoreHuge)
     local best = math.huge
     for _, h in ipairs(hazardShapes) do
         local c = nil
+        -- The vertical tolerance is a body's worth: a ring sits at
+        -- foot level, a laser at chest height. Fourteen studs also
+        -- took in effect parts parked under the floor between casts.
         if ignoreHuge and h.huge then
             -- skip
         elseif h.kind == "disc" then
-            if math.abs(p.Y - h.y) < 14 then
+            if math.abs(p.Y - h.y) < 8 then
                 local dx, dz = p.X - h.x, p.Z - h.z
                 c = math.sqrt(dx * dx + dz * dz) - h.r
             end
         elseif h.kind == "box" then
             local rel = h.cf:PointToObjectSpace(p)
-            if math.abs(rel.Y) < 14 then
+            if math.abs(rel.Y) < 8 then
                 c = math.max(math.abs(rel.X) - h.hx, math.abs(rel.Z) - h.hz)
             end
         else
@@ -2737,7 +2760,7 @@ local function HazardClearance(p, ignoreHuge)
             if len2 > 0.01 then
                 local t = math.clamp((p - h.a):Dot(ab) / len2, 0, 1)
                 local n = h.a + ab * t
-                if math.abs(p.Y - n.Y) < 12 then
+                if math.abs(p.Y - n.Y) < 8 then
                     local dx, dz = p.X - n.X, p.Z - n.Z
                     c = math.sqrt(dx * dx + dz * dz) - h.r
                 end
@@ -2814,7 +2837,7 @@ local function CollectTelegraphs(pos)
             end
             if math.abs(a - b) < 2 or round then
                 NoteDisc(o.Position.X, o.Position.Y, o.Position.Z,
-                         math.max(a, b) / 2 + CONFIG.TelegraphPad)
+                         math.max(a, b) / 2 + CONFIG.TelegraphPad, o)
             else
                 -- A level frame whose X runs along the strip's first
                 -- horizontal axis, so the box test can use it directly
@@ -2824,7 +2847,7 @@ local function CollectTelegraphs(pos)
                 local cf = CFrame.fromMatrix(o.Position, ax.Unit,
                                              Vector3.new(0, 1, 0))
                 NoteBox(cf, a / 2 + CONFIG.TelegraphPad,
-                        b / 2 + CONFIG.TelegraphPad, o.Position.Y)
+                        b / 2 + CONFIG.TelegraphPad, o.Position.Y, o)
             end
         end
     end
@@ -2897,12 +2920,37 @@ local function IsNewBeam(o)
     if not BeamShaped(o) then return false end
     -- Solid means a bar, a rail, a gate that has just closed: map.
     if o.CanCollide then return false end
+    -- Invisible used to count too, as a hitbox. But an attack also
+    -- spawns invisible helpers - aim guides, sound carriers - and one
+    -- of those became a hazard with nothing on screen to match it.
+    -- Every beam that has actually hit us has been visible.
+    if o.Transparency > 0.9 then return false end
     return true
 end
 
 local function NoteBeamPart(o)
     local axis, half, r = BeamSegment(o)
-    NoteLine(o.Position - axis * half, o.Position + axis * half, r)
+    NoteLine(o.Position - axis * half, o.Position + axis * half, r, o)
+end
+
+-- A Beam instance that could actually be a laser. Games use Beams for
+-- all sorts - a wide flat texture strip under a mob, an invisible one
+-- left Enabled with its transparency at 1 - and taking every Beam's
+-- Width as a laser's thickness produced a hazard many times the size
+-- of anything on screen. A laser is thin, visible and not absurdly
+-- long.
+local function BeamIsLaser(beam, a, b)
+    local w = math.max(beam.Width0, beam.Width1)
+    if w <= 0 or w > CONFIG.BeamMaxThick + 2 then return false end
+    if (b - a).Magnitude > 300 then return false end
+    local ok, visible = pcall(function()
+        local minT = 1
+        for _, k in ipairs(beam.Transparency.Keypoints) do
+            if k.Value < minT then minT = k.Value end
+        end
+        return minT < 0.9
+    end)
+    return ok and visible
 end
 
 -- Records every beam near `pos` as a line footprint. Shapes only, no
@@ -2927,9 +2975,9 @@ local function CollectBeams(pos)
             local okA, a = pcall(function() return beam.Attachment0.WorldPosition end)
             local okB, b = pcall(function() return beam.Attachment1.WorldPosition end)
             if okA and okB and (b - a).Magnitude > 1
-            and SegDistFlat(pos, a, b) < reach then
+            and SegDistFlat(pos, a, b) < reach and BeamIsLaser(beam, a, b) then
                 local w = math.max(beam.Width0, beam.Width1) / 2
-                NoteLine(a, b, w + CONFIG.BeamPad)
+                NoteLine(a, b, w + CONFIG.BeamPad, beam)
             end
         end
     end
@@ -3020,7 +3068,7 @@ local function CollectBeams(pos)
                     -- arena in one footprint.
                     if (cf.Position - pos).Magnitude < reach + ad.Radius then
                         NoteDisc(cf.Position.X, cf.Position.Y, cf.Position.Z,
-                                 ad.Radius + CONFIG.TelegraphPad)
+                                 ad.Radius + CONFIG.TelegraphPad, ad)
                     end
                     return
                 end
@@ -3046,7 +3094,7 @@ local function CollectBeams(pos)
             end
             if (b - a).Magnitude >= CONFIG.BeamMinLen
             and SegDistFlat(pos, a, b) < reach then
-                NoteLine(a, b, r)
+                NoteLine(a, b, r, ad)
             end
         end)
     end
@@ -3129,17 +3177,14 @@ end
 -- the spokes that CAN be dodged are invisible behind it. The last
 -- resort is the least-bad point: still inside something, but deeper
 -- into a gap than where we stand.
--- Returns the exit, and the NEAREST safe point along the same heading
--- (TeleportClear studs outside the pad) for a short hop to.
 local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
     local clean, crossing = {}, {}
-    local firstClear = {}      -- heading index -> nearest safe sample
     local bestBad, bestBadC = nil, HazardClearance(pos, ignoreHuge) + 2
     local flatNow = 0
     if mobPos then
         flatNow = Vector3.new(pos.X - mobPos.X, 0, pos.Z - mobPos.Z).Magnitude
     end
-    for di, dir in ipairs(ESCAPE_DIRS) do
+    for _, dir in ipairs(ESCAPE_DIRS) do
         local wasClear, crossed = false, false
         for d = 3, CONFIG.EscapeMaxDist, 3 do
             local p = pos + dir * d
@@ -3151,9 +3196,6 @@ local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
                 if c > bestBadC then bestBad, bestBadC = p, c end
             else
                 wasClear = true
-                if not firstClear[di] and c >= CONFIG.TeleportClear then
-                    firstClear[di] = p
-                end
                 local score = math.min(c, CONFIG.EscapeClearWant) * 2 - d * 0.5
                 if mobPos then
                     local flatNew = Vector3.new(p.X - mobPos.X, 0,
@@ -3166,7 +3208,7 @@ local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
                     end
                 end
                 local list = crossed and crossing or clean
-                list[#list + 1] = {p = p, score = score, dir = di}
+                list[#list + 1] = {p = p, score = score}
             end
         end
     end
@@ -3176,15 +3218,36 @@ local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
         table.sort(list, ByScore)
         for i = 1, math.min(#list, 6) do
             local p = list[i].p
-            if LineClear(pos, p) and HasGround(p) then
-                return p, firstClear[list[i].dir]
-            end
+            if LineClear(pos, p) and HasGround(p) then return p end
         end
     end
     if bestBad and LineClear(pos, bestBad) and HasGround(bestBad) then
-        return bestBad, nil
+        return bestBad
     end
-    return nil, nil
+    return nil
+end
+
+-- Where a hop lands: the closest point outside every footprint, in
+-- whichever direction that is. Fine-grained, unlike FindEscape's
+-- coarse samples, and shortest-first rather than best-scored - a hop
+-- should land just clear, not a stride further along a heading that
+-- happened to have more room.
+local function NearestClear(pos, ignoreHuge)
+    local found = {}
+    for _, dir in ipairs(ESCAPE_DIRS) do
+        for d = 1, CONFIG.TeleportMax do
+            local p = pos + dir * d
+            if HazardClearance(p, ignoreHuge) >= CONFIG.TeleportClear then
+                found[#found + 1] = {p = p, d = d}
+                break
+            end
+        end
+    end
+    table.sort(found, function(a, b) return a.d < b.d end)
+    for _, f in ipairs(found) do
+        if LineClear(pos, f.p) and HasGround(f.p) then return f.p, f.d end
+    end
+    return nil
 end
 
 -- HazardDebug only: draws every footprint from the last sweep as a red
@@ -3341,32 +3404,35 @@ function ScanHazards()
         and HazardClearance(held, true) > 0 then
             esc = held
         else
-            local how, near = "clear", nil
-            esc, near = FindEscape(pos, mobPos, keep, outward)
+            local how, tier2 = "clear", false
+            esc = FindEscape(pos, mobPos, keep, outward)
             if not esc then
-                how = "clear of what can be dodged"
-                esc, near = FindEscape(pos, mobPos, keep, outward, true)
+                how, tier2 = "clear of what can be dodged", true
+                esc = FindEscape(pos, mobPos, keep, outward, true)
             end
             hazardCache.holdP, hazardCache.holdUntil = esc, now + 0.8
             hazardCache.commitUntil = now + 2.5
 
-            -- Close enough to hop? Straight to the nearest safe spot
-            -- on that heading, then walk the rest. Too far, and it is
-            -- a walk from the start, as quick as the legs allow.
+            -- A safe spot within hopping range? Straight there, and
+            -- that IS the escape - land just clear and stay. Otherwise
+            -- it is a walk from the start, as quick as the legs allow.
             local hopped = false
-            if esc and near and CONFIG.HazardTeleport
+            if esc and CONFIG.HazardTeleport
             and now - lastBlink > CONFIG.TeleportCooldown then
-                local hop = Vector3.new(near.X - pos.X, 0, near.Z - pos.Z).Magnitude
-                if hop <= CONFIG.TeleportMax and Blink(root, near) then
+                local near, hop = NearestClear(pos, tier2)
+                if near and Blink(root, near) then
                     lastBlink, hopped = now, true
+                    esc = near
+                    hazardCache.holdP, hazardCache.commitUntil = near, now
+                    how = ("hopped %d studs"):format(hop)
                 end
             end
 
             if CONFIG.HazardDebug then
-                print(("[DQR] In a hazard (%d footprint(s), %d spokes) - %s%s")
+                print(("[DQR] In a hazard (%d footprint(s), %d spokes) - %s")
                     :format(#hazardShapes, hazardCache.radialN,
-                            esc and ("moving " .. how) or "NO EXIT FOUND",
-                            hopped and " (hopped)" or ""))
+                            esc and (hopped and how or ("moving " .. how))
+                                or "NO EXIT FOUND"))
             end
         end
     elseif held and now < hazardCache.commitUntil
@@ -4397,7 +4463,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v9.0 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
+    print("[DQR] v9.1 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
