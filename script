@@ -1,12 +1,13 @@
 -- ============================================================
---  DQR AUTO FARM v5.1
+--  DQR AUTO FARM v5.2
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
 
 local CONFIG = {
     TargetDungeon  = "Desert Temple",
-    Difficulty     = "Easy",
+    Difficulty     = "Medium",
+    Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
     UseRemotes     = false,  -- blind-firing guessed remotes; off by default
     DebugGui       = false,  -- full button dump on every queue (F6 does it too)
@@ -45,7 +46,7 @@ local CONFIG = {
 
     -- Range bar
     ShowRangeBar   = true,
-    BarWidth       = 1.4,
+    BarWidth       = 2.4,
     BarMaxLen      = 120,
 }
 
@@ -1085,6 +1086,8 @@ local UI = {
     DungeonList = {"queueGui", "chooseDungeon", "backgroundFillLeft",
                    "ScrollingFrame"},
     DiffRoot    = {"queueGui", "chooseDungeon", "backgroundFillRight"},
+    Hardcore    = {"queueGui", "chooseDungeon", "backgroundFillRight",
+                   "hardcoreSection", "hardcore"},
     CreateLobby = {"queueGui", "chooseDungeon", "backgroundFillMiddle",
                    "startMain", "TextButton"},
     LobbyInfo   = {"queueGui", "lobbyInfo"},
@@ -1259,6 +1262,27 @@ local function RunLobbyFlow()
             .. CONFIG.Difficulty .. "'.")
     end
     S(0.8)
+
+    -- Step 4b: HARDCORE MODE. Same shape as the difficulty buttons -
+    -- a frame named "hardcore" holding the clickable TextButton.
+    if CONFIG.Hardcore then
+        print("[DQR] Step 4b: Hardcore mode")
+        local hcFrame = Path(UI.Hardcore)
+        local hc = hcFrame
+            and hcFrame:FindFirstChildWhichIsA("TextButton") or nil
+        if hc then
+            ClickButton(hc)
+            -- It is a toggle, not a radio button: if the game remembers
+            -- the setting between runs this click could turn it back
+            -- OFF. Watch the first couple of queues and say so if it
+            -- alternates - the fix is to read its state before clicking.
+            print("[DQR]   Hardcore toggled (toggle, not radio - verify).")
+        else
+            print("[DQR]   MISS - no hardcore button at "
+                .. table.concat(UI.Hardcore, "."))
+        end
+        S(0.6)
+    end
 
     -- Step 5: Create Lobby - verified by the panel actually closing
     print("[DQR] Step 5: Create Lobby")
@@ -1759,7 +1783,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v5.1 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v5.2 loaded.  F5 farm  F6 dump  F7 show/hide log")
     NukeGraphics()
     S(2.5)
 
