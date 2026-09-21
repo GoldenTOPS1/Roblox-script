@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v6.4
+--  DQR AUTO FARM v6.5
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -92,6 +92,9 @@ local CONFIG = {
     StuckDist      = 2.5,    -- moved less than this...
     StuckTime      = 1.5,    -- ...for this long = stuck
     AgentMaxSlope  = 45,     -- steeper than this = route around, not up
+    AgentWidth     = 2.5,    -- half body width for clearance raycasts
+    PathHoldClear  = 3,      -- clear readings needed to drop a live path
+    NoProgressTime = 5,      -- secs of no closing before repath/give up
     ProbeDist      = 14,     -- how far ahead to test a clear heading
     GroundProbe    = 20,     -- how far down to look for floor at a target
 
@@ -519,6 +522,9 @@ local forceRepath = false
 local steerDir   = nil   -- fallback heading when no path exists
 local steerUntil = 0     -- keep that heading at least this long
 local wpStuck    = 0     -- seconds spent failing to reach pathQueue[1]
+local clearStreak = 0    -- consecutive "line is clear" readings
+local bestFar    = math.huge  -- closest we have got to the target
+local bestFarAt  = 0     -- ...and when
 local unreachable = {}   -- model -> tick() until which to ignore it
 local pathTargetModel = nil  -- what MainLoop is currently chasing
 
@@ -536,20 +542,34 @@ local EXCLUDE = (function()
     return Enum.RaycastFilterType.Blacklist
 end)()
 
+-- Body-width clearance, not a hairline. One thin ray from the centre
+-- squeaks past a wall corner that the character itself cannot fit
+-- through - and since a "clear line" makes the path worker throw away
+-- its computed path, that false positive is what produced the pacing
+-- at walls: path around, ray clears, drop path, walk into wall, repeat.
+-- Three parallel rays at body width, at two heights.
 local function LineClear(from, to)
     local char = GetChar()
     local p = RaycastParams.new()
     p.FilterType = EXCLUDE
     p.FilterDescendantsInstances = {char, RangeBarPart}
-    local a = from + Vector3.new(0, 1.5, 0)
-    local b = to   + Vector3.new(0, 1.5, 0)
-    local d = b - a
+
+    local d = Vector3.new(to.X - from.X, 0, to.Z - from.Z)
     if d.Magnitude < 1 then return true end
-    local hit = workspace:Raycast(a, d, p)
-    if not hit then return true end
-    -- Ignore things a walking character passes through anyway
-    if not hit.Instance.CanCollide then return true end
-    return false
+
+    -- Sideways offset, perpendicular to travel
+    local side = Vector3.new(-d.Unit.Z, 0, d.Unit.X) * CONFIG.AgentWidth
+    local full = to - from
+
+    for _, h in ipairs({1.5, 3.5}) do
+        for _, off in ipairs({Vector3.zero, side, -side}) do
+            local a = from + off + Vector3.new(0, h, 0)
+            local hit = workspace:Raycast(a, full, p)
+            -- Things a walking character passes through anyway don't count
+            if hit and hit.Instance.CanCollide then return false end
+        end
+    end
+    return true
 end
 
 -- ============================================================
@@ -710,10 +730,47 @@ local function PathWorker(getDestFn)
                     end
                 else
                     steerDir = nil
-                    if #pathQueue > 0 and LineClear(root.Position, dest) then
-                        ClearPath()  -- wall cleared, go direct again
+                    -- Don't throw a working path away on one clear
+                    -- reading. Near a corner that flickers, and dropping
+                    -- the path means walking straight back into the wall.
+                    if #pathQueue > 0 then
+                        clearStreak = clearStreak + 1
+                        if clearStreak >= CONFIG.PathHoldClear then
+                            ClearPath()
+                            clearStreak = 0
+                        end
+                    else
+                        clearStreak = 0
                     end
                 end
+
+                -- Progress watchdog. Whatever the cause - a flickering
+                -- line, a path that loops, a doorway too narrow - if we
+                -- are not actually getting closer then something is
+                -- wrong, so repath and eventually give up on this mob.
+                local mark = pathTargetModel
+                    and pathTargetModel:FindFirstChild("HumanoidRootPart")
+                local far = mark
+                    and (mark.Position - root.Position).Magnitude
+                    or (dest - root.Position).Magnitude
+
+                if far < bestFar - 3 then
+                    bestFar, bestFarAt = far, tick()
+                elseif tick() - bestFarAt > CONFIG.NoProgressTime then
+                    bestFar, bestFarAt = far, tick()
+                    forceRepath = true
+                    pathFail = pathFail + 1
+                    print("[DQR] No progress toward target - repathing.")
+                    if pathFail >= CONFIG.PathGiveUp and pathTargetModel then
+                        unreachable[pathTargetModel] =
+                            tick() + CONFIG.UnreachableFor
+                        print("[DQR] " .. pathTargetModel.Name
+                            .. " unreachable - switching target.")
+                        pathFail = 0
+                    end
+                end
+            else
+                bestFar, bestFarAt = math.huge, tick()
             end
         end
     end)
@@ -801,6 +858,8 @@ local function StartMoving(getDestFn)
     forceRepath = false
     stuckAt, stuckSince = nil, 0
     moveMode, commandSince, diagCount = "humanoid", 0, 0
+    clearStreak, wpStuck = 0, 0
+    bestFar, bestFarAt = math.huge, tick()
 
     wantDisabled = true
     SetDefaultControls(false)
@@ -2711,7 +2770,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v6.4 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v6.5 loaded.  F5 farm  F6 dump  F7 show/hide log")
     ApplyClass()
     NukeGraphics()
     S(2.5)
