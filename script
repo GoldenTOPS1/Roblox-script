@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v7.1
+--  DQR AUTO FARM v7.2
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -93,7 +93,7 @@ local CONFIG = {
     StuckTime      = 1.5,    -- ...for this long = stuck
     UnstickTime    = 0.9,    -- secs spent backing out of a snag
     UnstickDist    = 12,     -- how far to back out
-    PaceRadius     = 10,     -- confined to this circle...
+    PaceRadius     = 22,     -- confined to this circle...
     PaceTime       = 5,      -- ...for this long = pacing, going nowhere
     PaceGiveUp     = 2,      -- pacing bouts before abandoning the target
     LoopStallTime  = 6,      -- secs without a farm tick = dead thread
@@ -112,7 +112,7 @@ local CONFIG = {
                              -- non-deterministically and hide near mobs
     HazardTTL      = 0.1,    -- telegraph/beam scan at most 10x a second
     ThreatTTL      = 0.1,    -- projectile scan at most 10x a second
-    PathGiveUp     = 6,      -- failed paths before abandoning a mob
+    PathGiveUp     = 3,      -- failed paths before abandoning a mob
     UnreachableFor = 8,      -- seconds to ignore an abandoned mob
 
     -- Range bar
@@ -739,9 +739,11 @@ local function PathWorker(getDestFn)
                             local howFar = mk
                                 and (mk.Position - root.Position).Magnitude
                                 or math.huge
+                            -- No path exists at all. Only protect a mob
+                            -- we could actually be hitting from here.
                             if pathFail >= CONFIG.PathGiveUp
                             and pathTargetModel
-                            and howFar > CONFIG.MaxRange * 1.5 then
+                            and howFar > CONFIG.CircleRadius * 1.5 then
                                 unreachable[pathTargetModel] =
                                     tick() + CONFIG.UnreachableFor
                                 print(("[DQR] %s unreachable at %d studs - switching.")
@@ -793,10 +795,18 @@ local function PathWorker(getDestFn)
                     bestFar, bestFarAt = far, tick()
                     forceRepath = true
                     pathFail = pathFail + 1
-                    print("[DQR] No progress toward target - repathing.")
-                    -- Never abandon something standing right next to us.
-                    if pathFail >= CONFIG.PathGiveUp and pathTargetModel
-                    and far > CONFIG.MaxRange * 1.5 then
+                    print(("[DQR] No progress toward target (%d/%d) at %d studs.")
+                        :format(pathFail, CONFIG.PathGiveUp, far))
+
+                    -- There used to be an extra "and far > MaxRange*1.5"
+                    -- guard here, meaning nothing within 30 studs could
+                    -- ever be abandoned. A mob on a ledge 18 studs away
+                    -- therefore repathed every 5s forever - which IS the
+                    -- pacing. The guard is also redundant: this branch
+                    -- only runs when we are NOT at fighting distance, so
+                    -- repeatedly failing to close means unreachable, at
+                    -- whatever range.
+                    if pathFail >= CONFIG.PathGiveUp and pathTargetModel then
                         unreachable[pathTargetModel] =
                             tick() + CONFIG.UnreachableFor
                         print(("[DQR] %s unreachable at %d studs - switching.")
@@ -2988,7 +2998,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v7.1 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v7.2 loaded.  F5 farm  F6 dump  F7 show/hide log")
     ApplyClass()
     NukeGraphics()
     S(2.5)
