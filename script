@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v4.5
+--  DQR AUTO FARM v4.6
 --  Axiom Build — No mouse clicks, CFrame movement,
 --  melee + spells, full speed, remote-based dungeon queue
 -- ============================================================
@@ -14,7 +14,7 @@ local CONFIG = {
 
     MeleeRange     = 8,      -- swing left click when closer than this
     AttackRange    = 25,     -- cast spells when closer than this
-    MinRange       = 8,     -- back off if closer than this
+    MinRange       = 10,     -- back off if closer than this
     MaxRange       = 28,     -- close in if farther than this
     DodgeRange     = 40,
     DodgeCooldown  = 0.9,
@@ -35,6 +35,239 @@ local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local VIM              = game:GetService("VirtualInputManager")
 local LP               = Players.LocalPlayer
+local GuiService       = game:GetService("GuiService")
+local TweenService     = game:GetService("TweenService")
+
+-- ============================================================
+--  EXECUTOR GLOBALS
+-- ============================================================
+local function Env(name)
+    local ok, v = pcall(function()
+        if getfenv then return getfenv()[name] end
+        return (_G)[name]
+    end)
+    if ok then return v end
+    return nil
+end
+
+-- ============================================================
+--  ON-SCREEN LOG  (F7 toggles, Copy puts it on the clipboard)
+-- ============================================================
+local rawprint = print
+local LOG      = {}
+local MAX_LOG  = 600
+local LogGui, LogBox, LogScroll, LogCount
+
+local function LogRender()
+    if not LogBox then return end
+    LogBox.Text = table.concat(LOG, "\n")
+    local h = #LOG * 15 + 12
+    LogBox.Size = UDim2.new(1, -12, 0, math.max(h, 1))
+    if LogScroll then
+        LogScroll.CanvasSize = UDim2.new(0, 0, 0, h)
+        LogScroll.CanvasPosition = Vector2.new(0,
+            math.max(0, h - LogScroll.AbsoluteSize.Y))
+    end
+    if LogCount then LogCount.Text = #LOG .. " lines" end
+end
+
+local function Log(...)
+    local parts = {}
+    for i = 1, select("#", ...) do
+        parts[#parts + 1] = tostring((select(i, ...)))
+    end
+    local line = os.date("%H:%M:%S") .. "  " .. table.concat(parts, " ")
+    LOG[#LOG + 1] = line
+    if #LOG > MAX_LOG then table.remove(LOG, 1) end
+    pcall(rawprint, line)
+    pcall(LogRender)
+end
+
+-- Every print() below this line goes to the GUI as well as the console.
+local print = Log
+
+local function Copy(text)
+    for _, n in ipairs({"setclipboard", "toclipboard", "set_clipboard"}) do
+        local fn = Env(n)
+        if typeof(fn) == "function" then
+            local ok = pcall(fn, text)
+            if ok then return true end
+        end
+    end
+    return false
+end
+
+local function BuildLogGui()
+    local parent
+    local gethui = Env("gethui")
+    if typeof(gethui) == "function" then
+        local ok, h = pcall(gethui)
+        if ok then parent = h end
+    end
+    parent = parent or LP:FindFirstChildOfClass("PlayerGui")
+    if not parent then return end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name             = "DQR_LOG"
+    gui.ResetOnSpawn     = false
+    gui.IgnoreGuiInset   = true
+    gui.DisplayOrder     = 9999
+    gui.ZIndexBehavior   = Enum.ZIndexBehavior.Sibling
+    gui.Parent           = parent
+    LogGui = gui
+
+    local main = Instance.new("Frame")
+    main.Name                 = "main"
+    main.Size                 = UDim2.new(0, 560, 0, 320)
+    main.Position             = UDim2.new(0, 20, 0, 90)
+    main.BackgroundColor3     = Color3.fromRGB(18, 18, 22)
+    main.BorderSizePixel      = 0
+    main.Active               = true
+    main.Parent               = gui
+    Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+
+    local stroke = Instance.new("UIStroke", main)
+    stroke.Color = Color3.fromRGB(70, 130, 180)
+    stroke.Thickness = 1.5
+
+    local bar = Instance.new("Frame")
+    bar.Name             = "bar"
+    bar.Size             = UDim2.new(1, 0, 0, 30)
+    bar.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
+    bar.BorderSizePixel  = 0
+    bar.Parent           = main
+    Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 8)
+
+    local title = Instance.new("TextLabel")
+    title.Size                   = UDim2.new(0, 160, 1, 0)
+    title.Position               = UDim2.new(0, 10, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Font                   = Enum.Font.GothamBold
+    title.TextSize               = 13
+    title.TextColor3             = Color3.fromRGB(120, 200, 255)
+    title.TextXAlignment         = Enum.TextXAlignment.Left
+    title.Text                   = "DQR LOG"
+    title.Parent                 = bar
+
+    LogCount = Instance.new("TextLabel")
+    LogCount.Size                   = UDim2.new(0, 80, 1, 0)
+    LogCount.Position               = UDim2.new(0, 170, 0, 0)
+    LogCount.BackgroundTransparency = 1
+    LogCount.Font                   = Enum.Font.Gotham
+    LogCount.TextSize               = 11
+    LogCount.TextColor3             = Color3.fromRGB(120, 120, 130)
+    LogCount.TextXAlignment         = Enum.TextXAlignment.Left
+    LogCount.Text                   = "0 lines"
+    LogCount.Parent                 = bar
+
+    local function MkBtn(txt, xoff, w, color)
+        local b = Instance.new("TextButton")
+        b.Name                 = "DQRui_" .. txt
+        b.Size                 = UDim2.new(0, w, 0, 22)
+        b.Position             = UDim2.new(1, xoff, 0, 4)
+        b.BackgroundColor3     = color
+        b.BorderSizePixel      = 0
+        b.Font                 = Enum.Font.GothamBold
+        b.TextSize             = 12
+        b.TextColor3           = Color3.fromRGB(255, 255, 255)
+        b.Text                 = txt
+        b.AutoButtonColor      = true
+        b.Parent               = bar
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+        return b
+    end
+
+    local copyBtn  = MkBtn("Copy",  -180, 56, Color3.fromRGB(45, 110, 190))
+    local dumpBtn  = MkBtn("Dump",  -120, 56, Color3.fromRGB(90, 70, 160))
+    local clearBtn = MkBtn("Clear",  -60, 52, Color3.fromRGB(70, 70, 80))
+
+    LogScroll = Instance.new("ScrollingFrame")
+    LogScroll.Size                  = UDim2.new(1, -12, 1, -40)
+    LogScroll.Position              = UDim2.new(0, 6, 0, 34)
+    LogScroll.BackgroundColor3      = Color3.fromRGB(12, 12, 15)
+    LogScroll.BorderSizePixel       = 0
+    LogScroll.ScrollBarThickness    = 6
+    LogScroll.ScrollBarImageColor3  = Color3.fromRGB(70, 130, 180)
+    LogScroll.Parent                = main
+    Instance.new("UICorner", LogScroll).CornerRadius = UDim.new(0, 6)
+
+    LogBox = Instance.new("TextBox")
+    LogBox.Name                   = "DQRui_box"
+    LogBox.Size                   = UDim2.new(1, -12, 1, 0)
+    LogBox.Position               = UDim2.new(0, 6, 0, 6)
+    LogBox.BackgroundTransparency = 1
+    LogBox.Font                   = Enum.Font.Code
+    LogBox.TextSize               = 12
+    LogBox.TextColor3             = Color3.fromRGB(215, 220, 225)
+    LogBox.TextXAlignment         = Enum.TextXAlignment.Left
+    LogBox.TextYAlignment         = Enum.TextYAlignment.Top
+    LogBox.TextWrapped            = false
+    LogBox.MultiLine              = true
+    LogBox.ClearTextOnFocus       = false
+    LogBox.TextEditable           = false
+    LogBox.Text                   = ""
+    LogBox.Parent                 = LogScroll
+
+    copyBtn.MouseButton1Click:Connect(function()
+        local all = table.concat(LOG, "\n")
+        if Copy(all) then
+            copyBtn.Text = "Copied!"
+        else
+            -- No clipboard global — select the text so Ctrl+C works
+            LogBox.TextEditable = true
+            LogBox:CaptureFocus()
+            LogBox.SelectionStart = 1
+            LogBox.CursorPosition = #all + 1
+            copyBtn.Text = "Ctrl+C"
+        end
+        task.delay(1.5, function() copyBtn.Text = "Copy" end)
+    end)
+
+    clearBtn.MouseButton1Click:Connect(function()
+        table.clear(LOG)
+        LogRender()
+    end)
+
+    -- Dump button is wired up after DumpGui exists
+    LogGui:SetAttribute("DumpReady", false)
+    dumpBtn.Name = "DQRui_DumpBtn"
+
+    -- Drag the window by its title bar
+    local dragging, dragStart, startPos
+    bar.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            dragStart = i.Position
+            startPos  = main.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - dragStart
+            main.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    LogRender()
+end
+
+pcall(BuildLogGui)
+if not LogGui then
+    task.spawn(function()
+        LP:WaitForChild("PlayerGui", 20)
+        pcall(BuildLogGui)
+    end)
+end
 
 -- ============================================================
 --  GRAPHICS NUKE
@@ -288,8 +521,6 @@ end
 --    2. executor getconnections() -> :Fire() on each connection
 --    3. VirtualInputManager click at the button's real screen position
 -- ============================================================
-local GuiService = game:GetService("GuiService")
-
 local function VisibleOnScreen(gui)
     if not gui.Visible or gui.AbsoluteSize.X < 1 then return false end
     local p = gui.Parent
@@ -301,30 +532,69 @@ local function VisibleOnScreen(gui)
     return true
 end
 
-local function Env(name)
-    local ok, v = pcall(function()
-        if getfenv then return getfenv()[name] end
-        return (_G)[name]
-    end)
-    if ok then return v end
-    return nil
-end
-
 local function Norm(s) return (s or ""):lower():gsub("%s+", "") end
 
 -- The label of a Roblox button is very often a child TextLabel, not the
 -- button's own .Text. v4.4 only read TextButton.Text, so an ImageButton
 -- named "frame" wrapping a TextLabel reading "PLAY" matched nothing —
 -- which is exactly why the main-screen Play button was never pressed.
-local function ButtonText(btn)
-    local parts = {}
-    if btn:IsA("TextButton") then parts[#parts+1] = Norm(btn.Text) end
+local function ButtonTokens(btn)
+    local t = {}
+    if btn:IsA("TextButton") then t[#t+1] = Norm(btn.Text) end
     for _, d in ipairs(btn:GetDescendants()) do
         if d:IsA("TextLabel") or d:IsA("TextButton") then
-            parts[#parts+1] = Norm(d.Text)
+            t[#t+1] = Norm(d.Text)
         end
     end
-    return table.concat(parts, "|")
+    return t
+end
+
+local function ButtonText(btn)
+    return table.concat(ButtonTokens(btn), "|")
+end
+
+-- EXACT by default. Substring matching is what made "play" match the
+-- "Show Players" button in the top-right HUD — which is on screen inside
+-- a dungeon too, so InLobby() was always true and the script kept
+-- queueing new runs mid-dungeon. Pass contains=true to opt back in.
+local function ButtonMatches(btn, m)
+    local want = m.text and Norm(m.text) or nil
+    if want and want ~= "" then
+        for _, tok in ipairs(ButtonTokens(btn)) do
+            if m.contains then
+                if tok:find(want, 1, true) then return true end
+            elseif tok == want then
+                return true
+            end
+        end
+    end
+    local wn = m.name and Norm(m.name) or nil
+    if wn and wn ~= "" then
+        local nm = Norm(btn.Name)
+        if m.contains then
+            if nm:find(wn, 1, true) then return true end
+        elseif nm == wn then
+            return true
+        end
+    end
+    return false
+end
+
+-- AbsolutePosition is measured below the topbar unless the owning
+-- ScreenGui sets IgnoreGuiInset. VirtualInputManager wants true viewport
+-- coordinates, so the inset must be added *conditionally* — adding it
+-- always put the click ~36px below buttons like Create Lobby and missed.
+local function ScreenPointOf(gui)
+    local ignore = false
+    local p = gui.Parent
+    while p do
+        if p:IsA("ScreenGui") then ignore = p.IgnoreGuiInset break end
+        p = p.Parent
+    end
+    local x = gui.AbsolutePosition.X + gui.AbsoluteSize.X / 2
+    local y = gui.AbsolutePosition.Y + gui.AbsoluteSize.Y / 2
+    if not ignore then y = y + GuiService:GetGuiInset().Y end
+    return x, y
 end
 
 local function ClickButton(btn)
@@ -332,16 +602,15 @@ local function ClickButton(btn)
     -- whatever the game actually listens on (MouseButton1Down, InputBegan
     -- on the frame, TouchTap...), not just MouseButton1Click.
     if VisibleOnScreen(btn) then
-        local inset = GuiService:GetGuiInset()
-        local x = btn.AbsolutePosition.X + btn.AbsoluteSize.X / 2
-        local y = btn.AbsolutePosition.Y + btn.AbsoluteSize.Y / 2 + inset.Y
+        local x, y = ScreenPointOf(btn)
         local ok = pcall(function()
             VIM:SendMouseMoveEvent(x, y, game)
-            S(0.06)
+            S(0.08)
             VIM:SendMouseButtonEvent(x, y, 0, true,  game, 0)
-            S(0.06)
+            S(0.08)
             VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
         end)
+        print(("[DQR]   click @ %d,%d ok=%s"):format(x, y, tostring(ok)))
         if ok then return true end
     end
 
@@ -379,14 +648,11 @@ local function FindButtons(matches)
     if not pg then return {} end
     local vis, hid = {}, {}
     for _, obj in ipairs(pg:GetDescendants()) do
-        if obj:IsA("TextButton") or obj:IsA("ImageButton") then
-            local t  = ButtonText(obj)
-            local nm = Norm(obj.Name)
+        if (obj:IsA("TextButton") or obj:IsA("ImageButton"))
+        and not obj.Name:find("DQRui_")
+        and not (LogGui and obj:IsDescendantOf(LogGui)) then
             for _, m in ipairs(matches) do
-                local mt = m.text and Norm(m.text) or nil
-                local mn = m.name and Norm(m.name) or nil
-                if (mt and mt ~= "" and t:find(mt, 1, true))
-                or (mn and mn ~= "" and nm:find(mn, 1, true)) then
+                if ButtonMatches(obj, m) then
                     if VisibleOnScreen(obj) then
                         vis[#vis+1] = obj
                     else
@@ -401,20 +667,33 @@ local function FindButtons(matches)
     return vis
 end
 
-local function FindAndFireBtn(matches, timeout)
+-- `verify` (optional) returns true once the click has visibly taken
+-- effect. Without it a click counts as done the moment input is sent,
+-- which is how "Create Lobby" could report success while nothing moved.
+local function FindAndFireBtn(matches, timeout, verify)
     timeout = timeout or 8
     local elapsed = 0
     repeat
-        for _, obj in ipairs(FindButtons(matches)) do
+        local found = FindButtons(matches)
+        for _, obj in ipairs(found) do
             print(("[DQR] Clicking %s  text='%s'  visible=%s")
                 :format(obj:GetFullName(), ButtonText(obj),
                         tostring(VisibleOnScreen(obj))))
-            if ClickButton(obj) then return true end
+            ClickButton(obj)
+            if not verify then return true end
+            local w = 0
+            repeat S(0.25) w = w + 0.25 until verify() or w >= 1.5
+            if verify() then
+                print("[DQR]   verified.")
+                return true
+            end
+            print("[DQR]   click had no effect, trying next candidate.")
         end
+        if #found == 0 then print("[DQR]   (no candidates yet)") end
         S(0.5)
         elapsed = elapsed + 0.5
     until elapsed >= timeout
-    print("[DQR] No button matched after " .. timeout .. "s.")
+    print("[DQR] No button worked after " .. timeout .. "s.")
     return false
 end
 
@@ -434,6 +713,12 @@ local function DumpGui()
     print("[DQR] === END DUMP ===")
 end
 
+-- Wire the log window's Dump button now that DumpGui exists
+if LogGui then
+    local b = LogGui:FindFirstChild("DQRui_DumpBtn", true)
+    if b then b.MouseButton1Click:Connect(function() task.spawn(DumpGui) end) end
+end
+
 -- ============================================================
 --  LOBBY DETECTION
 --  "Am I in a dungeon?" was inferred from mob count, so any quiet
@@ -442,16 +727,29 @@ end
 --  queueing another one mid-run. Seeing the lobby's own Play button on
 --  screen is a positive, unambiguous signal — use that instead.
 -- ============================================================
+-- Exact matches only. "play" as a substring also hits "Show Players".
 local PLAY_MATCHES = {
-    {name = "playbutton"}, {name = "playbtn"}, {name = "play"},
     {text = "play"},
+    {name = "playbutton"}, {name = "playbtn"}, {name = "play"},
 }
 
-local function InLobby()
-    for _, b in ipairs(FindButtons(PLAY_MATCHES)) do
-        if VisibleOnScreen(b) then return true end
+local CREATE_LOBBY_MATCHES = {
+    {text = "createlobby"}, {text = "create"},
+    {name = "createlobby"}, {name = "createbutton"},
+}
+
+local function AnyVisible(matches)
+    for _, b in ipairs(FindButtons(matches)) do
+        if VisibleOnScreen(b) then return b end
     end
-    return false
+    return nil
+end
+
+-- The lobby is identified by its Play button OR the open dungeon-select
+-- panel's Create Lobby button. Both vanish once a run starts.
+local function InLobby()
+    return AnyVisible(PLAY_MATCHES) ~= nil
+        or AnyVisible(CREATE_LOBBY_MATCHES) ~= nil
 end
 
 local lobbyFlowActive = false
@@ -500,14 +798,22 @@ local function RunLobbyFlow()
     end
     S(1.5)
 
-    -- Step 2: Create Dungeon popup
-    print("[DQR] Step 2: Create Dungeon")
-    FindAndFireBtn({
-        {text = "createdungeon"}, {name = "createdungeon"},
-        {text = "create"},        {name = "create"},
-        {text = "newdungeon"},    {text = "host"},
-    }, 6)
-    S(1.2)
+    -- Step 2: wait for the dungeon-select panel. Play opens it directly —
+    -- there is no separate "Create Dungeon" step in this UI. The old
+    -- generic {text="create"} match here could hit Create Lobby *before*
+    -- the dungeon and difficulty were chosen.
+    print("[DQR] Step 2: Waiting for the dungeon panel")
+    local panelUp = false
+    for _ = 1, 12 do
+        if AnyVisible({{text = CONFIG.TargetDungeon}})
+        or AnyVisible(CREATE_LOBBY_MATCHES) then panelUp = true break end
+        S(0.5)
+    end
+    if not panelUp then
+        print("[DQR] Dungeon panel never opened. Press Copy and send the log.")
+        lobbyFlowActive = false
+        return
+    end
 
     -- Step 3: Select dungeon from list
     print("[DQR] Step 3: Select " .. CONFIG.TargetDungeon)
@@ -518,7 +824,10 @@ local function RunLobbyFlow()
         -- Keyword fallback — first word of the dungeon name
         local kw = CONFIG.TargetDungeon:match("(%a+)")
         if kw then
-            dunFired = FindAndFireBtn({{text = kw}, {name = kw}}, 3)
+            dunFired = FindAndFireBtn({
+                {text = kw, contains = true},
+                {name = kw, contains = true},
+            }, 3)
             if dunFired then print("[DQR] Dungeon via keyword: " .. kw) end
         end
     end
@@ -534,16 +843,15 @@ local function RunLobbyFlow()
     }, 5)
     S(0.8)
 
-    -- Step 5: Create Lobby. Broadened — the confirm button on this screen
-    -- is commonly just "CREATE" or "CONFIRM", which the old
-    -- "createlobby"-only match could never hit.
+    -- Step 5: Create Lobby. Verified — we only call this done once the
+    -- button is actually gone from the screen.
     print("[DQR] Step 5: Create Lobby")
-    FindAndFireBtn({
-        {text = "createlobby"}, {name = "createlobby"},
-        {text = "createparty"}, {name = "createparty"},
-        {text = "confirm"},     {name = "confirm"},
-        {text = "create"},      {name = "createbutton"},
-    }, 6)
+    local made = FindAndFireBtn(CREATE_LOBBY_MATCHES, 8, function()
+        return AnyVisible(CREATE_LOBBY_MATCHES) == nil
+    end)
+    if not made then
+        print("[DQR] Create Lobby did not take. Press Copy and send the log.")
+    end
     S(1.8)
 
     -- Step 6: Start (party screen)
@@ -989,7 +1297,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v4.5 loaded.")
+    print("[DQR] v4.6 loaded.  F5 farm  F6 dump  F7 hide log")
     NukeGraphics()
     S(2.5)
 
@@ -1027,6 +1335,8 @@ UserInputService.InputBegan:Connect(function(inp, gpe)
         DumpGui()
         print("[DQR] InLobby() = " .. tostring(InLobby())
             .. "  MobsPresent() = " .. tostring(MobsPresent()))
+    elseif inp.KeyCode == Enum.KeyCode.F7 then
+        if LogGui then LogGui.Enabled = not LogGui.Enabled end
     end
 end)
 
@@ -1035,3 +1345,4 @@ getgenv = getgenv or function() return _G end
 getgenv().DQR_Dump  = DumpGui
 getgenv().DQR_Lobby = InLobby
 getgenv().DQR_Queue = RunLobbyFlow
+getgenv().DQR_Log   = function() return table.concat(LOG, "\n") end
