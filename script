@@ -1,12 +1,12 @@
 -- ============================================================
---  DQR AUTO FARM v6.0
+--  DQR AUTO FARM v6.1
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
 
 local CONFIG = {
-    -- "Warrior" / "Tank"  -> melee range, hugs the mob
-    -- "Mage" / "Healer"   -> stands back and casts
+    -- "Warrior" / "Tank"  -> fights at the edge of melee reach
+    -- "Mage" / "Healer"   -> stands well back and casts
     -- Picks the engagement distances below. Anything you set by hand in
     -- the ENGAGEMENT DISTANCE block is overwritten by this at boot, so
     -- set Class to "" if you want to tune the numbers yourself.
@@ -105,22 +105,31 @@ local CONFIG = {
 --  swing never lands. Casters want the opposite: stay out past the
 --  mob's own reach and lean on Q/E, which is what AttackRange covers.
 -- ============================================================
+--  Melee weapons in this game swing a long way, so there is no reason
+--  to stand on top of a mob: sit at the OUTER edge of your own reach,
+--  which is usually past theirs. CircleRadius is the standoff and
+--  MeleeRange is how far out the swing still counts - keep
+--  CircleRadius comfortably below MeleeRange.
+--
+--  If a class stops connecting, lower its CircleRadius a couple of
+--  studs. If it is still taking melee hits, raise CircleRadius (and
+--  MinRange with it).
 local CLASS_RANGES = {
     Warrior = {
-        CircleRadius = 6,  MeleeRange = 9,  MinRange = 4,
-        MaxRange     = 14, AttackRange = 25,
+        CircleRadius = 12, MeleeRange = 18, MinRange = 10,
+        MaxRange     = 22, AttackRange = 30,
     },
     Tank = {
-        CircleRadius = 5,  MeleeRange = 10, MinRange = 3,
-        MaxRange     = 13, AttackRange = 25,
+        CircleRadius = 10, MeleeRange = 18, MinRange = 8,
+        MaxRange     = 20, AttackRange = 30,
     },
     Mage = {
-        CircleRadius = 20, MeleeRange = 9,  MinRange = 14,
-        MaxRange     = 30, AttackRange = 40,
+        CircleRadius = 24, MeleeRange = 10, MinRange = 18,
+        MaxRange     = 34, AttackRange = 45,
     },
     Healer = {
-        CircleRadius = 22, MeleeRange = 9,  MinRange = 16,
-        MaxRange     = 32, AttackRange = 40,
+        CircleRadius = 26, MeleeRange = 10, MinRange = 20,
+        MaxRange     = 36, AttackRange = 45,
     },
 }
 
@@ -2112,6 +2121,29 @@ local function MainLoop()
             continue
         end
 
+        -- Inside our own standoff: walk straight back out. The orbit
+        -- radius nudge alone (1.25x) was far too gentle - it left the
+        -- bot sitting inside the mob's swing arc taking hits while it
+        -- slowly drifted outward. Melee keeps firing while retreating,
+        -- because DoMelee was already called above on this frame.
+        if dist < CONFIG.MinRange then
+            local away = Vector3.new(root.Position.X - mobPos.X, 0,
+                                     root.Position.Z - mobPos.Z)
+            if away.Magnitude < 0.5 then
+                local b = root.CFrame.LookVector * -1
+                away = Vector3.new(b.X, 0, b.Z)
+            end
+            if away.Magnitude > 0.01 then
+                local u = away.Unit
+                currentDest = Vector3.new(
+                    mobPos.X + u.X * CONFIG.CircleRadius, mobPos.Y,
+                    mobPos.Z + u.Z * CONFIG.CircleRadius)
+                ShowRangeBar(root, mobPos, dist)
+                S(CONFIG.ScanRate)
+                continue
+            end
+        end
+
         -- Mob not moving and we are already in range? Stop shuffling and
         -- just hit it. Orbiting a stationary target only costs uptime.
         if target.Model == stillModel then
@@ -2166,15 +2198,12 @@ local function MainLoop()
             orbitAngle = orbitAngle - math.pi * 2
         end
 
-        -- Nudge the orbit radius by current distance. These used to be
-        -- 1.6x / 0.5x, which threw the bot out to ~29 studs whenever it
-        -- got close - so it backed itself out of melee range every time
-        -- it arrived. Gentle corrections keep it inside MeleeRange.
+        -- Closing in from far away: aim a little inside the standoff so
+        -- we actually arrive at it. Being too CLOSE is handled by the
+        -- retreat branch above, which exits before reaching here.
         local radius = CONFIG.CircleRadius
-        if dist < CONFIG.MinRange then
-            radius = CONFIG.CircleRadius * 1.25
-        elseif dist > CONFIG.MaxRange then
-            radius = CONFIG.CircleRadius * 0.7
+        if dist > CONFIG.MaxRange then
+            radius = CONFIG.CircleRadius * 0.85
         end
 
         -- Keep the orbit point's own Y (the mob's ground level). This
@@ -2499,7 +2528,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v6.0 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v6.1 loaded.  F5 farm  F6 dump  F7 show/hide log")
     ApplyClass()
     NukeGraphics()
     S(2.5)
