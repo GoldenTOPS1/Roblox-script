@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v6.8
+--  DQR AUTO FARM v6.9
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -91,6 +91,8 @@ local CONFIG = {
     SteerDwell     = 1.5,    -- hold a probed heading this long (no ping-pong)
     StuckDist      = 2.5,    -- moved less than this...
     StuckTime      = 1.5,    -- ...for this long = stuck
+    UnstickTime    = 0.9,    -- secs spent backing out of a snag
+    UnstickDist    = 12,     -- how far to back out
     AgentMaxSlope  = 45,     -- steeper than this = route around, not up
     AgentWidth     = 2.5,    -- half body width for clearance raycasts
     PathHoldClear  = 3,      -- clear readings needed to drop a live path
@@ -524,6 +526,9 @@ local steerDir   = nil   -- fallback heading when no path exists
 local steerUntil = 0     -- keep that heading at least this long
 local wpStuck    = 0     -- seconds spent failing to reach pathQueue[1]
 local clearStreak = 0    -- consecutive "line is clear" readings
+local stuckCount  = 0    -- consecutive stuck events at one spot
+local unstickDir  = nil  -- temporary "get out of here" heading
+local unstickUntil = 0
 local bestFar    = math.huge  -- closest we have got to the target
 local bestFarAt  = 0     -- ...and when
 local unreachable = {}   -- model -> tick() until which to ignore it
@@ -878,6 +883,7 @@ local function StartMoving(getDestFn)
     stuckAt, stuckSince = nil, 0
     moveMode, commandSince, diagCount = "humanoid", 0, 0
     clearStreak, wpStuck = 0, 0
+    stuckCount, unstickDir, unstickUntil = 0, nil, 0
     bestFar, bestFarAt = math.huge, tick()
 
     wantDisabled = true
@@ -920,7 +926,12 @@ local function StartMoving(getDestFn)
 
         -- Follow the path queue when we have one, else head straight
         local step = dest
-        if #pathQueue > 0 then
+
+        -- An unstick manoeuvre outranks the path and the destination:
+        -- the whole point is to stop heading where we were heading.
+        if unstickDir and tick() < unstickUntil then
+            step = pos + unstickDir * CONFIG.UnstickDist
+        elseif #pathQueue > 0 then
             local wp = pathQueue[1]
             local flatD = (Vector3.new(wp.Position.X, 0, wp.Position.Z)
                          - Vector3.new(pos.X, 0, pos.Z)).Magnitude
@@ -1021,16 +1032,40 @@ local function StartMoving(getDestFn)
                 stuckAt, stuckSince = pos, now
             elseif now - stuckSince > CONFIG.StuckTime then
                 stuckAt, stuckSince = pos, now
+                stuckCount = stuckCount + 1
+
                 human.Jump = true
                 pcall(function()
                     human:ChangeState(Enum.HumanoidStateType.Jumping)
                 end)
+
+                -- Jumping and repathing alone is not enough on a corner:
+                -- the new path starts from where we are wedged and aims
+                -- through the same gap, so we re-wedge immediately.
+                -- Back out and go round, alternating sides each attempt
+                -- so two bad corners cannot trap us in one direction.
+                ClearPath()
                 forceRepath = true
-                -- Log the full state the first few times only; the cause
-                -- is always visible in the first one or two.
+
+                local back = root.CFrame.LookVector * -1
+                back = Vector3.new(back.X, 0, back.Z)
+                if back.Magnitude < 0.01 then back = Vector3.new(1, 0, 0) end
+                back = back.Unit
+                local sign = (stuckCount % 2 == 0) and 1 or -1
+                local side = Vector3.new(-back.Z, 0, back.X) * sign
+                local want = (back * 0.7 + side).Unit
+
+                -- Prefer a direction with real room; fall back to
+                -- straight back out if we are boxed in entirely.
+                local spot = SafeStep(pos, want, CONFIG.UnstickDist)
+                unstickDir = spot
+                    and (Vector3.new(spot.X - pos.X, 0, spot.Z - pos.Z)).Unit
+                    or back
+                unstickUntil = now + CONFIG.UnstickTime
+
                 if diagCount < 3 then
                     diagCount = diagCount + 1
-                    print("[DQR] Stuck - " .. Diag())
+                    print("[DQR] Stuck - backing out. " .. Diag())
                 elseif diagCount == 3 then
                     diagCount = 4
                     print("[DQR] Stuck (further diagnostics suppressed).")
@@ -1038,6 +1073,7 @@ local function StartMoving(getDestFn)
             end
         else
             stuckAt = nil
+            stuckCount = 0
         end
 
         -- Rotation only: position is the Humanoid's business now.
@@ -2860,7 +2896,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v6.8 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v6.9 loaded.  F5 farm  F6 dump  F7 show/hide log")
     ApplyClass()
     NukeGraphics()
     S(2.5)
