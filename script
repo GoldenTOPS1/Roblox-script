@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v5.3
+--  DQR AUTO FARM v5.4
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -1501,12 +1501,20 @@ local function ColorIsThreat(c)
         or (c.R > 0.7 and c.G > 0.3  and c.B < 0.1)
 end
 
+-- Anything this script spawned into the world. The range bar is red,
+-- flat and long, i.e. it matches the telegraph test perfectly - and you
+-- stand at one end of it, so without this the bot dodges its own line
+-- forever.
+local function IsOurs(o)
+    return o == RangeBarPart or o.Name:sub(1, 4) == "DQR_"
+end
+
 local function ScanThreats()
     local root = GetRoot()
     if not root then return false, nil end
     local char = GetChar()
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("BasePart")
+        if obj:IsA("BasePart") and not IsOurs(obj)
         and (not char or not obj:IsDescendantOf(char)) then
             if obj.Material == Enum.Material.Neon
             or ColorIsThreat(obj.Color) then
@@ -1544,6 +1552,7 @@ end
 -- ============================================================
 local function IsTelegraph(o)
     if not o:IsA("BasePart") then return false end
+    if IsOurs(o) then return false end
     if o.Transparency > 0.9 then return false end
     local s = o.Size
     if s.Y > CONFIG.TelegraphMaxY then return false end          -- a prop
@@ -1929,7 +1938,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v5.3 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v5.4 loaded.  F5 farm  F6 dump  F7 show/hide log")
     NukeGraphics()
     S(2.5)
 
