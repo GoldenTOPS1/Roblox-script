@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v8.6
+--  DQR AUTO FARM v8.7
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log
 --  (F5 farm / F6 dump / F7 log / F8 mob diag / F9 hazard diag)
@@ -521,9 +521,11 @@ workspace.DescendantRemoving:Connect(function(o)
     hiddenBeams[o] = nil
 end)
 
--- Beams that already existed before the script loaded. Deferred, not
--- spawned: task.spawn runs immediately, before IsBeamShape exists.
-task.defer(function()
+-- Beams that already existed before the script loaded. The wait is
+-- needed: task.spawn runs its function immediately, before the rest of
+-- this file - IsBeamShape included - has been defined.
+task.spawn(function()
+    S(1)
     for _, o in ipairs(workspace:GetDescendants()) do
         if o:IsA("Beam") then
             beamObjects[o] = true
@@ -2429,6 +2431,16 @@ end
 --  These need a different test: am I standing inside the rectangle?
 --  If so, leave across its NARROW axis, which is the shortest way out.
 -- ============================================================
+-- Everything from here to the end of HazardDiag sits in one `do` block
+-- so its two dozen helpers stop counting against Luau's limit of 200
+-- live locals in the main chunk. v8.6 crossed that limit, and an
+-- executor reports it as "attempt to call a nil value" on line 1 -
+-- loadstring returned nil and the loader called it. Only these four
+-- names, plus the forward-declared HazardAt and IsBeamShape, are
+-- visible outside the block.
+local BeamShaped, hazardCache, ScanHazards, HazardDiag
+do
+
 -- A part's shape in WORLD terms: how tall it stands, and its two
 -- horizontal extents with their directions. Reading Size.Y for the
 -- height is wrong for anything rotated - a cylinder's axis is its X,
@@ -2636,7 +2648,8 @@ local function AtBodyHeight(o)
 end
 
 -- Geometry only: long in exactly one axis, thin in the other two.
-local function BeamShaped(o)
+-- Declared outside the block: SurfaceRadius below uses it too.
+function BeamShaped(o)
     if not o:IsA("BasePart") then return false end
     if IsOurs(o) then return false end
     local s = o.Size
@@ -2893,11 +2906,11 @@ end
 -- One call for every "get out of the way" test. Cached: two 20Hz
 -- threads poll this, and re-running the scans 40 times a second was a
 -- large part of the in-combat lag.
-local hazardCache = {t = 0, escape = nil, radial = false,
-                     backoffR = nil, backoffFor = nil,
-                     holdP = nil, holdUntil = 0}
+hazardCache = {t = 0, escape = nil, radial = false,
+               backoffR = nil, backoffFor = nil,
+               holdP = nil, holdUntil = 0}
 
-local function ScanHazards()
+function ScanHazards()
     local now = tick()
     if now - hazardCache.t < CONFIG.HazardTTL then
         return hazardCache.escape
@@ -2967,7 +2980,7 @@ end
 --  the verdict each test gives, so an attack that is NOT being dodged
 --  says why instead of leaving us to guess at how it is built.
 -- ============================================================
-local function HazardDiag()
+function HazardDiag()
     local root = GetRoot()
     if not root then print("[DQR] No character.") return end
     local pos, now = root.Position, tick()
@@ -3030,6 +3043,8 @@ local function HazardDiag()
     print("[DQR] === END HAZARD DIAG ===")
 end
 
+end -- of the hazard block (see the note above Footprint)
+
 -- ============================================================
 --  CIRCULAR ORBIT
 -- ============================================================
@@ -3051,13 +3066,6 @@ local stillModel = nil
 local stillPos   = Vector3.zero
 local stillSince = 0
 
--- Renamed from Whitelist in 2022; support both.
-local INCLUDE = (function()
-    local ok, v = pcall(function() return Enum.RaycastFilterType.Include end)
-    if ok and v then return v end
-    return Enum.RaycastFilterType.Whitelist
-end)()
-
 -- How far the target's BODY sits from its root, along the line from us.
 -- GetExtentsSize spans everything in the model - a boss's own beam and
 -- ring effects included, if they were parented to it when it was first
@@ -3065,9 +3073,20 @@ end)()
 -- bot then fights a phantom well outside it. One ray at the root says
 -- where the body actually begins. Smoothed, since the ray lands on a
 -- different limb from frame to frame.
+-- (Block-scoped for the same local-count reason as the hazard section.)
+local SurfaceRadius
+do
+
+-- Renamed from Whitelist in 2022; support both.
+local INCLUDE = (function()
+    local ok, v = pcall(function() return Enum.RaycastFilterType.Include end)
+    if ok and v then return v end
+    return Enum.RaycastFilterType.Whitelist
+end)()
+
 local bodyRadius = setmetatable({}, {__mode = "k"})  -- model -> studs
 
-local function SurfaceRadius(target, from)
+function SurfaceRadius(target, from)
     local model, mroot = target.Model, target.Root
     local ok, r = pcall(function()
         local p = RaycastParams.new()
@@ -3089,6 +3108,8 @@ local function SurfaceRadius(target, from)
     bodyRadius[model] = r
     return r
 end
+
+end -- of the SurfaceRadius block
 
 local function SeedOrbit(mobPos)
     local root = GetRoot()
