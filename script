@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v6.2
+--  DQR AUTO FARM v6.3
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -93,6 +93,7 @@ local CONFIG = {
     StuckTime      = 1.5,    -- ...for this long = stuck
     AgentMaxSlope  = 45,     -- steeper than this = route around, not up
     ProbeDist      = 14,     -- how far ahead to test a clear heading
+    GroundProbe    = 20,     -- how far down to look for floor at a target
     PathGiveUp     = 6,      -- failed paths before abandoning a mob
     UnreachableFor = 12,     -- seconds to ignore an abandoned mob
 
@@ -541,6 +542,44 @@ local function LineClear(from, to)
     -- Ignore things a walking character passes through anyway
     if not hit.Instance.CanCollide then return true end
     return false
+end
+
+-- Is there floor under this spot? Stops an escape from sending the bot
+-- off a ledge or out over a pit.
+local function HasGround(p)
+    local char = GetChar()
+    local rp = RaycastParams.new()
+    rp.FilterType = EXCLUDE
+    rp.FilterDescendantsInstances = {char, RangeBarPart}
+    return workspace:Raycast(p + Vector3.new(0, 6, 0),
+        Vector3.new(0, -CONFIG.GroundProbe, 0), rp) ~= nil
+end
+
+-- The nearest heading to `dir` that is actually walkable for `dist`
+-- studs, or nil if the bot is boxed in. Every evasive move goes through
+-- this: dodges, retreats and hazard escapes all used to be plain
+-- "position + direction * distance" with no check that anything was
+-- there, which is how the bot kept reversing into walls and pillars.
+local function SafeStep(pos, dir, dist)
+    dir = Vector3.new(dir.X, 0, dir.Z)
+    if dir.Magnitude < 0.01 then return nil end
+    dir = dir.Unit
+    dist = math.max(dist, 3)
+
+    for _, deg in ipairs({0, 20, -20, 40, -40, 65, -65,
+                          90, -90, 120, -120, 150, -150, 180}) do
+        local a = math.rad(deg)
+        local d = Vector3.new(
+            dir.X * math.cos(a) - dir.Z * math.sin(a), 0,
+            dir.X * math.sin(a) + dir.Z * math.cos(a))
+        local p = pos + d * dist
+        if LineClear(pos, p) and HasGround(p) then return p end
+    end
+
+    -- Boxed in at full range: settle for a shorter hop.
+    local half = pos + dir * (dist * 0.5)
+    if LineClear(pos, half) and HasGround(half) then return half end
+    return nil
 end
 
 -- When there is no usable path and the direct line is blocked, fan out
@@ -1829,7 +1868,6 @@ local function ScanTelegraphs()
                     local outZ = hz - math.abs(rel.Z)  -- cost to leave endwise
                     local depth = math.min(outX, outZ)
                     if depth > worstDepth then
-                        worstDepth = depth
                         local axis, sign
                         if outX <= outZ then
                             axis = o.CFrame:VectorToWorldSpace(Vector3.new(1, 0, 0))
@@ -1839,8 +1877,11 @@ local function ScanTelegraphs()
                             sign = rel.Z >= 0 and 1 or -1
                         end
                         local d = Vector3.new(axis.X, 0, axis.Z) * sign
-                        if d.Magnitude > 0.01 then
-                            escape = pos + d.Unit * (depth + 4)
+                        -- Only accept an exit we can actually walk.
+                        local p = SafeStep(pos, d, depth + 4)
+                        if p then
+                            worstDepth = depth
+                            escape = p
                         end
                     end
                 end
@@ -1904,7 +1945,8 @@ local function EscapeFromLine(pos, c, axis, half, clear)
     else
         out = perp
     end
-    return pos + out.Unit * (clear - d + 4)
+    -- Sidestep only somewhere there is actually room to stand.
+    return SafeStep(pos, out, clear - d + 4)
 end
 
 local function ScanBeams()
@@ -2157,12 +2199,17 @@ local function MainLoop()
                 tOrigin.Z - root.Position.Z).Unit
             local perp = Vector3.new(-toward.Z, 0, toward.X)
             local sign = math.cos(orbitAngle) > 0 and 1 or -1
-            local dodge = root.Position + perp * sign * CONFIG.DodgeStep
-            currentDest = Vector3.new(dodge.X, root.Position.Y, dodge.Z)
-            ShowRangeBar(root, mobPos, dist)
-            orbitAngle = orbitAngle + sign * 0.5
-            S(CONFIG.ScanRate)
-            continue
+            -- Try the preferred side, then the other, then give up and
+            -- keep fighting rather than reverse into a wall.
+            local dodge = SafeStep(root.Position, perp * sign, CONFIG.DodgeStep)
+                       or SafeStep(root.Position, perp * -sign, CONFIG.DodgeStep)
+            if dodge then
+                currentDest = dodge
+                ShowRangeBar(root, mobPos, dist)
+                orbitAngle = orbitAngle + sign * 0.5
+                S(CONFIG.ScanRate)
+                continue
+            end
         end
 
         -- Inside our own standoff: walk straight back out. The orbit
@@ -2186,13 +2233,18 @@ local function MainLoop()
                 away = Vector3.new(b.X, 0, b.Z)
             end
             if away.Magnitude > 0.01 then
-                local u = away.Unit
-                currentDest = Vector3.new(
-                    mobPos.X + u.X * CONFIG.CircleRadius, mobPos.Y,
-                    mobPos.Z + u.Z * CONFIG.CircleRadius)
-                ShowRangeBar(root, mobPos, dist)
-                S(CONFIG.ScanRate)
-                continue
+                -- Back off only where there is room. If we are against a
+                -- wall, stop retreating and fight instead of grinding
+                -- into it - otherwise the mob pins us there.
+                local spot = SafeStep(root.Position, away,
+                                      CONFIG.CircleRadius - flat)
+                if spot then
+                    currentDest = spot
+                    ShowRangeBar(root, mobPos, dist)
+                    S(CONFIG.ScanRate)
+                    continue
+                end
+                retreating = false
             end
         end
 
@@ -2231,15 +2283,26 @@ local function MainLoop()
                 if away.Magnitude > 0.01 then
                     local standoff = math.max(CONFIG.CircleRadius,
                                               CONFIG.MobAvoidRadius)
-                    currentDest = centre + away.Unit * standoff
-                    ShowRangeBar(root, mobPos, dist)
+                    local fromCentre = (Vector3.new(root.Position.X, 0, root.Position.Z)
+                                      - Vector3.new(centre.X, 0, centre.Z)).Magnitude
+                    local spot = SafeStep(root.Position, away,
+                                          standoff - fromCentre)
+                    if spot then
+                        currentDest = spot
+                        ShowRangeBar(root, mobPos, dist)
+                        if now - lastCrowdWarn > 3 then
+                            lastCrowdWarn = now
+                            print(("[DQR] %d mobs on me - backing to the edge.")
+                                :format(#pack))
+                        end
+                        S(CONFIG.ScanRate)
+                        continue
+                    end
                     if now - lastCrowdWarn > 3 then
                         lastCrowdWarn = now
-                        print(("[DQR] %d mobs on me - backing to the edge.")
-                            :format(#pack))
+                        print("[DQR] Surrounded with nowhere to back into "
+                            .. "- standing and fighting.")
                     end
-                    S(CONFIG.ScanRate)
-                    continue
                 end
             end
         end
@@ -2314,7 +2377,10 @@ local function DodgeWatcher()
                 origin.Z - root.Position.Z).Unit
             local perp = Vector3.new(-toward.Z, 0, toward.X)
             local sign = math.cos(orbitAngle) > 0 and 1 or -1
-            currentDest = root.Position + perp * sign * CONFIG.DodgeStep
+            currentDest =
+                   SafeStep(root.Position, perp * sign,  CONFIG.DodgeStep)
+                or SafeStep(root.Position, perp * -sign, CONFIG.DodgeStep)
+                or currentDest
         end
     end
 end
@@ -2580,7 +2646,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v6.2 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v6.3 loaded.  F5 farm  F6 dump  F7 show/hide log")
     ApplyClass()
     NukeGraphics()
     S(2.5)
