@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v4.6
+--  DQR AUTO FARM v4.7
 --  Axiom Build — No mouse clicks, CFrame movement,
 --  melee + spells, full speed, remote-based dungeon queue
 -- ============================================================
@@ -9,7 +9,7 @@ local CONFIG = {
     Difficulty     = "Easy",
     AutoRunDungeon = true,
     UseRemotes     = false,  -- blind-firing guessed remotes; off by default
-    DebugGui       = true,   -- dump every GUI button when the flow starts
+    DebugGui       = false,  -- full button dump on every queue (F6 does it too)
     LowerGraphics  = true,
 
     MeleeRange     = 8,      -- swing left click when closer than this
@@ -727,17 +727,6 @@ end
 --  queueing another one mid-run. Seeing the lobby's own Play button on
 --  screen is a positive, unambiguous signal — use that instead.
 -- ============================================================
--- Exact matches only. "play" as a substring also hits "Show Players".
-local PLAY_MATCHES = {
-    {text = "play"},
-    {name = "playbutton"}, {name = "playbtn"}, {name = "play"},
-}
-
-local CREATE_LOBBY_MATCHES = {
-    {text = "createlobby"}, {text = "create"},
-    {name = "createlobby"}, {name = "createbutton"},
-}
-
 local function AnyVisible(matches)
     for _, b in ipairs(FindButtons(matches)) do
         if VisibleOnScreen(b) then return b end
@@ -745,11 +734,87 @@ local function AnyVisible(matches)
     return nil
 end
 
--- The lobby is identified by its Play button OR the open dungeon-select
--- panel's Create Lobby button. Both vanish once a run starts.
+-- ============================================================
+--  EXACT UI PATHS  (taken from a live GUI dump of this game)
+--
+--  Keyword matching could never work for the dungeon list or the
+--  difficulty buttons: every one of them is *named* "TextButton" and
+--  has EMPTY text. The identifying name sits on the parent frame —
+--  chooseDungeon.backgroundFillLeft.ScrollingFrame["Desert Temple"]
+--  .TextButton, chooseDungeon.backgroundFillRight.Easy.TextButton.
+--  Exact paths remove all the guessing.
+-- ============================================================
+local UI = {
+    IntroPlay   = {"introGui", "title", "Frame", "TextButton"},
+    LobbyPlay   = {"mainInterface", "buttons", "playButton"},
+    SelectPanel = {"queueGui", "selectOption"},
+    CreateGame  = {"queueGui", "selectOption", "Frame", "createGame"},
+    ChoosePanel = {"queueGui", "chooseDungeon"},
+    DungeonList = {"queueGui", "chooseDungeon", "backgroundFillLeft",
+                   "ScrollingFrame"},
+    DiffRoot    = {"queueGui", "chooseDungeon", "backgroundFillRight"},
+    CreateLobby = {"queueGui", "chooseDungeon", "backgroundFillMiddle",
+                   "startMain", "TextButton"},
+    LobbyInfo   = {"queueGui", "lobbyInfo"},
+    StartRun    = {"queueGui", "lobbyInfo", "startBackground", "startFrame",
+                   "startButton"},
+    Replay      = {"ReplayDungeonButton", "Replay"},
+}
+
+local function Path(parts)
+    local node = LP:FindFirstChildOfClass("PlayerGui")
+    if not node then return nil end
+    for _, n in ipairs(parts) do
+        node = node:FindFirstChild(n)
+        if not node then return nil end
+    end
+    return node
+end
+
+local function PathVisible(parts)
+    local o = Path(parts)
+    if o and VisibleOnScreen(o) then return o end
+    return nil
+end
+
+-- A dungeon row / difficulty button: the clickable TextButton is a child
+-- of a frame named after the dungeon or difficulty.
+local function DungeonBtn(name)
+    local list = Path(UI.DungeonList)
+    if not list then return nil end
+    local row = list:FindFirstChild(name)
+    return row and row:FindFirstChildWhichIsA("TextButton") or nil
+end
+
+local function DifficultyBtn(name)
+    local root = Path(UI.DiffRoot)
+    if not root then return nil end
+    local row = root:FindFirstChild(name)
+    return row and row:FindFirstChildWhichIsA("TextButton") or nil
+end
+
+-- Rows live in a ScrollingFrame; a row scrolled out of view has a valid
+-- AbsolutePosition but cannot be clicked. Bring it into view first.
+local function ScrollIntoView(btn)
+    local sf = btn
+    while sf and not sf:IsA("ScrollingFrame") do sf = sf.Parent end
+    if not sf then return end
+    local delta = btn.AbsolutePosition.Y - sf.AbsolutePosition.Y
+    if delta < 0 or delta > sf.AbsoluteSize.Y - btn.AbsoluteSize.Y then
+        sf.CanvasPosition = Vector2.new(sf.CanvasPosition.X,
+            math.max(0, sf.CanvasPosition.Y + delta - sf.AbsoluteSize.Y / 2))
+        S(0.35)
+    end
+end
+
+-- In the lobby exactly when the lobby's own UI is on screen. All of
+-- these belong to the lobby place and are gone inside a dungeon.
 local function InLobby()
-    return AnyVisible(PLAY_MATCHES) ~= nil
-        or AnyVisible(CREATE_LOBBY_MATCHES) ~= nil
+    return PathVisible(UI.LobbyPlay)   ~= nil
+        or PathVisible(UI.IntroPlay)   ~= nil
+        or PathVisible(UI.SelectPanel) ~= nil
+        or PathVisible(UI.ChoosePanel) ~= nil
+        or PathVisible(UI.LobbyInfo)   ~= nil
 end
 
 local lobbyFlowActive = false
@@ -786,90 +851,106 @@ local function RunLobbyFlow()
 
     print("[DQR] Driving the lobby UI.")
 
-    -- Step 1: Play button.
-    -- The hardcoded mainInterface/buttons/playButton path was a guess, and
-    -- WaitForChild on a wrong name burns 12s inside a pcall before the
-    -- fallback even runs. Search by name/text instead, visible first.
-    print("[DQR] Step 1: Play button")
-    if not FindAndFireBtn(PLAY_MATCHES, 8) then
-        print("[DQR] Play button not found — run DQR_Dump() and check names.")
-        lobbyFlowActive = false
-        return
-    end
-    S(1.5)
-
-    -- Step 2: wait for the dungeon-select panel. Play opens it directly —
-    -- there is no separate "Create Dungeon" step in this UI. The old
-    -- generic {text="create"} match here could hit Create Lobby *before*
-    -- the dungeon and difficulty were chosen.
-    print("[DQR] Step 2: Waiting for the dungeon panel")
-    local panelUp = false
-    for _ = 1, 12 do
-        if AnyVisible({{text = CONFIG.TargetDungeon}})
-        or AnyVisible(CREATE_LOBBY_MATCHES) then panelUp = true break end
-        S(0.5)
-    end
-    if not panelUp then
-        print("[DQR] Dungeon panel never opened. Press Copy and send the log.")
-        lobbyFlowActive = false
-        return
-    end
-
-    -- Step 3: Select dungeon from list
-    print("[DQR] Step 3: Select " .. CONFIG.TargetDungeon)
-    local dunFired = FindAndFireBtn({
-        {text = CONFIG.TargetDungeon}, {name = CONFIG.TargetDungeon},
-    }, 6)
-    if not dunFired then
-        -- Keyword fallback — first word of the dungeon name
-        local kw = CONFIG.TargetDungeon:match("(%a+)")
-        if kw then
-            dunFired = FindAndFireBtn({
-                {text = kw, contains = true},
-                {name = kw, contains = true},
-            }, 3)
-            if dunFired then print("[DQR] Dungeon via keyword: " .. kw) end
+    -- Waits for a path to become visible, then clicks it.
+    local function Step(n, label, parts, wait)
+        print(("[DQR] Step %d: %s"):format(n, label))
+        local w = 0
+        local o = PathVisible(parts)
+        while not o and w < (wait or 8) do
+            S(0.4) w = w + 0.4
+            o = PathVisible(parts)
         end
+        if not o then
+            local exists = Path(parts)
+            print(("[DQR]   MISS — %s (%s)"):format(
+                table.concat(parts, "."),
+                exists and "exists but hidden" or "does not exist"))
+            return false
+        end
+        ClickButton(o)
+        return true
     end
-    if not dunFired then
-        print("[DQR] Could not find " .. CONFIG.TargetDungeon .. " in the list.")
+
+    -- Step 0: the intro/title splash. This is a DIFFERENT Play button
+    -- (introGui.title.Frame.TextButton) from the lobby's
+    -- mainInterface.buttons.playButton — the flow has to pass both.
+    if PathVisible(UI.IntroPlay) then
+        Step(0, "Intro splash Play", UI.IntroPlay, 3)
+        local w = 0
+        repeat S(0.5) w = w + 0.5 until PathVisible(UI.LobbyPlay) or w > 15
+    end
+
+    -- Step 1: lobby Play -> opens the Join/Create chooser
+    if not Step(1, "Lobby Play", UI.LobbyPlay, 10) then
+        lobbyFlowActive = false
+        return
     end
     S(1.0)
 
-    -- Step 4: Difficulty
-    print("[DQR] Step 4: Difficulty " .. CONFIG.Difficulty)
-    FindAndFireBtn({
-        {text = CONFIG.Difficulty}, {name = CONFIG.Difficulty},
-    }, 5)
+    -- Step 2: "Create Dungeon" in the Join/Create chooser
+    if not Step(2, "Create Dungeon", UI.CreateGame, 8) then
+        lobbyFlowActive = false
+        return
+    end
+    S(1.0)
+
+    -- Step 3: pick the dungeon. Named frame, empty-text child button.
+    print("[DQR] Step 3: Select " .. CONFIG.TargetDungeon)
+    local db, w = DungeonBtn(CONFIG.TargetDungeon), 0
+    while not db and w < 8 do
+        S(0.4) w = w + 0.4
+        db = DungeonBtn(CONFIG.TargetDungeon)
+    end
+    if db then
+        ScrollIntoView(db)
+        ClickButton(db)
+    else
+        local list = Path(UI.DungeonList)
+        print("[DQR]   MISS — no row named '" .. CONFIG.TargetDungeon .. "'.")
+        if list then
+            local names = {}
+            for _, c in ipairs(list:GetChildren()) do names[#names+1] = c.Name end
+            print("[DQR]   Available: " .. table.concat(names, ", "))
+        end
+        lobbyFlowActive = false
+        return
+    end
     S(0.8)
 
-    -- Step 5: Create Lobby. Verified — we only call this done once the
-    -- button is actually gone from the screen.
+    -- Step 4: difficulty — same shape, frame named Easy/Medium/Hard/...
+    print("[DQR] Step 4: Difficulty " .. CONFIG.Difficulty)
+    local fb = DifficultyBtn(CONFIG.Difficulty)
+    if fb then
+        ClickButton(fb)
+    else
+        print("[DQR]   MISS — no difficulty frame named '"
+            .. CONFIG.Difficulty .. "'.")
+    end
+    S(0.8)
+
+    -- Step 5: Create Lobby — verified by the panel actually closing
     print("[DQR] Step 5: Create Lobby")
-    local made = FindAndFireBtn(CREATE_LOBBY_MATCHES, 8, function()
-        return AnyVisible(CREATE_LOBBY_MATCHES) == nil
-    end)
+    local made = false
+    for attempt = 1, 4 do
+        local cl = PathVisible(UI.CreateLobby)
+        if not cl then S(0.5) else
+            ClickButton(cl)
+            local t = 0
+            repeat S(0.3) t = t + 0.3
+            until not PathVisible(UI.ChoosePanel) or t > 2.5
+            if not PathVisible(UI.ChoosePanel) then made = true break end
+            print("[DQR]   attempt " .. attempt .. " did not close the panel.")
+        end
+    end
     if not made then
         print("[DQR] Create Lobby did not take. Press Copy and send the log.")
+        lobbyFlowActive = false
+        return
     end
-    S(1.8)
+    S(1.2)
 
-    -- Step 6: Start (party screen)
-    print("[DQR] Step 6: Start")
-    FindAndFireBtn({
-        {text = "start"},
-        {name = "start"},
-        {name = "startButton"},
-        {name = "Start"},
-    }, 8)
-    S(1.5)
-
-    -- Step 7: In-dungeon START
-    print("[DQR] Step 7: In-dungeon START")
-    FindAndFireBtn({
-        {text = "start"}, {name = "start"}, {name = "startbutton"},
-        {text = "ready"}, {text = "begin"},
-    }, 12)
+    -- Step 6: Start the run from the party screen
+    Step(6, "Start run", UI.StartRun, 10)
 
     print("[DQR] Lobby flow complete.")
     lobbyFlowActive = false
@@ -1280,6 +1361,18 @@ local function DungeonWatcher()
             end
         until InLobby() or w > 60
 
+        -- The game offers a Replay button at the end of a run. One click
+        -- beats redriving the whole six-step queue flow.
+        local replay = PathVisible(UI.Replay)
+        if replay and CONFIG.AutoRunDungeon then
+            print("[DQR] Replay Dungeon available — clicking it.")
+            ClickButton(replay)
+            local t = 0
+            repeat S(2) t = t + 2 until IsInDungeon() or t > 60
+            if IsInDungeon() then Farm.Start() end
+            continue
+        end
+
         if not Farm.Running and InLobby() and CONFIG.AutoRunDungeon then
             print("[DQR] Back in the lobby — queueing next run.")
             RunLobbyFlow()
@@ -1297,7 +1390,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v4.6 loaded.  F5 farm  F6 dump  F7 hide log")
+    print("[DQR] v4.7 loaded.  F5 farm  F6 dump  F7 hide log")
     NukeGraphics()
     S(2.5)
 
