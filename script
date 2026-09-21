@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v8.7
+--  DQR AUTO FARM v8.8
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log
@@ -65,7 +65,9 @@ local CONFIG = {
                              -- foot level, else it is floor decoration
     FootOffset     = 3,      -- studs from HumanoidRootPart down to feet
     RecentWindow   = 8,      -- a part this new counts as an attack
-    HazardDebug    = false,  -- log what the beam scanner reacts to
+    HazardDebug    = true,  -- log what the hazard scanner reacts to AND
+                             -- draw every footprint it sees as a red
+                             -- slab on the floor (F9 dumps the details)
 
     -- Ground telegraphs (the red strips a boss paints before it hits)
     DodgeTelegraph = true,
@@ -505,6 +507,20 @@ local recentParts = setmetatable({}, {__mode = "k"})  -- BasePart -> born
 local hiddenBeams = setmetatable({}, {__mode = "k"})  -- BasePart -> true
 local IsBeamShape, BeamShaped   -- assigned with the beam scanner far below
 
+-- Handle adornments. A LineHandleAdornment is drawn one pixel wide at
+-- any distance - which is exactly what the Ice Elemental's hairline
+-- telegraph spokes look like - and it is not a part, so no part query,
+-- raycast or Beam registry will ever see it. They can be parented
+-- anywhere (a LocalScript often puts them in PlayerGui or the Camera),
+-- so this listens on the whole DataModel, not just workspace.
+local adornObjects = setmetatable({}, {__mode = "k"})  -- adornment -> true
+
+local function IsAdorn(o)
+    return o:IsA("LineHandleAdornment")
+        or o:IsA("CylinderHandleAdornment")
+        or o:IsA("BoxHandleAdornment")
+end
+
 workspace.DescendantAdded:Connect(function(o)
     if o:IsA("Beam") then
         beamObjects[o] = true
@@ -523,9 +539,18 @@ workspace.DescendantRemoving:Connect(function(o)
     hiddenBeams[o] = nil
 end)
 
--- Beams that already existed before the script loaded. The wait is
--- needed: task.spawn runs its function immediately, before the rest of
--- this file - IsBeamShape included - has been defined.
+pcall(function()
+    game.DescendantAdded:Connect(function(o)
+        if IsAdorn(o) then adornObjects[o] = true end
+    end)
+    game.DescendantRemoving:Connect(function(o)
+        adornObjects[o] = nil
+    end)
+end)
+
+-- Beams and adornments that already existed before the script loaded.
+-- The wait is needed: task.spawn runs its function immediately, before
+-- the rest of this file - BeamShaped included - has been defined.
 task.spawn(function()
     S(1)
     for _, o in ipairs(workspace:GetDescendants()) do
@@ -534,7 +559,19 @@ task.spawn(function()
         elseif o:IsA("BasePart") and not o.CanQuery
         and BeamShaped and BeamShaped(o) then
             hiddenBeams[o] = true
+        elseif IsAdorn(o) then
+            adornObjects[o] = true
         end
+    end
+    for _, name in ipairs({"PlayerGui", "CoreGui"}) do
+        pcall(function()
+            local root = LP:FindFirstChildOfClass(name)
+                      or game:FindFirstChildOfClass(name)
+            if not root then return end
+            for _, o in ipairs(root:GetDescendants()) do
+                if IsAdorn(o) then adornObjects[o] = true end
+            end
+        end)
     end
 end)
 
@@ -569,9 +606,12 @@ end
 -- is a pooled effect just brought in from wherever it is parked. The
 -- beam and ring pools sit far under the map between casts, so there
 -- is no "parked" reading on record to compare against, and first
--- sight is the only chance to notice them. Anything solid is exempt:
--- a damage effect never blocks movement, floor decoration often does.
-function LooksActive(o, fresh)
+-- sight is the only chance to notice them. Anything solid is exempt
+-- unless the caller says otherwise (`solidOk`): a damage effect never
+-- blocks movement, floor decoration often does - but a line lying
+-- flush with the floor is walked over whether or not it collides, and
+-- nobody bothers to untick CanCollide on one.
+function LooksActive(o, fresh, solidOk)
     local now  = tick()
     local born = recentParts[o]
     local new  = born ~= nil and now - born < CONFIG.RecentWindow
@@ -584,7 +624,7 @@ function LooksActive(o, fresh)
     -- record never goes stale.
     if rec and now - rec.seen > 3 then rec = nil end
     if not rec then
-        local hit = new or (fresh == true and not o.CanCollide)
+        local hit = new or (fresh == true and (solidOk or not o.CanCollide))
         effectSeen[o] = {pos = o.Position, tr = o.Transparency,
                          size = PartSize(o), moved = hit and now or 0,
                          seen = now}
@@ -2576,7 +2616,7 @@ local function IsTelegraph(o, pos, radius)
     -- moved into place mid-fight.
     local fresh = sweepFresh and pos ~= nil
                   and NearDist(o, pos) < radius * 0.6
-    return LooksActive(o, fresh)
+    return LooksActive(o, fresh, true)   -- flat: solid or not, it is walked over
 end
 
 -- ============================================================
@@ -2789,7 +2829,7 @@ end
 local function CollectBeams(pos)
     if not CONFIG.DodgeBeams then return end
     local now   = tick()
-    local reach = CONFIG.DodgeRange * 2
+    local reach = CONFIG.DodgeRange
 
     -- 1. Every Beam object in the world, from the live registry.
     --
@@ -2836,18 +2876,31 @@ local function CollectBeams(pos)
     --        shape and never moves.
     --    The activity test runs before the visibility one so a parked,
     --    invisible spoke is on record when it fades in.
+    local done = {}
     local function Consider(o)
-        if not BeamShaped(o) or PlayerOwned(o) then return end
+        if done[o] or not BeamShaped(o) or PlayerOwned(o) then return end
+        done[o] = true
         -- Scenery enters the scan at its edge as we walk; a part first
-        -- seen well inside it appeared there.
+        -- seen well inside it appeared there. A flat one counts even if
+        -- it collides: a line flush with the floor is walked over.
         local fresh  = sweepFresh and NearDist(o, pos) < reach * 0.6
-        local active = LooksActive(o, fresh)
+        local flat   = (Footprint(o)) <= CONFIG.TelegraphMaxY
+        local active = LooksActive(o, fresh, flat)
         if recentParts[o] then return end           -- noted above already
         if o.Transparency > 0.9 then return end     -- parked, not firing
         if active or (IsBeamShape(o) and AtBodyHeight(o)) then
             NoteBeamPart(o)
         end
     end
+    -- The broadphase query is CAPPED at MaxQueryParts and truncates
+    -- arbitrarily past that - not by distance - so in a busy arena a
+    -- spoke under our feet could simply be missing from the wide query
+    -- while a pillar 70 studs off was included. A small query first
+    -- cannot overflow, so anything actually touching us is guaranteed.
+    -- The wide one is as far as we plan escapes; a long spoke is
+    -- returned by either as long as any part of it is inside, since
+    -- the query is against bounds, not centres.
+    for _, o in ipairs(NearbyParts(pos, 10)) do Consider(o) end
     for _, o in ipairs(NearbyParts(pos, reach)) do Consider(o) end
     for o in pairs(hiddenBeams) do
         if not o.Parent then
@@ -2855,6 +2908,54 @@ local function CollectBeams(pos)
         elseif NearDist(o, pos) < reach then
             Consider(o)
         end
+    end
+
+    -- 4. Handle adornments - drawn, not built, so nothing above can see
+    --    them. World placement is the adornee's frame times the
+    --    adornment's own. A line runs from its origin along its
+    --    LookVector for Length studs (CFrame.new(from, to) plus
+    --    Length = distance is the idiom everyone uses to draw one); a
+    --    cylinder is centred, along the same axis; a box is a box.
+    for ad in pairs(adornObjects) do
+        pcall(function()
+            local adornee = ad.Adornee
+            if not ad.Parent or not ad.Visible or not adornee
+            or ad.Transparency > 0.9 then return end
+            local acf = adornee:IsA("Model") and adornee:GetPivot()
+                     or adornee.CFrame
+            local cf = acf * ad.CFrame
+            local a, b, r
+            if ad:IsA("LineHandleAdornment") then
+                a = cf.Position
+                b = cf.Position + cf.LookVector * ad.Length
+                r = CONFIG.BeamPad
+            elseif ad:IsA("CylinderHandleAdornment") then
+                local h = ad.Height / 2
+                a = cf.Position - cf.LookVector * h
+                b = cf.Position + cf.LookVector * h
+                r = ad.Radius + CONFIG.BeamPad
+            else
+                local s = ad.Size
+                local axis, half, thin
+                if s.X >= s.Y and s.X >= s.Z then
+                    axis, half = cf.RightVector, s.X / 2
+                elseif s.Y >= s.X and s.Y >= s.Z then
+                    axis, half = cf.UpVector, s.Y / 2
+                else
+                    axis, half = cf.LookVector, s.Z / 2
+                end
+                thin = math.min(s.X, s.Y, s.Z)
+                if half * 2 < CONFIG.BeamMinLen
+                or thin > CONFIG.BeamMaxThick then return end
+                a = cf.Position - axis * half
+                b = cf.Position + axis * half
+                r = thin / 2 + CONFIG.BeamPad
+            end
+            if (b - a).Magnitude >= CONFIG.BeamMinLen
+            and SegDistFlat(pos, a, b) < reach then
+                NoteLine(a, b, r)
+            end
+        end)
     end
 end
 
@@ -2971,6 +3072,58 @@ local function FindEscape(pos, mobPos, keepWithin, outward)
     return nil
 end
 
+-- HazardDebug only: draws every footprint from the last sweep as a red
+-- slab on the floor, so what the bot thinks is dangerous can be held
+-- up against what is actually on screen. Named DQR_ so the scanners
+-- ignore them; CanQuery off so no query or raycast sees them.
+local drawPool = {}
+local function DrawHazards(pos)
+    local y = pos.Y - CONFIG.FootOffset + 0.4
+    local n = 0
+    for _, h in ipairs(hazardShapes) do
+        if n >= 40 then break end
+        n = n + 1
+        local p = drawPool[n]
+        if not p or not p.Parent then
+            p = Instance.new("Part")
+            p.Name         = "DQR_Hz"
+            p.Anchored     = true
+            p.CanCollide   = false
+            p.CanQuery     = false
+            p.CanTouch     = false
+            p.CastShadow   = false
+            p.Material     = Enum.Material.Neon
+            p.Color        = Color3.fromRGB(255, 60, 60)
+            p.Transparency = 0.45
+            p.Parent       = workspace
+            drawPool[n] = p
+        end
+        if h.kind == "line" then
+            local a = Vector3.new(h.a.X, y, h.a.Z)
+            local b = Vector3.new(h.b.X, y, h.b.Z)
+            local d = (b - a).Magnitude
+            if d > 0.1 then
+                p.Size   = Vector3.new(h.r * 2, 0.3, d)
+                p.CFrame = CFrame.lookAt((a + b) / 2, b)
+            end
+        elseif h.kind == "disc" then
+            p.Size   = Vector3.new(h.r * 2, 0.3, h.r * 2)
+            p.CFrame = CFrame.new(h.x, y, h.z)
+        else
+            local c = h.cf.Position
+            p.Size   = Vector3.new(h.hx * 2, 0.3, h.hz * 2)
+            p.CFrame = CFrame.new(c.X, y, c.Z) * (h.cf - h.cf.Position)
+        end
+    end
+    -- Park the rest out of sight rather than churn instances.
+    for i = n + 1, #drawPool do
+        local p = drawPool[i]
+        if p and p.Parent and p.Position.Y > -400 then
+            p.CFrame = CFrame.new(0, -500, 0)
+        end
+    end
+end
+
 -- One call for every "get out of the way" test. Cached: two 20Hz
 -- threads poll this, and re-running the scans 40 times a second was a
 -- large part of the in-combat lag.
@@ -3007,6 +3160,7 @@ function ScanHazards()
     table.clear(hazardShapes)
     CollectTelegraphs(pos)
     CollectBeams(pos)
+    if CONFIG.HazardDebug then pcall(DrawHazards, pos) end
 
     local esc = nil
     if #hazardShapes > 0 and HazardAt(pos) then
@@ -3106,6 +3260,33 @@ function HazardDiag()
         end
     end
     print(("[DQR] %d Beam object(s) within %d studs."):format(n, reach))
+
+    n = 0
+    for ad in pairs(adornObjects) do
+        pcall(function()
+            local adornee = ad.Adornee
+            if not ad.Parent or not adornee then return end
+            local acf = adornee:IsA("Model") and adornee:GetPivot()
+                     or adornee.CFrame
+            local cf = acf * ad.CFrame
+            local len = ad:IsA("LineHandleAdornment") and ad.Length
+                     or ad:IsA("CylinderHandleAdornment") and ad.Height
+                     or ad.Size.Magnitude
+            local a = cf.Position
+            local b = cf.Position + cf.LookVector * len
+            local near = math.min(SegDistFlat(pos, a, b),
+                                  (a - pos).Magnitude)
+            if near < reach then
+                n = n + 1
+                print(("[Adorn] %s | %s | adornee=%s visible=%s tr=%.2f len=%d from=%s look=%s near=%d")
+                    :format(ad:GetFullName(), ad.ClassName,
+                            adornee:GetFullName(), tostring(ad.Visible),
+                            ad.Transparency, len, tostring(a),
+                            tostring(cf.LookVector), near))
+            end
+        end)
+    end
+    print(("[DQR] %d handle adornment(s) within %d studs."):format(n, reach))
 
     -- Beam-shaped parts that were here before we were: pooled effects,
     -- and the scenery that looks like one. Full walk - it is a keypress.
