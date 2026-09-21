@@ -1,12 +1,12 @@
 -- ============================================================
---  DQR AUTO FARM v5.2
+--  DQR AUTO FARM v5.3
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
 
 local CONFIG = {
     TargetDungeon  = "Desert Temple",
-    Difficulty     = "Hard",
+    Difficulty     = "Medium",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
     UseRemotes     = false,  -- blind-firing guessed remotes; off by default
@@ -19,7 +19,7 @@ local CONFIG = {
     -- orbits from the mob, so it IS the fighting distance. It has to
     -- sit inside MeleeRange or the left-click swing never fires.
     -- Lower CircleRadius to hug the mob, raise it to keep away.
-    CircleRadius   = 8,      -- <-- orbit distance = fighting distance
+    CircleRadius   = 10,      -- <-- orbit distance = fighting distance
     MeleeRange     = 9,      -- swing left click when closer than this
     MinRange       = 4,      -- ease out if closer than this
     MaxRange       = 14,     -- close in if farther than this
@@ -30,7 +30,21 @@ local CONFIG = {
     DodgeStep      = 18,
     AttackRate     = 0.3,    -- spell cast rate
     MeleeRate      = 0.2,    -- melee swing rate
-    WalkSpeed      = 0,      -- 0 = keep the character's own speed
+
+    -- Walk speed: SetWalkSpeed=false leaves whatever the game gives you
+    SetWalkSpeed   = true,
+    WalkSpeed      = 19,
+
+    -- Ground telegraphs (the red strips a boss paints before it hits)
+    DodgeTelegraph = true,
+    TelegraphPad   = 4,      -- treat this much beyond the edge as unsafe
+    TelegraphMinLen= 6,      -- ignore red parts smaller than this
+    TelegraphMaxY  = 2,      -- ...and anything taller than this (props)
+
+    -- Stand and fight when the mob is not moving
+    HoldWhenStill  = true,
+    MobStillTime   = 1.0,    -- mob still for this long...
+    MobMoveEps     = 1.5,    -- ...meaning it moved less than this
     CircleSpeed    = 0.85,
     ScanRate       = 0.05,
     AimCamera      = true,   -- point the camera at the mob (DQR aims from camera)
@@ -409,8 +423,15 @@ local function PathWorker(getDestFn)
     task.spawn(function()
         while moveConn do
             S(0.4)
-            local root = GetRoot()
-            local dest = getDestFn()
+            local root  = GetRoot()
+            local human = GetHuman()
+            local dest  = getDestFn()
+            -- No pathing while dead: ComputeAsync against a corpse or a
+            -- half-loaded respawn is what produces the stuck glitches.
+            if human and human.Health <= 0 then
+                ClearPath()
+                dest = nil
+            end
             if root and dest then
                 local flat = (Vector3.new(dest.X, 0, dest.Z)
                             - Vector3.new(root.Position.X, 0, root.Position.Z)).Magnitude
@@ -534,8 +555,7 @@ local function StartMoving(getDestFn)
         -- AutoRotate re-orients the character from its own move direction
         -- every frame and would overwrite our facing.
         pcall(function() h0.AutoRotate = false end)
-        -- 0 = leave the character's own speed alone (gear/buffs apply)
-        if CONFIG.WalkSpeed > 0 then
+        if CONFIG.SetWalkSpeed then
             pcall(function() h0.WalkSpeed = CONFIG.WalkSpeed end)
         end
         pcall(function()
@@ -548,7 +568,19 @@ local function StartMoving(getDestFn)
         local root  = GetRoot()
         local human = GetHuman()
         if not root or not human then return end
+
+        -- Dead: drop everything. A stale path plus a ragdolling or
+        -- respawning character is where the movement glitches come from.
+        if human.Health <= 0 then
+            if #pathQueue > 0 then ClearPath() end
+            stuckAt, commandSince = nil, 0
+            return
+        end
+
         if human.AutoRotate then human.AutoRotate = false end
+        if CONFIG.SetWalkSpeed and human.WalkSpeed ~= CONFIG.WalkSpeed then
+            human.WalkSpeed = CONFIG.WalkSpeed
+        end
 
         local pos  = root.Position
         local dest = getDestFn()
@@ -1503,11 +1535,79 @@ local function ScanThreats()
 end
 
 -- ============================================================
+--  GROUND TELEGRAPHS
+--  The red strips a boss paints on the floor before it strikes are
+--  ANCHORED and STATIONARY, so ScanThreats above - which only reacts
+--  to parts moving at you faster than 8 studs/s - is blind to them.
+--  These need a different test: am I standing inside the rectangle?
+--  If so, leave across its NARROW axis, which is the shortest way out.
+-- ============================================================
+local function IsTelegraph(o)
+    if not o:IsA("BasePart") then return false end
+    if o.Transparency > 0.9 then return false end
+    local s = o.Size
+    if s.Y > CONFIG.TelegraphMaxY then return false end          -- a prop
+    if math.max(s.X, s.Z) < CONFIG.TelegraphMinLen then return false end
+    local c = o.Color
+    return c.R > 0.55 and c.G < 0.45 and c.B < 0.45              -- red-ish
+end
+
+-- Returns a world position to run to, or nil when we are standing clear.
+local function ScanTelegraphs()
+    if not CONFIG.DodgeTelegraph then return nil end
+    local root = GetRoot()
+    if not root then return nil end
+    local char = GetChar()
+    local pos  = root.Position
+
+    local worstDepth, escape = 0, nil
+
+    for _, o in ipairs(workspace:GetDescendants()) do
+        if IsTelegraph(o) and (not char or not o:IsDescendantOf(char)) then
+            if (o.Position - pos).Magnitude < CONFIG.DodgeRange then
+                -- Where do we stand in the strip's own axes?
+                local rel = o.CFrame:PointToObjectSpace(pos)
+                local hx  = o.Size.X / 2 + CONFIG.TelegraphPad
+                local hz  = o.Size.Z / 2 + CONFIG.TelegraphPad
+                if math.abs(rel.X) < hx and math.abs(rel.Z) < hz
+                and math.abs(rel.Y) < 14 then
+                    local outX = hx - math.abs(rel.X)  -- cost to leave sideways
+                    local outZ = hz - math.abs(rel.Z)  -- cost to leave endwise
+                    local depth = math.min(outX, outZ)
+                    if depth > worstDepth then
+                        worstDepth = depth
+                        local axis, sign
+                        if outX <= outZ then
+                            axis = o.CFrame:VectorToWorldSpace(Vector3.new(1, 0, 0))
+                            sign = rel.X >= 0 and 1 or -1
+                        else
+                            axis = o.CFrame:VectorToWorldSpace(Vector3.new(0, 0, 1))
+                            sign = rel.Z >= 0 and 1 or -1
+                        end
+                        local d = Vector3.new(axis.X, 0, axis.Z) * sign
+                        if d.Magnitude > 0.01 then
+                            escape = pos + d.Unit * (depth + 4)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return escape
+end
+
+-- ============================================================
 --  CIRCULAR ORBIT
 -- ============================================================
 local orbitAngle = 0
 local seeded     = false
 local lastDodge  = 0
+local lastTeleWarn = 0
+
+-- Tracks how long the current target has held position
+local stillModel = nil
+local stillPos   = Vector3.zero
+local stillSince = 0
 
 local function SeedOrbit(mobPos)
     local root = GetRoot()
@@ -1598,6 +1698,20 @@ local function MainLoop()
         -- Seed orbit on new target
         if not seeded then SeedOrbit(mobPos) end
 
+        -- Standing in a telegraphed strip beats every other movement:
+        -- there is no point orbiting prettily inside the damage zone.
+        local escape = ScanTelegraphs()
+        if escape then
+            currentDest = Vector3.new(escape.X, root.Position.Y, escape.Z)
+            ShowRangeBar(root, mobPos, dist)
+            if now - lastTeleWarn > 2 then
+                lastTeleWarn = now
+                print("[DQR] Standing in a telegraph - moving clear.")
+            end
+            S(CONFIG.ScanRate)
+            continue
+        end
+
         -- Dodge - highest movement priority
         local threatened, tOrigin = ScanThreats()
         if threatened and (now - lastDodge) > CONFIG.DodgeCooldown then
@@ -1611,6 +1725,25 @@ local function MainLoop()
             currentDest = Vector3.new(dodge.X, root.Position.Y, dodge.Z)
             ShowRangeBar(root, mobPos, dist)
             orbitAngle = orbitAngle + sign * 0.5
+            S(CONFIG.ScanRate)
+            continue
+        end
+
+        -- Mob not moving and we are already in range? Stop shuffling and
+        -- just hit it. Orbiting a stationary target only costs uptime.
+        if target.Model == stillModel then
+            if (mobPos - stillPos).Magnitude > CONFIG.MobMoveEps then
+                stillPos, stillSince = mobPos, now
+            end
+        else
+            stillModel, stillPos, stillSince = target.Model, mobPos, now
+        end
+
+        if CONFIG.HoldWhenStill
+        and (now - stillSince) > CONFIG.MobStillTime
+        and dist <= CONFIG.MaxRange then
+            currentDest = nil          -- stand still, keep attacking
+            ShowRangeBar(root, mobPos, dist)
             S(CONFIG.ScanRate)
             continue
         end
@@ -1652,8 +1785,21 @@ local function DodgeWatcher()
     local lastDW = 0
     while Farm.Running do
         S(0.05)
-        local root = GetRoot()
+        local root  = GetRoot()
+        local human = GetHuman()
         if not root then continue end
+        if human and human.Health <= 0 then
+            currentDest = nil
+            continue
+        end
+
+        -- Telegraphs first: standing in one is already damage incoming.
+        local esc = ScanTelegraphs()
+        if esc then
+            currentDest = Vector3.new(esc.X, root.Position.Y, esc.Z)
+            continue
+        end
+
         local ok, origin = ScanThreats()
         local now = tick()
         if ok and (now - lastDW) > CONFIG.DodgeCooldown then
@@ -1783,7 +1929,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v5.2 loaded.  F5 farm  F6 dump  F7 show/hide log")
+    print("[DQR] v5.3 loaded.  F5 farm  F6 dump  F7 show/hide log")
     NukeGraphics()
     S(2.5)
 
