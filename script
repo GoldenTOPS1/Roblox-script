@@ -1,15 +1,16 @@
 -- ============================================================
---  DQR AUTO FARM v5.0
+--  DQR AUTO FARM v5.1
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
 
 local CONFIG = {
     TargetDungeon  = "Desert Temple",
-    Difficulty     = "Medium",
+    Difficulty     = "Easy",
     AutoRunDungeon = true,
     UseRemotes     = false,  -- blind-firing guessed remotes; off by default
     DebugGui       = false,  -- full button dump on every queue (F6 does it too)
+    ShowLog        = false,  -- log window starts hidden; F7 shows it
     LowerGraphics  = true,
 
     -- ---- ENGAGEMENT DISTANCE -------------------------------
@@ -131,6 +132,9 @@ local function BuildLogGui()
     gui.IgnoreGuiInset   = true
     gui.DisplayOrder     = 9999
     gui.ZIndexBehavior   = Enum.ZIndexBehavior.Sibling
+    -- Hidden by default: the window sat over the game's UI and had to be
+    -- dragged aside before the script could click anything behind it.
+    gui.Enabled          = CONFIG.ShowLog and true or false
     gui.Parent           = parent
     LogGui = gui
 
@@ -447,8 +451,16 @@ end
 --  no jump either, because the same module owns the jump state.
 --  Disabling the control module hands movement back to us.
 -- ============================================================
+--  ...and it does not stay disabled. Roblox's ControlModule listens for
+--  UserInputService.LastInputTypeChanged and, when the input type
+--  changes, swaps in a different controller and ENABLES it again. On a
+--  phone or an Android emulator a tap is Touch input, so one click
+--  while the bot is running re-enables the module, it resumes zeroing
+--  Humanoid:Move, and the character freezes for good. So the disable
+--  has to be re-asserted, not set once.
 local Controls     = nil
 local controlsOff  = false
+local wantDisabled = false
 
 local function SetDefaultControls(enabled)
     pcall(function()
@@ -463,6 +475,30 @@ local function SetDefaultControls(enabled)
         controlsOff = not enabled
     end)
 end
+
+local function ReassertControls()
+    if not wantDisabled then return end
+    -- Character respawn builds a new PlayerModule, so re-fetch it.
+    local pm = LP:FindFirstChild("PlayerScripts")
+    pm = pm and pm:FindFirstChild("PlayerModule")
+    if not pm then Controls = nil end
+    SetDefaultControls(false)
+end
+
+-- Any input-type change is the module's cue to re-enable itself.
+UserInputService.LastInputTypeChanged:Connect(function()
+    if wantDisabled then
+        task.defer(ReassertControls)
+    end
+end)
+
+-- Belt and braces: a slow ticker in case something else re-enables it.
+task.spawn(function()
+    while true do
+        S(0.5)
+        if wantDisabled then ReassertControls() end
+    end
+end)
 
 -- One-line snapshot of everything that can stop a humanoid moving.
 local function Diag()
@@ -489,6 +525,7 @@ local function StartMoving(getDestFn)
     stuckAt, stuckSince = nil, 0
     moveMode, commandSince, diagCount = "humanoid", 0, 0
 
+    wantDisabled = true
     SetDefaultControls(false)
 
     local h0 = GetHuman()
@@ -553,11 +590,20 @@ local function StartMoving(getDestFn)
                 -- so the walk animation keeps playing.
                 if tick() - commandSince > 1
                 and human.MoveDirection.Magnitude < 0.1 then
+                    -- Most likely the control module woke back up.
+                    ReassertControls()
                     moveMode = "velocity"
                     print("[DQR] Humanoid:Move is being overridden - "
                         .. "switching to velocity mode. " .. Diag())
                 end
             else
+                -- Recover: if the humanoid is responding again, go back
+                -- to real walking (better collision and animation).
+                if human.MoveDirection.Magnitude > 0.1 then
+                    moveMode     = "humanoid"
+                    commandSince = tick()
+                    print("[DQR] Humanoid responding again - back to walk mode.")
+                end
                 local spd = human.WalkSpeed > 0 and human.WalkSpeed or 16
                 local v   = root.AssemblyLinearVelocity
                 root.AssemblyLinearVelocity =
@@ -643,6 +689,7 @@ local function StopMoving()
     local hm = GetHuman()
     if hm then pcall(function() hm:Move(Vector3.zero, false) end) end
     -- Hand the controls back so you can move the character yourself.
+    wantDisabled = false
     SetDefaultControls(true)
     local h = GetHuman()
     if h then pcall(function() h.AutoRotate = true end) end
@@ -883,6 +930,10 @@ local function ClickButton(btn)
     -- on the frame, TouchTap...), not just MouseButton1Click.
     if VisibleOnScreen(btn) then
         local x, y = ScreenPointOf(btn)
+        -- The log window would swallow a click landing underneath it.
+        -- Blink it off for the duration rather than making you drag it.
+        local wasOpen = LogGui and LogGui.Enabled
+        if wasOpen then LogGui.Enabled = false end
         local ok = pcall(function()
             VIM:SendMouseMoveEvent(x, y, game)
             S(0.08)
@@ -890,6 +941,7 @@ local function ClickButton(btn)
             S(0.08)
             VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
         end)
+        if wasOpen then LogGui.Enabled = true end
         print(("[DQR]   click @ %d,%d ok=%s"):format(x, y, tostring(ok)))
         if ok then return true end
     end
@@ -1707,7 +1759,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v5.0 loaded.  F5 farm  F6 dump  F7 hide log")
+    print("[DQR] v5.1 loaded.  F5 farm  F6 dump  F7 show/hide log")
     NukeGraphics()
     S(2.5)
 
