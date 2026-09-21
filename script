@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v7.9
+--  DQR AUTO FARM v8.0
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -1667,6 +1667,9 @@ local UI = {
     CreateLobby = {"queueGui", "chooseDungeon", "backgroundFillMiddle",
                    "startMain", "TextButton"},
     LobbyInfo   = {"queueGui", "lobbyInfo"},
+    -- HUD corner buttons that the lobby shows and a dungeon does not.
+    ShowFriends = {"friendsList", "buttonMain", "TextButton"},
+    ShowPlayers = {"leaderboard", "buttonMain", "TextButton"},
     StartRun    = {"queueGui", "lobbyInfo", "startBackground", "startFrame",
                    "startButton"},
     Replay      = {"ReplayDungeonButton", "Replay"},
@@ -1718,34 +1721,37 @@ local function ScrollIntoView(btn)
     end
 end
 
--- In the lobby exactly when the lobby's own UI is on screen. All of
--- these belong to the lobby place and are gone inside a dungeon.
-local function InLobby()
-    return PathVisible(UI.LobbyPlay)   ~= nil
-        or PathVisible(UI.IntroPlay)   ~= nil
-        or PathVisible(UI.SelectPanel) ~= nil
-        or PathVisible(UI.ChoosePanel) ~= nil
-        or PathVisible(UI.LobbyInfo)   ~= nil
-        -- The end-of-run screen. When a dungeon is failed you land back
-        -- in the lobby with this showing and the normal lobby buttons
-        -- hidden behind it - which used to read as "not the lobby", so
-        -- the script sat there believing it was still in the dungeon.
-        or PathVisible(UI.Replay)      ~= nil
+-- Lobby vs dungeon, by what is ON SCREEN.
+--
+-- An earlier version tested whether queueGui / mainInterface EXISTED,
+-- on the assumption that the dungeon was a separate place with its own
+-- GUIs. It is not: the log showed "Lobby place: true" inside a dungeon
+-- with playButton "exists but hidden". Both GUIs are present
+-- everywhere, so existence proves nothing and only visibility counts.
+--
+-- Which marker to watch matters too. Cosmetics, Inventory, Player Stats
+-- and Hide UI are on screen in BOTH. These four are lobby-only:
+--   the Play button, Show Friends, Show Players, and the queue panels.
+local LOBBY_MARKERS = {
+    "LobbyPlay", "IntroPlay", "SelectPanel", "ChoosePanel",
+    "LobbyInfo", "Replay", "ShowFriends", "ShowPlayers",
+}
+
+local function LobbyMarker()
+    for _, k in ipairs(LOBBY_MARKERS) do
+        if PathVisible(UI[k]) then return k end
+    end
+    return nil
 end
 
--- Are we in the LOBBY PLACE at all, regardless of what is on screen?
---
--- queueGui is the lobby's dungeon-queue interface: it exists in the
--- lobby and nowhere else. Testing for its existence (not its
--- visibility) survives any popup covering the lobby - a rewards screen
--- after finishing a run, say - which is what made the script decide it
--- was still in a dungeon and go attack the lobby NPCs.
 local function InLobbyPlace()
-    local pg = LP:FindFirstChildOfClass("PlayerGui")
-    if not pg then return false end
-    return pg:FindFirstChild("queueGui") ~= nil
-        or Path(UI.LobbyPlay) ~= nil
+    return LobbyMarker() ~= nil
 end
+
+-- One definition of "lobby", used everywhere. Keeping two slightly
+-- different ones is what let the script believe it was in the lobby and
+-- in a dungeon at the same time.
+local InLobby = InLobbyPlace
 
 local lobbyFlowActive = false
 
@@ -2718,7 +2724,8 @@ local function MainLoop()
             StopFacing()
             if now - lastLobbyWarn > 5 then
                 lastLobbyWarn = now
-                print("[DQR] In the lobby - not farming. Stopping.")
+                print("[DQR] In the lobby (" .. tostring(LobbyMarker())
+                    .. ") - not farming. Stopping.")
             end
             Farm.Running = false
             S(0.5)
@@ -3125,7 +3132,8 @@ end
 function Farm.Start()
     if Farm.Running then return end
     if InLobbyPlace() then
-        print("[DQR] Refusing to farm - this is the lobby.")
+        print("[DQR] Refusing to farm - lobby marker '"
+            .. tostring(LobbyMarker()) .. "' is on screen.")
         return
     end
     Farm.Running     = true
@@ -3324,13 +3332,12 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v7.9 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
+    print("[DQR] v8.0 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
 
-    print("[DQR] Lobby place: " .. tostring(InLobbyPlace())
-        .. "  lobby UI visible: " .. tostring(InLobby()))
+    print("[DQR] Lobby marker: " .. tostring(LobbyMarker() or "none"))
 
     if not InLobbyPlace() then
         -- Not the lobby place: we are already in a run (or loading).
