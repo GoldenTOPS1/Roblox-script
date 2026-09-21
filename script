@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v7.7
+--  DQR AUTO FARM v7.8
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log (F5 farm / F6 dump / F7 log)
 -- ============================================================
@@ -1704,10 +1704,18 @@ local function InLobby()
         or PathVisible(UI.Replay)      ~= nil
 end
 
--- Do the lobby's GUIs exist at all, visible or not? Survives popups
--- covering the whole lobby interface.
+-- Are we in the LOBBY PLACE at all, regardless of what is on screen?
+--
+-- queueGui is the lobby's dungeon-queue interface: it exists in the
+-- lobby and nowhere else. Testing for its existence (not its
+-- visibility) survives any popup covering the lobby - a rewards screen
+-- after finishing a run, say - which is what made the script decide it
+-- was still in a dungeon and go attack the lobby NPCs.
 local function InLobbyPlace()
-    return Path(UI.LobbyPlay) ~= nil or Path(UI.ChoosePanel) ~= nil
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    if not pg then return false end
+    return pg:FindFirstChild("queueGui") ~= nil
+        or Path(UI.LobbyPlay) ~= nil
 end
 
 local lobbyFlowActive = false
@@ -1715,8 +1723,12 @@ local lobbyFlowActive = false
 local function RunLobbyFlow()
     if not CONFIG.AutoRunDungeon then return end
 
-    -- Hard guard: never queue a dungeon unless the lobby is actually up.
-    if not InLobby() then
+    -- Guard on the PLACE, not on what happens to be visible. After
+    -- finishing a run the lobby's buttons can be hidden behind a
+    -- rewards popup, and requiring them to be on screen meant the
+    -- script refused to queue and sat there instead. Step 1 already
+    -- waits for the Play button to appear, which covers the popup.
+    if not InLobbyPlace() then
         print("[DQR] Not in the lobby - refusing to queue a dungeon.")
         return
     end
@@ -2547,6 +2559,7 @@ local retreating   = false
 local lastStartCheck = 0
 local startVisible = false
 local lastNoTarget = 0
+local lastLobbyWarn = 0
 
 -- Tracks how long the current target has held position
 local stillModel = nil
@@ -2662,6 +2675,22 @@ local function MainLoop()
             currentDest = nil
             ClearRangeBar()
             StopFacing()
+            S(0.5)
+            continue
+        end
+
+        -- Never fight in the lobby. Its NPCs have humanoids and name
+        -- tags, so they pass every mob test - the only thing that tells
+        -- them apart from real enemies is that we are in the lobby.
+        if InLobbyPlace() then
+            currentDest = nil
+            ClearRangeBar()
+            StopFacing()
+            if now - lastLobbyWarn > 5 then
+                lastLobbyWarn = now
+                print("[DQR] In the lobby - not farming. Stopping.")
+            end
+            Farm.Running = false
             S(0.5)
             continue
         end
@@ -3051,6 +3080,10 @@ end
 
 function Farm.Start()
     if Farm.Running then return end
+    if InLobbyPlace() then
+        print("[DQR] Refusing to farm - this is the lobby.")
+        return
+    end
     Farm.Running     = true
     loopBeat         = tick()
     Farm.Thread      = task.spawn(Guarded("Main loop", MainLoop))
@@ -3120,8 +3153,8 @@ local function DungeonWatcher()
         -- Require mobs to be gone as well. A lobby-only GUI reading as
         -- visible mid-run (the Replay button, say) would otherwise stop
         -- the farm while there was still a room full of things to kill.
-        if InLobby() and not MobsPresent() then
-            print("[DQR] Lobby is up and no mobs - run over, stopping farm.")
+        if InLobbyPlace() then
+            print("[DQR] Back in the lobby - run over, stopping farm.")
             Farm.Stop()
             quiet = 0
             continue
@@ -3167,48 +3200,39 @@ local function Supervisor()
             continue
         end
 
-        -- End-of-run screen: one click beats redriving the queue flow.
-        local replay = PathVisible(UI.Replay)
-        if replay and CONFIG.AutoRunDungeon then
-            print("[DQR] Replay Dungeon available - clicking it.")
-            ClickButton(replay)
+        -- WHERE we are decides what to do, not what is on screen and not
+        -- whether anything nearby happens to have a humanoid. The old
+        -- order ended with "not InLobbyPlace() OR MobsPresent() -> farm",
+        -- so standing in the lobby next to its NPCs started the farm and
+        -- the bot went and attacked them.
+        if InLobbyPlace() then
+            if not CONFIG.AutoRunDungeon then continue end
+
+            -- End-of-run screen: one click beats redriving the flow.
+            local replay = PathVisible(UI.Replay)
+            if replay then
+                print("[DQR] Replay Dungeon available - clicking it.")
+                ClickButton(replay)
+                local t = 0
+                repeat S(2) t = t + 2 until IsInDungeon() or t > 60
+                if IsInDungeon() then Farm.Start() end
+                idleSince, reported = tick(), false
+                continue
+            end
+
+            print("[DQR] Idle in the lobby - queueing a run.")
+            RunLobbyFlow()
             local t = 0
-            repeat S(2) t = t + 2 until IsInDungeon() or t > 60
+            repeat S(2) t = t + 2 until IsInDungeon() or t > 90
             if IsInDungeon() then Farm.Start() end
             idleSince, reported = tick(), false
             continue
         end
 
-        if InLobby() then
-            if CONFIG.AutoRunDungeon then
-                print("[DQR] Idle in the lobby - queueing a run.")
-                RunLobbyFlow()
-                local t = 0
-                repeat S(2) t = t + 2 until IsInDungeon() or t > 90
-                if IsInDungeon() then Farm.Start() end
-                idleSince, reported = tick(), false
-            end
-            continue
-        end
-
-        -- Not the lobby and not farming: we are somewhere worth fighting.
-        if not InLobbyPlace() or MobsPresent() then
-            print("[DQR] Idle outside the lobby - resuming farm.")
-            Farm.Start()
-            idleSince, reported = tick(), false
-            continue
-        end
-
-        -- In the lobby place, but no lobby UI we recognise. Say so once,
-        -- with the evidence, rather than sitting silent.
-        if tick() - idleSince > 20 and not reported then
-            reported = true
-            print(("[DQR] Idle and unsure. InLobby=%s InLobbyPlace=%s mobs=%s")
-                :format(tostring(InLobby()), tostring(InLobbyPlace()),
-                        tostring(MobsPresent())))
-            print("[DQR] Dumping buttons so this state can be identified.")
-            DumpGui()
-        end
+        -- Not the lobby: this is a dungeon, so fight.
+        print("[DQR] Idle outside the lobby - resuming farm.")
+        Farm.Start()
+        idleSince, reported = tick(), false
     end
 end
 
@@ -3256,15 +3280,17 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v7.7 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
+    print("[DQR] v7.8 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
 
-    if not InLobby() then
-        -- Not at the main screen: we are already in a run (or loading).
-        -- Never queue from here.
-        print("[DQR] Lobby UI not present - assuming already in a dungeon.")
+    print("[DQR] Lobby place: " .. tostring(InLobbyPlace())
+        .. "  lobby UI visible: " .. tostring(InLobby()))
+
+    if not InLobbyPlace() then
+        -- Not the lobby place: we are already in a run (or loading).
+        print("[DQR] Not the lobby - assuming already in a dungeon.")
         Farm.Start()
     elseif CONFIG.AutoRunDungeon then
         RunLobbyFlow()
