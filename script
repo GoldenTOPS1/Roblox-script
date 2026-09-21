@@ -9,11 +9,12 @@ local CONFIG = {
     Difficulty     = "Easy",
     AutoRunDungeon = true,
     UseRemotes     = false,  -- blind-firing guessed remotes; off by default
+    DebugGui       = true,   -- dump every GUI button when the flow starts
     LowerGraphics  = true,
 
     MeleeRange     = 8,      -- swing left click when closer than this
     AttackRange    = 25,     -- cast spells when closer than this
-    MinRange       = 10,     -- back off if closer than this
+    MinRange       = 8,     -- back off if closer than this
     MaxRange       = 28,     -- close in if farther than this
     DodgeRange     = 40,
     DodgeCooldown  = 0.9,
@@ -309,7 +310,58 @@ local function Env(name)
     return nil
 end
 
+local function Norm(s) return (s or ""):lower():gsub("%s+", "") end
+
+-- The label of a Roblox button is very often a child TextLabel, not the
+-- button's own .Text. v4.4 only read TextButton.Text, so an ImageButton
+-- named "frame" wrapping a TextLabel reading "PLAY" matched nothing —
+-- which is exactly why the main-screen Play button was never pressed.
+local function ButtonText(btn)
+    local parts = {}
+    if btn:IsA("TextButton") then parts[#parts+1] = Norm(btn.Text) end
+    for _, d in ipairs(btn:GetDescendants()) do
+        if d:IsA("TextLabel") or d:IsA("TextButton") then
+            parts[#parts+1] = Norm(d.Text)
+        end
+    end
+    return table.concat(parts, "|")
+end
+
 local function ClickButton(btn)
+    -- Prefer a genuine click when the button is on screen: it triggers
+    -- whatever the game actually listens on (MouseButton1Down, InputBegan
+    -- on the frame, TouchTap...), not just MouseButton1Click.
+    if VisibleOnScreen(btn) then
+        local inset = GuiService:GetGuiInset()
+        local x = btn.AbsolutePosition.X + btn.AbsoluteSize.X / 2
+        local y = btn.AbsolutePosition.Y + btn.AbsoluteSize.Y / 2 + inset.Y
+        local ok = pcall(function()
+            VIM:SendMouseMoveEvent(x, y, game)
+            S(0.06)
+            VIM:SendMouseButtonEvent(x, y, 0, true,  game, 0)
+            S(0.06)
+            VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+        end)
+        if ok then return true end
+    end
+
+    -- Hidden or input blocked — drive the signal directly. getconnections
+    -- first because it is verifiable: we can count the handlers we fired.
+    local gc = Env("getconnections")
+    if typeof(gc) == "function" then
+        local fired = 0
+        for _, sig in ipairs({btn.MouseButton1Click, btn.Activated,
+                              btn.MouseButton1Down, btn.MouseButton1Up}) do
+            pcall(function()
+                for _, c in ipairs(gc(sig)) do
+                    c:Fire()
+                    fired = fired + 1
+                end
+            end)
+        end
+        if fired > 0 then return true end
+    end
+
     local fs = Env("firesignal")
     if typeof(fs) == "function" then
         local ok = pcall(fs, btn.MouseButton1Click)
@@ -317,67 +369,109 @@ local function ClickButton(btn)
         if ok then return true end
     end
 
-    local gc = Env("getconnections")
-    if typeof(gc) == "function" then
-        local fired = false
-        for _, sig in ipairs({btn.MouseButton1Click, btn.Activated}) do
-            pcall(function()
-                for _, c in ipairs(gc(sig)) do
-                    c:Fire()
-                    fired = true
-                end
-            end)
-        end
-        if fired then return true end
-    end
+    return false
+end
 
-    -- Real mouse input at the button's centre (needs it on screen)
-    if not VisibleOnScreen(btn) then return false end
-    local inset = GuiService:GetGuiInset()
-    local x = btn.AbsolutePosition.X + btn.AbsoluteSize.X / 2
-    local y = btn.AbsolutePosition.Y + btn.AbsoluteSize.Y / 2 + inset.Y
-    pcall(function()
-        VIM:SendMouseMoveEvent(x, y, game)
-        S(0.05)
-        VIM:SendMouseButtonEvent(x, y, 0, true,  game, 0)
-        S(0.05)
-        VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
-    end)
-    return true
+-- Returns every button matching, visible ones first. A hidden "play" in
+-- some other closed menu must never win over the one on screen.
+local function FindButtons(matches)
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    if not pg then return {} end
+    local vis, hid = {}, {}
+    for _, obj in ipairs(pg:GetDescendants()) do
+        if obj:IsA("TextButton") or obj:IsA("ImageButton") then
+            local t  = ButtonText(obj)
+            local nm = Norm(obj.Name)
+            for _, m in ipairs(matches) do
+                local mt = m.text and Norm(m.text) or nil
+                local mn = m.name and Norm(m.name) or nil
+                if (mt and mt ~= "" and t:find(mt, 1, true))
+                or (mn and mn ~= "" and nm:find(mn, 1, true)) then
+                    if VisibleOnScreen(obj) then
+                        vis[#vis+1] = obj
+                    else
+                        hid[#hid+1] = obj
+                    end
+                    break
+                end
+            end
+        end
+    end
+    for _, o in ipairs(hid) do vis[#vis+1] = o end
+    return vis
 end
 
 local function FindAndFireBtn(matches, timeout)
     timeout = timeout or 8
     local elapsed = 0
     repeat
+        for _, obj in ipairs(FindButtons(matches)) do
+            print(("[DQR] Clicking %s  text='%s'  visible=%s")
+                :format(obj:GetFullName(), ButtonText(obj),
+                        tostring(VisibleOnScreen(obj))))
+            if ClickButton(obj) then return true end
+        end
         S(0.5)
         elapsed = elapsed + 0.5
-        local pg = LP:WaitForChild("PlayerGui")
-        for _, obj in ipairs(pg:GetDescendants()) do
-            if obj:IsA("TextButton") or obj:IsA("ImageButton") then
-                local t  = obj:IsA("TextButton")
-                    and obj.Text:lower():gsub("%s+","") or ""
-                local nm = obj.Name:lower():gsub("%s+","")
-                for _, m in ipairs(matches) do
-                    local mt = m.text and m.text:lower():gsub("%s+","") or nil
-                    local mn = m.name and m.name:lower():gsub("%s+","") or nil
-                    if (mt and (t == mt or t:find(mt)))
-                    or (mn and (nm == mn or nm:find(mn))) then
-                        print("[DQR] Firing button: " .. obj.Name
-                            .. " Text: '" .. (obj:IsA("TextButton")
-                            and obj.Text or "") .. "'")
-                        if ClickButton(obj) then return true end
-                    end
-                end
-            end
-        end
     until elapsed >= timeout
+    print("[DQR] No button matched after " .. timeout .. "s.")
     return false
 end
 
+-- Prints every button in PlayerGui. Run this in the lobby and paste the
+-- output if a step still misses — it gives the real names to match on.
+local function DumpGui()
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    if not pg then return end
+    print("[DQR] === GUI BUTTON DUMP ===")
+    for _, obj in ipairs(pg:GetDescendants()) do
+        if obj:IsA("TextButton") or obj:IsA("ImageButton") then
+            print(("%s | text='%s' | visible=%s")
+                :format(obj:GetFullName(), ButtonText(obj),
+                        tostring(VisibleOnScreen(obj))))
+        end
+    end
+    print("[DQR] === END DUMP ===")
+end
+
+-- ============================================================
+--  LOBBY DETECTION
+--  "Am I in a dungeon?" was inferred from mob count, so any quiet
+--  moment in a dungeon (between rooms, mobs not matching the strict
+--  filter) read as "not in a dungeon" and the watcher happily started
+--  queueing another one mid-run. Seeing the lobby's own Play button on
+--  screen is a positive, unambiguous signal — use that instead.
+-- ============================================================
+local PLAY_MATCHES = {
+    {name = "playbutton"}, {name = "playbtn"}, {name = "play"},
+    {text = "play"},
+}
+
+local function InLobby()
+    for _, b in ipairs(FindButtons(PLAY_MATCHES)) do
+        if VisibleOnScreen(b) then return true end
+    end
+    return false
+end
+
+local lobbyFlowActive = false
+
 local function RunLobbyFlow()
     if not CONFIG.AutoRunDungeon then return end
-    print("[DQR] Starting lobby flow — no mouse clicks.")
+
+    -- Hard guard: never queue a dungeon unless the lobby is actually up.
+    if not InLobby() then
+        print("[DQR] Not in the lobby — refusing to queue a dungeon.")
+        return
+    end
+    if lobbyFlowActive then
+        print("[DQR] Lobby flow already running.")
+        return
+    end
+    lobbyFlowActive = true
+
+    print("[DQR] Lobby detected. Starting queue flow.")
+    if CONFIG.DebugGui then DumpGui() end
 
     -- Remotes are only a hint here. TryFireDungeonRemote returned true as
     -- soon as it found *any* name-matching remote and blind-fired guessed
@@ -394,79 +488,63 @@ local function RunLobbyFlow()
 
     print("[DQR] Driving the lobby UI.")
 
-    -- Step 1: Play button
+    -- Step 1: Play button.
+    -- The hardcoded mainInterface/buttons/playButton path was a guess, and
+    -- WaitForChild on a wrong name burns 12s inside a pcall before the
+    -- fallback even runs. Search by name/text instead, visible first.
     print("[DQR] Step 1: Play button")
-    local playFired = false
-    -- Direct path fire
-    pcall(function()
-        local btn = LP.PlayerGui
-            :WaitForChild("mainInterface", 4)
-            :WaitForChild("buttons", 4)
-            :WaitForChild("playButton", 4)
-        playFired = ClickButton(btn)
-        print("[DQR] playButton fired via direct path.")
-    end)
-    if not playFired then
-        FindAndFireBtn({
-            {name = "playbutton"}, {name = "playBtn"},
-            {text = "play"},
-        }, 8)
+    if not FindAndFireBtn(PLAY_MATCHES, 8) then
+        print("[DQR] Play button not found — run DQR_Dump() and check names.")
+        lobbyFlowActive = false
+        return
     end
-    S(1.2)
+    S(1.5)
 
     -- Step 2: Create Dungeon popup
     print("[DQR] Step 2: Create Dungeon")
     FindAndFireBtn({
-        {text = "createdungeon"},
-        {name = "createdungeon"},
-        {name = "createDungeon"},
+        {text = "createdungeon"}, {name = "createdungeon"},
+        {text = "create"},        {name = "create"},
+        {text = "newdungeon"},    {text = "host"},
     }, 6)
-    S(1.0)
+    S(1.2)
 
     -- Step 3: Select dungeon from list
     print("[DQR] Step 3: Select " .. CONFIG.TargetDungeon)
-    -- Try exact text match first
     local dunFired = FindAndFireBtn({
-        {text = CONFIG.TargetDungeon:lower():gsub("%s+","")},
-        {text = CONFIG.TargetDungeon:lower()},
+        {text = CONFIG.TargetDungeon}, {name = CONFIG.TargetDungeon},
     }, 6)
     if not dunFired then
-        -- Keyword fallback
-        local kw = CONFIG.TargetDungeon:match("(%a+)"):lower()
-        local pg = LP:WaitForChild("PlayerGui")
-        for _, obj in ipairs(pg:GetDescendants()) do
-            if obj:IsA("TextButton") or obj:IsA("ImageButton") then
-                local t = obj:IsA("TextButton") and obj.Text:lower() or ""
-                local n = obj.Name:lower()
-                if t:find(kw) or n:find(kw) then
-                    if ClickButton(obj) then
-                        print("[DQR] Dungeon via keyword: " .. kw)
-                        dunFired = true
-                        break
-                    end
-                end
-            end
+        -- Keyword fallback — first word of the dungeon name
+        local kw = CONFIG.TargetDungeon:match("(%a+)")
+        if kw then
+            dunFired = FindAndFireBtn({{text = kw}, {name = kw}}, 3)
+            if dunFired then print("[DQR] Dungeon via keyword: " .. kw) end
         end
     end
-    S(0.8)
+    if not dunFired then
+        print("[DQR] Could not find " .. CONFIG.TargetDungeon .. " in the list.")
+    end
+    S(1.0)
 
     -- Step 4: Difficulty
     print("[DQR] Step 4: Difficulty " .. CONFIG.Difficulty)
     FindAndFireBtn({
-        {text = CONFIG.Difficulty:lower()},
-        {name = CONFIG.Difficulty:lower()},
+        {text = CONFIG.Difficulty}, {name = CONFIG.Difficulty},
     }, 5)
-    S(0.6)
+    S(0.8)
 
-    -- Step 5: Create Lobby
+    -- Step 5: Create Lobby. Broadened — the confirm button on this screen
+    -- is commonly just "CREATE" or "CONFIRM", which the old
+    -- "createlobby"-only match could never hit.
     print("[DQR] Step 5: Create Lobby")
     FindAndFireBtn({
-        {text = "createlobby"},
-        {name = "createlobby"},
-        {name = "createLobby"},
-        {name = "CreateLobby"},
+        {text = "createlobby"}, {name = "createlobby"},
+        {text = "createparty"}, {name = "createparty"},
+        {text = "confirm"},     {name = "confirm"},
+        {text = "create"},      {name = "createbutton"},
     }, 6)
-    S(1.5)
+    S(1.8)
 
     -- Step 6: Start (party screen)
     print("[DQR] Step 6: Start")
@@ -481,12 +559,12 @@ local function RunLobbyFlow()
     -- Step 7: In-dungeon START
     print("[DQR] Step 7: In-dungeon START")
     FindAndFireBtn({
-        {text = "start"},
-        {name = "start"},
-        {name = "startButton"},
+        {text = "start"}, {name = "start"}, {name = "startbutton"},
+        {text = "ready"}, {text = "begin"},
     }, 12)
 
     print("[DQR] Lobby flow complete.")
+    lobbyFlowActive = false
 end
 
 -- ============================================================
@@ -555,7 +633,7 @@ end
 -- ============================================================
 --  DUNGEON DETECTION
 -- ============================================================
-local function IsInDungeon()
+local function MobsPresent()
     local count = 0
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("Model") then
@@ -579,6 +657,13 @@ local function IsInDungeon()
         end
     end
     return false
+end
+
+-- In a dungeon = the lobby UI is gone. Mobs are corroborating evidence,
+-- not the test: a cleared room has no mobs but you are still in the run.
+local function IsInDungeon()
+    if InLobby() then return false end
+    return MobsPresent()
 end
 
 local function IsInDungeonSafe()
@@ -860,22 +945,42 @@ local function DungeonWatcher()
     while true do
         S(3)
         if not Farm.Running then continue end
-        if not GetNearestMob() then
-            empty = empty + 1
-            if empty >= 3 then
-                empty = 0
-                print("[DQR] Dungeon cleared.")
-                Farm.Stop()
-                S(6)
-                if CONFIG.AutoRunDungeon then
-                    task.spawn(RunLobbyFlow)
-                    local w = 0
-                    repeat S(2) w = w + 2 until IsInDungeon() or w > 90
-                end
-                if IsInDungeon() then Farm.Start() end
-            end
-        else
+
+        if GetNearestMob() then
             empty = 0
+            continue
+        end
+
+        -- No mobs. That alone does NOT mean the run is over — it happens
+        -- constantly between rooms. Only act on a long dry spell (30s),
+        -- and only queue once the lobby is actually back on screen.
+        empty = empty + 1
+        if empty < 10 then continue end
+        empty = 0
+
+        print("[DQR] No mobs for 30s — pausing farm.")
+        Farm.Stop()
+
+        -- Wait for the game to return us to the lobby on its own.
+        local w = 0
+        repeat
+            S(2) w = w + 2
+            if MobsPresent() then
+                print("[DQR] Mobs again — still in the run.")
+                Farm.Start()
+                break
+            end
+        until InLobby() or w > 60
+
+        if not Farm.Running and InLobby() and CONFIG.AutoRunDungeon then
+            print("[DQR] Back in the lobby — queueing next run.")
+            RunLobbyFlow()
+            local t = 0
+            repeat S(2) t = t + 2 until IsInDungeon() or t > 90
+            if IsInDungeon() then Farm.Start() end
+        elseif not Farm.Running and not InLobby() then
+            print("[DQR] Still in the dungeon, no lobby — resuming farm.")
+            Farm.Start()
         end
     end
 end
@@ -884,15 +989,17 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v4.4 loaded.")
+    print("[DQR] v4.5 loaded.")
     NukeGraphics()
     S(2.5)
 
-    if IsInDungeonSafe() then
-        print("[DQR] Already in dungeon.")
+    if not InLobby() then
+        -- Not at the main screen: we are already in a run (or loading).
+        -- Never queue from here.
+        print("[DQR] Lobby UI not present — assuming already in a dungeon.")
         Farm.Start()
     elseif CONFIG.AutoRunDungeon then
-        task.spawn(RunLobbyFlow)
+        RunLobbyFlow()
         local w = 0
         repeat S(2) w = w + 2 until IsInDungeon() or w > 120
         if IsInDungeon() then
@@ -916,5 +1023,15 @@ UserInputService.InputBegan:Connect(function(inp, gpe)
     if gpe then return end
     if inp.KeyCode == Enum.KeyCode.F5 then
         if Farm.Running then Farm.Stop() else Farm.Start() end
+    elseif inp.KeyCode == Enum.KeyCode.F6 then
+        DumpGui()
+        print("[DQR] InLobby() = " .. tostring(InLobby())
+            .. "  MobsPresent() = " .. tostring(MobsPresent()))
     end
 end)
+
+-- Callable from the executor console for debugging
+getgenv = getgenv or function() return _G end
+getgenv().DQR_Dump  = DumpGui
+getgenv().DQR_Lobby = InLobby
+getgenv().DQR_Queue = RunLobbyFlow
