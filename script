@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.22
+--  DQR AUTO FARM v10.26
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -50,11 +50,27 @@ local CONFIG = {
     -- PlayerGui.rewardGuiHolder.holder. {} = detect it again.
     LootPanelPath  = {"rewardGuiHolder", "holder"},
 
+    -- Which rarities are worth posting. Set one false and those drops
+    -- are left out of the Discord post entirely. An item whose rarity
+    -- cannot be read is posted regardless, so a colour this script
+    -- does not recognise never silently swallows a good drop.
+    LootRarities   = {
+        Common    = false,
+        Uncommon  = false,
+        Rare      = true,
+        Epic      = true,
+        Legendary = true,
+        Ultimate  = true,
+    },
+    -- When a run drops nothing worth posting: false = stay silent,
+    -- true = still post the gold and gems with no items.
+    LootPostIfEmpty = false,
+
     -- Local-only vanity. Changes what YOUR client draws, nothing else:
     -- the server, other players and your actual save are untouched.
-    SpoofName      = true,
+    SpoofName      = false,
     FakeName       = "WOAH2EZ",
-    SpoofLevel     = true,
+    SpoofLevel     = false,
     FakeLevel      = "99999999",
 
     -- Extra graphics stripping
@@ -5415,17 +5431,37 @@ function ReportLoot(panel)
     local HttpS = game:GetService("HttpService")
     local icons, names, viewports = {}, {}, 0
     local items, color = {}, nil
+    local dropped, hidden = 0, 0
     if panel then
         items = ItemSlots(panel)
-        if #items > 0 then
-            -- The known layout: one line per item, its icon in the
-            -- gallery, the embed tinted like the first one's glow.
+        dropped = #items
+
+        -- Rarity filter. An item whose rarity could not be read is
+        -- kept: a colour the script does not recognise should never
+        -- silently swallow a drop.
+        if dropped > 0 and type(CONFIG.LootRarities) == "table" then
+            local keep = {}
+            for _, it in ipairs(items) do
+                local want = CONFIG.LootRarities[it.rarity or ""]
+                if want == nil then want = true end
+                if want then
+                    keep[#keep + 1] = it
+                else
+                    hidden = hidden + 1
+                end
+            end
+            items = keep
+        end
+
+        if dropped > 0 then
+            -- One embed per item, so each picture carries its own
+            -- rarity: a merged gallery puts every icon in one block
+            -- with a single caption above it, and there is then no way
+            -- to tell which of three items was the Epic one.
             for _, it in ipairs(items) do
                 icons[#icons + 1] = it.id
                 local c = it.color
-                names[#names + 1] = ("- %s%s"):format(it.rarity or "item",
-                    c and (("  `#%02X%02X%02X`"):format(c.R * 255, c.G * 255, c.B * 255)) or "")
-                if not color and c then
+                if c and not color then
                     color = math.floor(c.R * 255) * 65536
                           + math.floor(c.G * 255) * 256 + math.floor(c.B * 255)
                 end
@@ -5447,6 +5483,15 @@ function ReportLoot(panel)
         else
             icons, names, viewports = CollectLoot(panel)
         end
+    end
+
+    -- Everything that dropped was a rarity you have switched off.
+    -- Bail before the thumbnail lookup and the post: that is the whole
+    -- point of the filter, and it keeps the channel for real drops.
+    if panel and dropped > 0 and #items == 0 and not CONFIG.LootPostIfEmpty then
+        print(("[DQR] Loot: %d item(s) dropped, all filtered out by "
+            .. "LootRarities - not posting."):format(hidden))
+        return true
     end
 
     -- Asset id -> a CDN picture URL Discord can fetch. The thumbnail
@@ -5480,11 +5525,16 @@ function ReportLoot(panel)
     local desc = {}
     if panel then
         if #items > 0 then
-            desc[#desc + 1] = ("**%d item%s**"):format(#items, #items == 1 and "" or "s")
+            desc[#desc + 1] = ("**%d item%s**%s"):format(
+                #items, #items == 1 and "" or "s",
+                hidden > 0 and (" *(%d hidden by the rarity filter)*"):format(hidden) or "")
+        elseif hidden > 0 then
+            desc[#desc + 1] = ("*%d item%s dropped, all below your rarity filter.*")
+                :format(hidden, hidden == 1 and "" or "s")
         end
         if #names > 0 then
             desc[#desc + 1] = table.concat(names, "\n")
-        else
+        elseif dropped == 0 then
             desc[#desc + 1] = "(nothing readable on the panel - press F10 on the reward screen)"
         end
         if viewports > 0 and #icons == 0 then
@@ -5498,19 +5548,35 @@ function ReportLoot(panel)
     local title = panel
         and ("Dungeon complete - %s (%s)"):format(CONFIG.TargetDungeon, CONFIG.Difficulty)
         or "DQR webhook test"
-    -- Embeds that share a `url` are merged into one gallery.
+    -- A header embed, then one per item. Deliberately NOT sharing a
+    -- `url`: embeds that do are merged into a single gallery, and a
+    -- gallery has one caption for all of its pictures.
     local embeds = {{
         title = title,
         description = table.concat(desc, "\n"),
         color = color or 5763719,
-        url = "https://www.roblox.com/",
-        footer = {text = os.date("%Y-%m-%d %H:%M:%S") .. "  -  DQR"},
     }}
-    if icons[1] then embeds[1].image = {url = thumbs[icons[1]]} end
-    for i = 2, math.min(#icons, 4) do
-        embeds[#embeds + 1] = {url = "https://www.roblox.com/",
-                               image = {url = thumbs[icons[i]]}}
+    for i, it in ipairs(items) do
+        if i > 9 then break end          -- Discord allows ten embeds
+        local c = it.color
+        local hex = c and ("#%02X%02X%02X"):format(c.R * 255, c.G * 255, c.B * 255)
+                      or "?"
+        embeds[#embeds + 1] = {
+            title = ("%d.  %s"):format(i, it.rarity or "Unknown rarity"),
+            description = hex,
+            color = c and (math.floor(c.R * 255) * 65536
+                         + math.floor(c.G * 255) * 256
+                         + math.floor(c.B * 255)) or 5763719,
+            image = thumbs[it.id] and {url = thumbs[it.id]} or nil,
+        }
     end
+    -- The fallback scan has no per-item rarity, only a pile of icons.
+    if #items == 0 then
+        for i = 1, math.min(#icons, 4) do
+            embeds[#embeds + 1] = {image = {url = thumbs[icons[i]]}}
+        end
+    end
+    embeds[#embeds].footer = {text = os.date("%Y-%m-%d %H:%M:%S") .. "  -  DQR"}
 
     local body = HttpS:JSONEncode({username = "DQR", embeds = embeds})
     local res, err = HttpRequest({
@@ -5523,8 +5589,8 @@ function ReportLoot(panel)
         return false
     end
     local code = res.StatusCode or res.Status or "?"
-    print(("[DQR] Loot posted (%s): %d name(s), %d icon(s), %d preview(s).")
-        :format(tostring(code), #names, #icons, viewports))
+    print(("[DQR] Loot posted (%s): %d item(s) shown, %d hidden, %d icon(s), %d preview(s).")
+        :format(tostring(code), #items, hidden, #icons, viewports))
     return true
 end
 
@@ -5749,7 +5815,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.22 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.26 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     ApplyClass()
     NukeGraphics()
     S(2.5)
