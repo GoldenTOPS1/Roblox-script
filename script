@@ -15,7 +15,7 @@ local CONFIG = {
     -- set Class to "" if you want to tune the numbers yourself.
     Class          = "Warrior",
 
-    TargetDungeon  = "Samurai Palace",
+    TargetDungeon  = "The Canals",
     Difficulty     = "Nightmare",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
