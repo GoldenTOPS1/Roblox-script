@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.12
+--  DQR AUTO FARM v10.13
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -145,6 +145,17 @@ local CONFIG = {
                              -- two hazards' pads is a last resort, not
                              -- a choice: a one-stud gap between beams
                              -- used to win on distance alone
+    -- Nothing may stop the bot for good. An attack marker lasts
+    -- seconds: a source still producing a footprint after HazardMaxAge
+    -- is decoration and stops counting. "Hazard between us and the
+    -- target - waiting it out" gives up after WaitGiveUp and walks. And
+    -- if there is a live target whose health has not dropped while we
+    -- have not moved for StallTime, hazards are ignored for StallMute
+    -- seconds and the fight resumes. The bot stood all night once.
+    HazardMaxAge   = 20,
+    WaitGiveUp     = 10,
+    StallTime      = 30,
+    StallMute      = 20,
     -- Hazard escapes: hop straight to the nearest safe spot when it is
     -- close, walk when it is not. The hop is a CFrame write - a short
     -- one, never more often than the cooldown - because a game may
@@ -2984,7 +2995,32 @@ local function Describe(h)
     return ("line len=%d r=%d"):format((h.b - h.a).Magnitude, h.r)
 end
 
+-- How long a source has been producing a footprint without a break.
+-- An attack marker lasts seconds; something still there after
+-- HazardMaxAge is decoration - a neon light strip, a lantern's Beam -
+-- and treating it as a hazard forever is how the bot came to stand
+-- all night "waiting out" a decoration between it and its target.
+-- A break of a few seconds resets the clock, so a pooled effect that
+-- fires again later is fresh again.
+local srcFirst = setmetatable({}, {__mode = "k"})
+local srcLast  = setmetatable({}, {__mode = "k"})
+local function TooOld(src)
+    if not src then return false end
+    local now  = tick()
+    local last = srcLast[src]
+    if not last or now - last > 3 then srcFirst[src] = now end
+    srcLast[src] = now
+    if now - srcFirst[src] > CONFIG.HazardMaxAge then
+        if CONFIG.HazardDebug and now - srcFirst[src] < CONFIG.HazardMaxAge + 0.2 then
+            print("[DQR] Hazard aged out - decoration: " .. src:GetFullName())
+        end
+        return true
+    end
+    return false
+end
+
 local function NoteDisc(cx, cy, cz, r, src)
+    if TooOld(src) then return end
     local h = {kind = "disc", x = cx, y = cy, z = cz, r = r,
                huge = r > HUGE, src = src}
     hazardShapes[#hazardShapes + 1] = h
@@ -2992,6 +3028,7 @@ local function NoteDisc(cx, cy, cz, r, src)
 end
 
 local function NoteBox(cf, hx, hz, cy, src)
+    if TooOld(src) then return end
     local h = {kind = "box", cf = cf, hx = hx, hz = hz, y = cy,
                huge = math.min(hx, hz) > HUGE, src = src}
     hazardShapes[#hazardShapes + 1] = h
@@ -2999,6 +3036,7 @@ local function NoteBox(cf, hx, hz, cy, src)
 end
 
 local function NoteLine(a, b, r, src)
+    if TooOld(src) then return end
     local h = {kind = "line", a = a, b = b, r = r, huge = r > HUGE, src = src}
     hazardShapes[#hazardShapes + 1] = h
     Census(src, Describe(h))
@@ -3730,6 +3768,15 @@ function ScanHazards()
     end
     local pos = root.Position
 
+    -- Muted by the combat-stall watchdog: no footprints, no escapes,
+    -- fight on. See StallTime.
+    if now < (hazardCache.muteUntil or 0) then
+        table.clear(hazardShapes)
+        hazardCache.escape, hazardCache.holdP = nil, nil
+        hazardCache.resting, hazardCache.radialN = false, 0
+        return nil
+    end
+
     -- First-sight activity (see LooksActive) is off for a few seconds
     -- after the scanner starts or resumes, and after any teleport - a
     -- respawn, a room change - because then EVERYTHING is new, at
@@ -4252,6 +4299,27 @@ local function MainLoop()
         local dist   = target.Distance
         pathTargetModel = target.Model   -- so the path worker can blacklist it
 
+        -- Combat-stall watchdog. A live target whose health has not
+        -- dropped, and a bot that has not moved, for StallTime: it is
+        -- standing there deciding not to fight - waiting on a hazard
+        -- that will not clear, resting beside one that will not go,
+        -- boxed in by footprints - and left alone it stands all night.
+        -- Mute the hazard scanner for a while and get on with it.
+        local hp = target.Humanoid.Health
+        local st = hazardCache.stall
+        if not st or st.model ~= target.Model
+        or hp < st.hp - 1
+        or (root.Position - st.pos).Magnitude > 3 then
+            hazardCache.stall = {model = target.Model, hp = hp,
+                                 pos = root.Position, since = now}
+        elseif now - st.since > CONFIG.StallTime then
+            hazardCache.muteUntil = now + CONFIG.StallMute
+            hazardCache.stall = nil
+            print(("[DQR] Combat stall: %s untouched and no movement for %ds - "
+                .. "ignoring hazards for %ds."):format(target.Model.Name,
+                CONFIG.StallTime, CONFIG.StallMute))
+        end
+
         -- Distance is measured root-to-root, so for a big model its
         -- SURFACE is much nearer than its centre. Add the target's own
         -- radius to every range so they stay consistent.
@@ -4454,23 +4522,40 @@ local function MainLoop()
                 local ang = math.atan2(root.Position.Z - mobPos.Z,
                                        root.Position.X - mobPos.X)
                 local spot = AngleTo(mobPos, ringR, ang)
+                local waiting = false
                 if CONFIG.AvoidHazardPaths and HazardOnPath(root.Position, spot) then
                     local clear = ClearRingAngle(mobPos, ringR, ang,
                                                  root.Position)
                     if clear then
                         ang, spot = clear, AngleTo(mobPos, ringR, clear)
                     else
-                        spot = nil
-                        if now - lastTeleWarn > 2 then
+                        -- Wait for it to go - but not forever. A
+                        -- hazard that never goes is not one, and the
+                        -- bot once stood all night behind a decoration.
+                        local since = hazardCache.waitSince or 0
+                        if since == 0 then
+                            since = now
+                            hazardCache.waitSince = now
+                        end
+                        if now - since < CONFIG.WaitGiveUp then
+                            waiting, spot = true, nil
+                            if now - lastTeleWarn > 2 then
+                                lastTeleWarn = now
+                                print("[DQR] Hazard between us and the target - waiting it out.")
+                            end
+                        elseif now - lastTeleWarn > 2 then
                             lastTeleWarn = now
-                            print("[DQR] Hazard between us and the target - waiting it out.")
+                            print(("[DQR] Waited %ds on that hazard - walking anyway.")
+                                :format(now - since))
                         end
                     end
                 end
+                if not waiting then hazardCache.waitSince = 0 end
                 orbitAngle  = ang
                 currentDest = spot
             else
                 currentDest = nil      -- stand still, keep attacking
+                hazardCache.waitSince = 0
             end
             ShowRangeBar(root, mobPos, dist)
             S(CONFIG.ScanRate)
@@ -5353,7 +5438,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.12 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.13 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     ApplyClass()
     NukeGraphics()
     S(2.5)
