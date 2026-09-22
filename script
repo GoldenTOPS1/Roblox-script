@@ -243,7 +243,7 @@ local CONFIG = {
     --   "off"    - the bot never touches the camera or the cursor.
     -- The character's own facing is turned toward the mob in every
     -- mode, so anything the game resolves from the body still lands.
-    AimMode        = "camera",
+    AimMode        = "off",
     AimCamera      = true,   -- legacy; "camera" mode implies it
     CameraHeight   = 12,
     CameraBack     = 17,
