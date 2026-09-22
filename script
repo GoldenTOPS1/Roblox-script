@@ -1,9 +1,10 @@
 -- ============================================================
---  DQR AUTO FARM v9.9
+--  DQR AUTO FARM v10.0
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
---  exact-path lobby queue, on-screen log
---  (F5 farm / F6 dump / F7 log / F8 mob diag / F9 hazard diag)
+--  exact-path lobby queue, on-screen log, Discord loot webhook
+--  (F5 farm / F6 dump / F7 log / F8 mob diag / F9 hazard diag /
+--   F10 loot panel)
 -- ============================================================
 
 local CONFIG = {
@@ -20,6 +21,18 @@ local CONFIG = {
     AutoRunDungeon = true,
     UseRemotes     = false,  -- blind-firing guessed remotes; off by default
     DebugGui       = false,  -- full button dump on every queue (F6 does it too)
+
+    -- Discord: paste a webhook URL here and each completed run posts
+    -- the reward screen's items to that channel - names, plus pictures
+    -- when the icons are image assets (a 3D preview cannot be
+    -- pictured). Empty = off. Needs an executor with a `request`
+    -- function. The reward panel is whichever frame appears when the
+    -- run ends, was not on screen during the fight, and has the most
+    -- item slots on it; set LootPanelPath to name it exactly instead.
+    -- F10 lists the candidates and dumps the chosen one; the console
+    -- command DQR_LootTest() sends a test post without finishing a run.
+    DiscordWebhook = "",
+    LootPanelPath  = {},     -- e.g. {"rewardGui", "main"}; {} = detect
 
     -- Local-only vanity. Changes what YOUR client draws, nothing else:
     -- the server, other players and your actual save are untouched.
@@ -4665,6 +4678,288 @@ local function DungeonWatcher()
 end
 
 -- ============================================================
+--  DISCORD LOOT WEBHOOK
+--  When the reward panel comes up at the end of a run, read what is
+--  on it and post it to the webhook in CONFIG.DiscordWebhook. A script
+--  cannot take a screenshot, so this is the next best thing: the item
+--  names as text, and the item icons as pictures when they are image
+--  assets - resolved through Roblox's thumbnail API to URLs Discord
+--  can show. Up to four go in one embed gallery.
+-- ============================================================
+local ReportLoot, LootDump, LootWatcher
+do
+
+-- The executor's HTTP function, under whichever name it uses. The
+-- game's own HttpService cannot be used from a client.
+local function HttpRequest(opts)
+    for _, name in ipairs({"request", "http_request"}) do
+        local fn = Env(name)
+        if typeof(fn) == "function" then
+            local ok, res = pcall(fn, opts)
+            if ok then return res end
+            return nil, tostring(res)
+        end
+    end
+    for _, ns in ipairs({"syn", "http", "fluxus"}) do
+        local t = Env(ns)
+        if typeof(t) == "table" and typeof(t.request) == "function" then
+            local ok, res = pcall(t.request, opts)
+            if ok then return res end
+            return nil, tostring(res)
+        end
+    end
+    return nil, "this executor has no request function"
+end
+
+-- Every top-level frame (a ScreenGui's direct child) on screen right
+-- now, as a set. Our own log window excluded.
+local function VisibleTops()
+    local out = {}
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    if not pg then return out end
+    for _, sg in ipairs(pg:GetChildren()) do
+        if sg:IsA("ScreenGui") and sg.Enabled and sg ~= LogGui then
+            for _, f in ipairs(sg:GetChildren()) do
+                if f:IsA("GuiObject") and VisibleOnScreen(f) then
+                    out[f] = true
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- Item slots on a frame: 3D previews and pictures.
+local function SlotCount(frame)
+    local n = 0
+    for _, o in ipairs(frame:GetDescendants()) do
+        if o:IsA("ViewportFrame")
+        or ((o:IsA("ImageLabel") or o:IsA("ImageButton")) and o.Image ~= "") then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+-- The reward panel. With LootPanelPath set, that frame. Otherwise the
+-- frame on screen now that was NOT on screen during the fight
+-- (`during` is the set the watcher collected) with the most item
+-- slots on it - the HUD is always up, so it never qualifies; the
+-- reward panel only comes up at the end.
+local function FindLootPanel(during)
+    if CONFIG.LootPanelPath and #CONFIG.LootPanelPath > 0 then
+        return PathVisible(CONFIG.LootPanelPath)
+    end
+    -- The lobby's own GUIs are hidden during a run and back
+    -- afterwards, so they read as "new" too - and the main menu is
+    -- full of icons.
+    local lobbyGuis = {introGui = true, mainInterface = true, queueGui = true,
+                       friendsList = true, leaderboard = true}
+    local best, bestN = nil, 0
+    for f in pairs(VisibleTops()) do
+        if not (during and during[f]) and not lobbyGuis[f.Parent.Name] then
+            local n = SlotCount(f)
+            if n > bestN then best, bestN = f, n end
+        end
+    end
+    if bestN >= 2 then return best end   -- one slot is a button icon
+    return nil
+end
+
+-- Everything on the panel worth reporting: distinct icon asset ids,
+-- distinct bits of text, and how many 3D previews there were. Our own
+-- name is left out of the text.
+local function CollectLoot(panel)
+    local icons, names, seen, viewports = {}, {}, {}, 0
+    local me1, me2 = LP.Name:lower(), LP.DisplayName:lower()
+    for _, o in ipairs(panel:GetDescendants()) do
+        if (o:IsA("ImageLabel") or o:IsA("ImageButton")) and o.Image ~= "" then
+            local img = tostring(o.Image)
+            local id = img:match("id=(%d+)") or img:match("(%d+)%s*$")
+            if id and not seen["i" .. id] then
+                seen["i" .. id] = true
+                icons[#icons + 1] = id
+            end
+        elseif o:IsA("ViewportFrame") then
+            viewports = viewports + 1
+        elseif o:IsA("TextLabel") or o:IsA("TextButton") then
+            local t = o.Text:gsub("^%s+", ""):gsub("%s+$", "")
+            local lt = t:lower()
+            if #t > 1 and t:find("%a")
+            and not lt:find(me1, 1, true) and not lt:find(me2, 1, true)
+            and not seen["t" .. t] then
+                seen["t" .. t] = true
+                names[#names + 1] = t
+            end
+        end
+    end
+    return icons, names, viewports
+end
+
+-- Post the panel's contents. With no panel, posts a test message so
+-- the URL can be checked without finishing a run.
+function ReportLoot(panel)
+    local url = CONFIG.DiscordWebhook
+    if type(url) ~= "string" or not url:find("^https://") then
+        print("[DQR] Loot: no webhook URL set.")
+        return false
+    end
+    local HttpS = game:GetService("HttpService")
+    local icons, names, viewports = {}, {}, 0
+    if panel then
+        icons, names, viewports = CollectLoot(panel)
+    end
+
+    -- Asset id -> a CDN picture URL Discord can fetch. The thumbnail
+    -- API answers for decals and images alike; the older
+    -- asset-thumbnail endpoint is the fallback if it does not.
+    local thumbs = {}
+    if #icons > 0 then
+        local res = HttpRequest({
+            Url = "https://thumbnails.roblox.com/v1/assets?assetIds="
+                .. table.concat(icons, ",") .. "&size=420x420&format=Png",
+            Method = "GET",
+        })
+        if res and res.Body then
+            local ok, data = pcall(function() return HttpS:JSONDecode(res.Body) end)
+            if ok and type(data) == "table" and type(data.data) == "table" then
+                for _, e in ipairs(data.data) do
+                    if e.imageUrl and e.imageUrl ~= "" then
+                        thumbs[tostring(e.targetId)] = e.imageUrl
+                    end
+                end
+            end
+        end
+        for _, id in ipairs(icons) do
+            if not thumbs[id] then
+                thumbs[id] = "https://www.roblox.com/asset-thumbnail/image?assetId="
+                    .. id .. "&width=420&height=420&format=png"
+            end
+        end
+    end
+
+    local desc = {}
+    if panel then
+        if #names > 0 then
+            desc[#desc + 1] = table.concat(names, "\n")
+        else
+            desc[#desc + 1] = "(no item text found on the panel - press F10 on the reward screen)"
+        end
+        if viewports > 0 and #icons == 0 then
+            desc[#desc + 1] = ("(%d item icon(s) are 3D previews - no picture possible)")
+                :format(viewports)
+        end
+    else
+        desc[#desc + 1] = "Webhook test from DQR - the URL works."
+    end
+
+    local title = panel
+        and ("Dungeon complete - %s (%s)"):format(CONFIG.TargetDungeon, CONFIG.Difficulty)
+        or "DQR webhook test"
+    -- Embeds that share a `url` are merged into one gallery.
+    local embeds = {{
+        title = title,
+        description = table.concat(desc, "\n\n"),
+        color = 5763719,
+        url = "https://www.roblox.com/",
+        footer = {text = os.date("%Y-%m-%d %H:%M:%S") .. "  -  DQR"},
+    }}
+    if icons[1] then embeds[1].image = {url = thumbs[icons[1]]} end
+    for i = 2, math.min(#icons, 4) do
+        embeds[#embeds + 1] = {url = "https://www.roblox.com/",
+                               image = {url = thumbs[icons[i]]}}
+    end
+
+    local body = HttpS:JSONEncode({username = "DQR", embeds = embeds})
+    local res, err = HttpRequest({
+        Url = url, Method = "POST",
+        Headers = {["Content-Type"] = "application/json"},
+        Body = body,
+    })
+    if not res then
+        print("[DQR] Loot post failed: " .. tostring(err))
+        return false
+    end
+    local code = res.StatusCode or res.Status or "?"
+    print(("[DQR] Loot posted (%s): %d name(s), %d icon(s), %d preview(s).")
+        :format(tostring(code), #names, #icons, viewports))
+    return true
+end
+
+-- Frames seen on screen while the farm was running: whatever is up
+-- at the end and NOT in here is new, and the reward panel is new.
+local during = {}
+
+-- F10: every frame on screen with its slot count and whether it was
+-- up during the fight, then the contents of the one the scan would
+-- choose. Run it on the reward screen; if it picks the wrong frame,
+-- the right one's path goes in LootPanelPath.
+function LootDump()
+    print("[DQR] === FRAMES ON SCREEN ===")
+    for f in pairs(VisibleTops()) do
+        print(("%s | slots=%d | up during the fight=%s")
+            :format(f:GetFullName(), SlotCount(f), tostring(during[f] == true)))
+    end
+    local panel = FindLootPanel(during)
+    if not panel then
+        print("[DQR] No frame qualifies as the reward panel (new since the fight, 2+ slots).")
+        return
+    end
+    print("[DQR] === LOOT PANEL: " .. panel:GetFullName() .. " ===")
+    for _, o in ipairs(panel:GetDescendants()) do
+        local extra = ""
+        if o:IsA("TextLabel") or o:IsA("TextButton") then
+            extra = " text='" .. o.Text .. "'"
+        elseif o:IsA("ImageLabel") or o:IsA("ImageButton") then
+            extra = " image=" .. o.Image
+        elseif o:IsA("ViewportFrame") then
+            extra = " (3D preview)"
+        end
+        if extra ~= "" then
+            print(("%s | %s | visible=%s%s"):format(
+                o:GetFullName():sub(#panel:GetFullName() + 2), o.ClassName,
+                tostring(o:IsA("GuiObject") and VisibleOnScreen(o)), extra))
+        end
+    end
+    print("[DQR] === END LOOT PANEL ===")
+end
+
+-- While the farm runs, remembers what is on screen. Once it stops -
+-- the run is over - looks for a frame that is new since, with item
+-- slots on it, and posts it. Once per run: re-armed by the next farm.
+function LootWatcher()
+    local ran, stoppedAt = false, 0
+    while true do
+        S(0.5)
+        if Farm.Running then
+            if not ran then during = {} end
+            ran, stoppedAt = true, 0
+            for f in pairs(VisibleTops()) do during[f] = true end
+        elseif ran then
+            -- The run is over. Look for the panel for a while; give
+            -- up after that rather than mistake some later menu for it.
+            if stoppedAt == 0 then stoppedAt = tick() end
+            if tick() - stoppedAt > 30 then
+                ran = false
+            elseif CONFIG.DiscordWebhook ~= "" then
+                local ok, panel = pcall(FindLootPanel, during)
+                if ok and panel then
+                    ran = false
+                    -- The panel can dismiss itself within seconds:
+                    -- post what is there now, and only wait for more
+                    -- if it is still empty.
+                    local icons, names = CollectLoot(panel)
+                    if #icons == 0 and #names == 0 then S(0.8) end
+                    pcall(ReportLoot, panel)
+                end
+            end
+        end
+    end
+end
+
+end -- of the loot block
+
+-- ============================================================
 --  SUPERVISOR
 --  Runs forever, farm or no farm. Whenever we are idle it works out
 --  where we actually are and gets things moving again, so no single
@@ -4777,7 +5072,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v9.9 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
+    print("[DQR] v10.0 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     ApplyClass()
     NukeGraphics()
     S(2.5)
@@ -4817,6 +5112,7 @@ task.spawn(function()
     task.spawn(Supervisor)
     task.spawn(StartWatcher)
     task.spawn(VanityWatcher)
+    task.spawn(LootWatcher)
 end)
 
 -- ============================================================
@@ -4836,6 +5132,8 @@ UserInputService.InputBegan:Connect(function(inp, gpe)
         MobDiag()
     elseif inp.KeyCode == Enum.KeyCode.F9 then
         HazardDiag()
+    elseif inp.KeyCode == Enum.KeyCode.F10 then
+        LootDump()
     end
 end)
 
@@ -4847,3 +5145,5 @@ getgenv().DQR_Queue = RunLobbyFlow
 getgenv().DQR_Log   = function() return table.concat(LOG, "\n") end
 getgenv().DQR_Mobs  = MobDiag
 getgenv().DQR_Hazards = HazardDiag
+getgenv().DQR_LootDump = LootDump
+getgenv().DQR_LootTest = function() return ReportLoot(nil) end
