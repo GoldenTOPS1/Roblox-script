@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.11
+--  DQR AUTO FARM v10.12
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -141,6 +141,10 @@ local CONFIG = {
     EscapeClearWant= 4,      -- clearance from a hazard's pad that counts
                              -- as safe; more than this buys nothing, so
                              -- the exit stays close
+    ExitMinClear   = 2,      -- an exit with less room than this between
+                             -- two hazards' pads is a last resort, not
+                             -- a choice: a one-stud gap between beams
+                             -- used to win on distance alone
     -- Hazard escapes: hop straight to the nearest safe spot when it is
     -- close, walk when it is not. The hop is a CFrame write - a short
     -- one, never more often than the cooldown - because a game may
@@ -212,8 +216,8 @@ local CONFIG = {
     PathGiveUp     = 3,      -- failed paths before abandoning a mob
     UnreachableFor = 8,      -- seconds to ignore an abandoned mob
 
-    -- Range bar
-    ShowRangeBar   = true,
+    -- Range bar (the red beam from the character to its target)
+    ShowRangeBar   = false,
     BarWidth       = 4,
     BarMaxLen      = 200,
     -- Destination markers: a green sphere where the bot has decided to
@@ -882,6 +886,7 @@ local bestFarAt  = 0     -- ...and when
 local unreachable = {}   -- model -> tick() until which to ignore it
 local pathTargetModel = nil  -- what MainLoop is currently chasing
 local engageRing = 0     -- MainLoop's current fighting distance to it
+local hazardWaitUntil = 0  -- route crossed a hazard: stand until then
 
 local function ClearPath()
     pathQueue = {}
@@ -1151,15 +1156,23 @@ local function PathWorker(getDestFn)
                 -- it at 60Hz and that alone made the game unplayable.
                 -- A couple of maths lookups, a few times a second.
                 if CONFIG.AvoidHazardPaths and HazardAt then
-                    local ahead = nil
+                    -- The WHOLE route, not just the next waypoint: a
+                    -- path that bent around a wall and then cut across
+                    -- two green lines passed the old one-point test.
+                    local crosses = false
                     if #pathQueue > 0 then
-                        ahead = pathQueue[1].Position
+                        local from = root.Position
+                        for i = 1, math.min(#pathQueue, 6) do
+                            local to = pathQueue[i].Position
+                            if HazardOnPath(from, to) then crosses = true break end
+                            from = to
+                        end
                     elseif dest then
                         local d = Vector3.new(dest.X - root.Position.X, 0,
                                               dest.Z - root.Position.Z)
                         if d.Magnitude > 1 then
-                            ahead = root.Position
-                                  + d.Unit * math.min(d.Magnitude, 12)
+                            crosses = HazardOnPath(root.Position,
+                                root.Position + d.Unit * math.min(d.Magnitude, 12))
                         end
                     end
                     -- Only when there is something to route AROUND. If
@@ -1169,13 +1182,16 @@ local function PathWorker(getDestFn)
                     -- either case just meant dropping it again 0.4s
                     -- later, forever - the bot paced at a doorway for
                     -- as long as a false hazard covered the room.
-                    if ahead and HazardAt(ahead)
+                    if crosses
                     and not HazardAt(root.Position)
                     and not HazardAt(dest) then
-                        -- Drop it and recompute. A path made before the
-                        -- beam appeared points straight through it.
+                        -- Drop it and recompute - and stand still in
+                        -- the meantime. With the path gone the
+                        -- heartbeat walks the straight line, which is
+                        -- the very line that crosses the hazard.
                         ClearPath()
                         forceRepath = true
+                        hazardWaitUntil = tick() + 0.6
                         if CONFIG.HazardDebug then
                             print("[DQR] Route crosses a hazard - repathing.")
                         end
@@ -1419,6 +1435,15 @@ local function StartMoving(getDestFn)
             -- No path and the direct line is blocked: follow the clear
             -- heading the path worker probed instead of pressing into it.
             step = pos + steerDir * CONFIG.ProbeDist
+        end
+
+        -- The path worker found the route crossing a hazard and is
+        -- recomputing: wait for it rather than walk the straight line,
+        -- which is the line that crosses it. Not while in a hazard
+        -- ourselves - then the escape's destination must be walked.
+        if step and tick() < hazardWaitUntil
+        and HazardAt and not HazardAt(pos) then
+            step = nil
         end
 
         -- Where we are going, and where we are walking to right now.
@@ -3188,7 +3213,10 @@ end
 -- long.
 local function BeamIsLaser(beam, a, b)
     local w = math.max(beam.Width0, beam.Width1)
-    if w <= 0 or w > CONFIG.BeamMaxThick + 2 then return false end
+    -- Up to 16 wide: a boss's strip drawn as a Beam is wider than a
+    -- wizard's laser. (The "huge slab" of old was a cylinder hitbox,
+    -- not a Beam, so this cap can afford to be generous.)
+    if w <= 0 or w > 16 then return false end
     if (b - a).Magnitude > 300 then return false end
     local ok, visible = pcall(function()
         local minT = 1
@@ -3485,8 +3513,13 @@ end
 -- the spokes that CAN be dodged are invisible behind it. The last
 -- resort is the least-bad point: still inside something, but deeper
 -- into a gap than where we stand.
-local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
-    local clean, crossing = {}, {}
+-- `prevDir`, if given, is the heading of the exit chosen a moment ago:
+-- a re-pick prefers to keep going that way. Without it, when a new
+-- line landed across the chosen route the re-pick had no memory and
+-- could flip to the other side, then back - dithering between two
+-- exits while the beam it stood in went off.
+local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge, prevDir)
+    local clean, narrow, crossing = {}, {}, {}
     local bestBad, bestBadC = nil, HazardClearance(pos, ignoreHuge) + 2
     local flatNow = 0
     if mobPos then
@@ -3494,6 +3527,7 @@ local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
     end
     for _, dir in ipairs(ESCAPE_DIRS) do
         local wasClear, crossed = false, false
+        local keep = prevDir and dir:Dot(prevDir) * 4 or 0
         for d = 3, CONFIG.EscapeMaxDist, 3 do
             local p = pos + dir * d
             local c = HazardClearance(p, ignoreHuge)
@@ -3504,7 +3538,7 @@ local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
                 if c > bestBadC then bestBad, bestBadC = p, c end
             else
                 wasClear = true
-                local score = math.min(c, CONFIG.EscapeClearWant) * 2 - d * 0.5
+                local score = math.min(c, CONFIG.EscapeClearWant) * 2 - d * 0.5 + keep
                 if mobPos then
                     local flatNew = Vector3.new(p.X - mobPos.X, 0,
                                                 p.Z - mobPos.Z).Magnitude
@@ -3515,14 +3549,17 @@ local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge)
                         score = score - (flatNew - keepWithin)
                     end
                 end
-                local list = crossed and crossing or clean
+                -- A spot squeezed between two pads is a last resort.
+                local list = crossed and crossing
+                          or c < CONFIG.ExitMinClear and narrow
+                          or clean
                 list[#list + 1] = {p = p, score = score}
             end
         end
     end
     -- Maths first, raycasts only for the front-runners.
     local function ByScore(a, b) return a.score > b.score end
-    for _, list in ipairs({clean, crossing}) do
+    for _, list in ipairs({clean, narrow, crossing}) do
         table.sort(list, ByScore)
         for i = 1, math.min(#list, 6) do
             local p = list[i].p
@@ -3758,13 +3795,20 @@ function ScanHazards()
         and not HazardOnPath(pos, held) then
             esc = held
         else
+            -- The heading we were already escaping along, if any, so
+            -- a re-pick keeps going rather than flipping sides.
+            local prevDir = nil
+            if held then
+                local d = Vector3.new(held.X - pos.X, 0, held.Z - pos.Z)
+                if d.Magnitude > 1 then prevDir = d.Unit end
+            end
             local how, tier2 = "clear", false
-            esc = FindEscape(pos, mobPos, keep, outward)
+            esc = FindEscape(pos, mobPos, keep, outward, false, prevDir)
             if not esc then
                 how, tier2 = "clear of what can be dodged", true
-                esc = FindEscape(pos, mobPos, keep, outward, true)
+                esc = FindEscape(pos, mobPos, keep, outward, true, prevDir)
             end
-            hazardCache.holdP, hazardCache.holdUntil = esc, now + 0.8
+            hazardCache.holdP, hazardCache.holdUntil = esc, now + 1.2
             hazardCache.commitUntil = now + 2.5
 
             -- A safe spot within hopping range? Straight there, and
@@ -5309,7 +5353,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.11 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.12 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     ApplyClass()
     NukeGraphics()
     S(2.5)
