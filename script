@@ -15,8 +15,8 @@ local CONFIG = {
     -- set Class to "" if you want to tune the numbers yourself.
     Class          = "Warrior",
 
-    TargetDungeon  = "Pirate Island",
-    Difficulty     = "Nightmare",
+    TargetDungeon  = "King's Castle",
+    Difficulty     = "Insane",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
     UseRemotes     = false,  -- blind-firing guessed remotes; off by default
