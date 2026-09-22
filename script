@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.6
+--  DQR AUTO FARM v10.7
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -75,7 +75,7 @@ local CONFIG = {
     DodgeBeams     = true,
     BeamMinLen     = 12,     -- a laser is long in exactly one axis...
     BeamMaxThick   = 6,      -- ...and thin in the other two
-    BeamPad        = 3,      -- clearance to keep from the line's edge
+    BeamPad        = 4,      -- clearance to keep from the line's edge
     BeamMinHeight  = 1.5,    -- a PERSISTENT beam must sit this far above
                              -- foot level, else it is floor decoration
     FootOffset     = 3,      -- studs from HumanoidRootPart down to feet
@@ -86,16 +86,19 @@ local CONFIG = {
 
     -- Ground telegraphs (the red strips a boss paints before it hits)
     DodgeTelegraph = true,
-    TelegraphPad   = 3,      -- treat this much beyond the edge as unsafe
+    TelegraphPad   = 4,      -- treat this much beyond the edge as unsafe
     TelegraphMinLen= 6,      -- ignore red parts smaller than this
     TelegraphMaxY  = 2,      -- ...and anything taller than this (props)
     TelegraphMaxWide= 30,    -- ...and anything wider than this in its
                              -- NARROW direction: a strip is narrow, a
                              -- ring is small, a room floor is neither
-    -- Red is this game's colour for "about to be hit" and nothing on a
-    -- map is painted it, so a RED part is trusted past the caps above:
+    -- Red, orange and purple are this game's colours for "about to be
+    -- hit", so a part in one of them is trusted past the caps above:
     -- Captain Blackbeard's rings are 40 studs across, and a marker on
     -- terrain is a slab sunk a few studs in to show through the grass.
+    -- Red is trusted outright. Orange and purple are also floor
+    -- colours (King's Castle has an orange floor), so those must be
+    -- non-solid or have just appeared or moved as well.
     RedMaxY        = 6,
     RedMaxWide     = 80,
     -- A part first seen well inside the scan radius (rather than
@@ -143,9 +146,10 @@ local CONFIG = {
     -- hazard is still beside it and the spot stays safe, rather than
     -- walking straight back into it.
     HazardTeleport = true,
-    TeleportMax    = 8,      -- hop at most this far; further = walk
-    TeleportClear  = 1,      -- land this far outside the hazard's pad
-                             -- (pad 3 + 1 = 4 studs off its visible edge)
+    TeleportMax    = 10,     -- hop at most this far; further = walk
+    TeleportClear  = 2,      -- land this far outside the hazard's pad
+                             -- (pad 4 + 2 = 6 studs off its visible edge:
+                             -- the damage is often wider than the paint)
     TeleportCooldown = 0.65,
     RestNearHazard = 12,     -- after an escape, rest while a hazard is
                              -- still within this many studs...
@@ -2794,17 +2798,32 @@ end
 -- `pos`/`radius` (optional) enable the first-sight rule in LooksActive:
 -- scenery enters the scan at its edge as we walk, so a part first seen
 -- well inside the radius appeared there.
--- HazardDebug: a red part the size caps threw out, named once every few
--- seconds, so a red ring the bot walked through can be traced to the
--- cap that rejected it.
-local redRejectAt = setmetatable({}, {__mode = "k"})
-local function RedReject(o, red, why)
-    if red and CONFIG.HazardDebug then
+-- The game's warning colours, or nil. Red is the classic; The King
+-- paints orange strips, and some mobs paint the same rectangle a red
+-- one would in purple. Cyan/blue are handled by the beam tests.
+local function WarnColor(c)
+    local r, g, b = c.R, c.G, c.B
+    if r > 0.55 and g < 0.45 and b < 0.45 then return "red" end
+    if r > 0.75 and g >= 0.3 and g < 0.7 and b < 0.3 and g < r * 0.75 then
+        return "orange"
+    end
+    if b > 0.45 and r > 0.35 and g < 0.4 and g < math.min(r, b) * 0.75 then
+        return "purple"
+    end
+    return nil
+end
+
+-- HazardDebug: a warning-coloured part the size caps threw out, named
+-- once every few seconds, so a ring the bot walked through can be
+-- traced to the cap that rejected it.
+local warnRejectAt = setmetatable({}, {__mode = "k"})
+local function WarnReject(o, warn, why)
+    if warn and CONFIG.HazardDebug then
         local now = tick()
-        if not redRejectAt[o] or now - redRejectAt[o] > 5 then
-            redRejectAt[o] = now
-            print(("[DQR] Red part rejected (%s): %s size=%s")
-                :format(why, o:GetFullName(), tostring(PartSize(o))))
+        if not warnRejectAt[o] or now - warnRejectAt[o] > 5 then
+            warnRejectAt[o] = now
+            print(("[DQR] %s part rejected (%s): %s size=%s")
+                :format(warn, why, o:GetFullName(), tostring(PartSize(o))))
         end
     end
     return false
@@ -2813,22 +2832,21 @@ end
 local function IsTelegraph(o, pos, radius)
     if not o:IsA("BasePart") then return false end
     if IsOurs(o) then return false end
-    -- Red is trusted further than any other colour: see RedMaxY.
-    local c = o.Color
-    local red = c.R > 0.55 and c.G < 0.45 and c.B < 0.45
-    local maxY    = red and CONFIG.RedMaxY    or CONFIG.TelegraphMaxY
-    local maxWide = red and CONFIG.RedMaxWide or CONFIG.TelegraphMaxWide
+    -- Warning colours are trusted further than any other: see RedMaxY.
+    local warn = WarnColor(o.Color)
+    local maxY    = warn and CONFIG.RedMaxY    or CONFIG.TelegraphMaxY
+    local maxWide = warn and CONFIG.RedMaxWide or CONFIG.TelegraphMaxWide
     local s = PartSize(o)
     -- Cheap rejections before touching the CFrame: nothing whose
     -- smallest side is taller than the limit can lie flat any way up.
-    if math.min(s.X, s.Y, s.Z) > maxY then return RedReject(o, red, "too thick") end
+    if math.min(s.X, s.Y, s.Z) > maxY then return WarnReject(o, warn, "too thick") end
     if math.max(s.X, s.Y, s.Z) < CONFIG.TelegraphMinLen then return false end
     local height, a, b = Footprint(o)
-    if height > maxY then return RedReject(o, red, "too tall") end   -- a prop
+    if height > maxY then return WarnReject(o, warn, "too tall") end   -- a prop
     if math.max(a, b) < CONFIG.TelegraphMinLen then return false end
     -- A marker is a strip or a ring: narrow one way, or small. Wide
     -- both ways is a floor, and a whole room floor was being flagged.
-    if math.min(a, b) > maxWide then return RedReject(o, red, "too wide") end
+    if math.min(a, b) > maxWide then return WarnReject(o, warn, "too wide") end
 
     -- Colour alone is not enough: the Ice Elemental paints CYAN rings,
     -- and cyan is also the colour of half the Winter Outpost scenery.
@@ -2842,7 +2860,14 @@ local function IsTelegraph(o, pos, radius)
     local active, why = LooksActive(o, fresh)
     if o.Transparency > 0.95 then return false end
 
-    if red then return true end
+    if warn == "red" then return true end
+    if warn then
+        -- Orange and purple are floor colours too. An attack marker
+        -- is not solid, or has just appeared or moved; a castle floor
+        -- is solid and has always been there.
+        if not o.CanCollide or why == "new" or why == "moved" then return true end
+        return WarnReject(o, warn, "solid and static - a floor")
+    end
     if not active then return false end
 
     -- You stand ON floors, so a solid part is map unless the evidence
@@ -3686,9 +3711,12 @@ function ScanHazards()
     if #hazardShapes > 0 and HazardAt(pos) then
         hazardCache.restUntil = 0
         -- Keep a chosen exit for a moment rather than re-picking every
-        -- sweep and zig-zagging between two equally good ones.
+        -- sweep and zig-zagging between two equally good ones - unless
+        -- the walk to it now crosses something that was not there when
+        -- it was picked.
         if held and now < hazardCache.holdUntil
-        and HazardClearance(held, true) > 0 then
+        and HazardClearance(held, true) > 0
+        and not HazardOnPath(pos, held) then
             esc = held
         else
             local how, tier2 = "clear", false
@@ -3725,12 +3753,14 @@ function ScanHazards()
         end
     elseif held and now < hazardCache.commitUntil
     and Vector3.new(held.X - pos.X, 0, held.Z - pos.Z).Magnitude > 2.5
-    and HazardClearance(held, true) > 0 then
+    and HazardClearance(held, true) > 0
+    and not HazardOnPath(pos, held) then
         -- Out of the footprint but not yet at the exit: see it
         -- through. The footprint ends where the PART ends, which is
         -- not necessarily where the damage does, and stopping the
         -- instant the root crossed the padded edge left the bot
-        -- standing on the rim of a ring it had all but escaped.
+        -- standing on the rim of a ring it had all but escaped. (But
+        -- not through a hazard that has since landed across the way.)
         esc = held
     else
         if held then
@@ -5240,7 +5270,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.6 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.7 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     ApplyClass()
     NukeGraphics()
     S(2.5)
