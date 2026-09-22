@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.3
+--  DQR AUTO FARM v10.4
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -4761,17 +4761,39 @@ local function VisibleSet()
     return out
 end
 
--- Item slots under a frame: 3D previews and pictures, on screen.
-local function SlotCount(frame, vis)
-    local n = 0
-    for _, o in ipairs(frame:GetDescendants()) do
-        if (not vis or vis[o])
-        and (o:IsA("ViewportFrame")
-             or ((o:IsA("ImageLabel") or o:IsA("ImageButton")) and o.Image ~= "")) then
-            n = n + 1
+-- The Dungeon Quest reward panel, as dumped on 2026-09-21:
+--   rewardGuiHolder.holder
+--     reward            slot background (x one per item)
+--       glow            ImageLabel tinted with the item's rarity colour
+--       itemPicture     ImageLabel: the item's icon
+--   rewardGuiHolder.Frame.Gold   the gold earned
+-- No name labels anywhere, so names cannot be reported; the glow's
+-- tint is read as the rarity instead. Returns one record per item.
+local function ItemSlots(panel)
+    local function Rarity(c)
+        if not c then return nil end
+        local h, s, v = c:ToHSV()
+        if s < 0.25 then return v > 0.6 and "Common" or "Common" end
+        if h < 0.04 or h > 0.93 then return "Mythic" end
+        if h < 0.17 then return "Legendary" end
+        if h < 0.47 then return "Uncommon" end
+        if h < 0.72 then return "Rare" end
+        return "Epic"
+    end
+    local items = {}
+    for _, o in ipairs(panel:GetDescendants()) do
+        if o.Name == "itemPicture"
+        and (o:IsA("ImageLabel") or o:IsA("ImageButton")) and o.Image ~= "" then
+            local img = tostring(o.Image)
+            local id = img:match("id=(%d+)") or img:match("(%d+)%s*$")
+            if id then
+                local glow = o.Parent and o.Parent:FindFirstChild("glow")
+                local col = glow and glow:IsA("ImageLabel") and glow.ImageColor3 or nil
+                items[#items + 1] = {id = id, color = col, rarity = Rarity(col)}
+            end
         end
     end
-    return n
+    return items
 end
 
 -- The candidates for the reward panel, best first: whatever is on
@@ -4788,6 +4810,17 @@ local function LootCandidates(during)
     local lobbyGuis = {introGui = true, mainInterface = true, queueGui = true,
                        friendsList = true, leaderboard = true}
     local vis = VisibleSet()
+    -- Item slots under a frame: 3D previews and pictures, on screen.
+    local function SlotCount(frame)
+        local n = 0
+        for _, o in ipairs(frame:GetDescendants()) do
+            if vis[o] and (o:IsA("ViewportFrame")
+               or ((o:IsA("ImageLabel") or o:IsA("ImageButton")) and o.Image ~= "")) then
+                n = n + 1
+            end
+        end
+        return n
+    end
     local roots, byParent = {}, {}
     for o in pairs(vis) do
         if not (during and during[o]) then
@@ -4814,7 +4847,7 @@ local function LootCandidates(during)
         local frame = (p and byParent[p] and byParent[p] >= 2) and p or o
         if not seen[frame] then
             seen[frame] = true
-            cands[#cands + 1] = {frame = frame, slots = SlotCount(frame, vis)}
+            cands[#cands + 1] = {frame = frame, slots = SlotCount(frame)}
         end
     end
     table.sort(cands, function(a, b) return a.slots > b.slots end)
@@ -4870,8 +4903,39 @@ function ReportLoot(panel)
     end
     local HttpS = game:GetService("HttpService")
     local icons, names, viewports = {}, {}, 0
+    local items, color = {}, nil
     if panel then
-        icons, names, viewports = CollectLoot(panel)
+        items = ItemSlots(panel)
+        if #items > 0 then
+            -- The known layout: one line per item, its icon in the
+            -- gallery, the embed tinted like the first one's glow.
+            for _, it in ipairs(items) do
+                icons[#icons + 1] = it.id
+                local c = it.color
+                names[#names + 1] = ("- %s%s"):format(it.rarity or "item",
+                    c and (("  `#%02X%02X%02X`"):format(c.R * 255, c.G * 255, c.B * 255)) or "")
+                if not color and c then
+                    color = math.floor(c.R * 255) * 65536
+                          + math.floor(c.G * 255) * 256 + math.floor(c.B * 255)
+                end
+            end
+            -- The gold (and anything else with a number) shown beside
+            -- the items, in rewardGuiHolder.Frame.
+            local side = panel.Parent and panel.Parent:FindFirstChild("Frame")
+            if side then
+                local seen = {}
+                for _, o in ipairs(side:GetDescendants()) do
+                    if o:IsA("TextLabel") and o.Text:find("%d") and not seen[o.Text] then
+                        seen[o.Text] = true
+                        local label = o.Parent and o.Parent.Name or "Reward"
+                        names[#names + 1] = ("%s: %s"):format(label, o.Text)
+                        if #names > 12 then break end
+                    end
+                end
+            end
+        else
+            icons, names, viewports = CollectLoot(panel)
+        end
     end
 
     -- Asset id -> a CDN picture URL Discord can fetch. The thumbnail
@@ -4904,10 +4968,13 @@ function ReportLoot(panel)
 
     local desc = {}
     if panel then
+        if #items > 0 then
+            desc[#desc + 1] = ("**%d item%s**"):format(#items, #items == 1 and "" or "s")
+        end
         if #names > 0 then
             desc[#desc + 1] = table.concat(names, "\n")
         else
-            desc[#desc + 1] = "(no item text found on the panel - press F10 on the reward screen)"
+            desc[#desc + 1] = "(nothing readable on the panel - press F10 on the reward screen)"
         end
         if viewports > 0 and #icons == 0 then
             desc[#desc + 1] = ("(%d item icon(s) are 3D previews - no picture possible)")
@@ -4923,8 +4990,8 @@ function ReportLoot(panel)
     -- Embeds that share a `url` are merged into one gallery.
     local embeds = {{
         title = title,
-        description = table.concat(desc, "\n\n"),
-        color = 5763719,
+        description = table.concat(desc, "\n"),
+        color = color or 5763719,
         url = "https://www.roblox.com/",
         footer = {text = os.date("%Y-%m-%d %H:%M:%S") .. "  -  DQR"},
     }}
@@ -4974,6 +5041,12 @@ function LootDump()
         return
     end
     print("[DQR] === LOOT PANEL: " .. panel:GetFullName() .. " ===")
+    for i, it in ipairs(ItemSlots(panel)) do
+        local c = it.color
+        print(("[Item %d] icon=%s rarity=%s glow=%s"):format(i, it.id,
+            tostring(it.rarity),
+            c and ("#%02X%02X%02X"):format(c.R * 255, c.G * 255, c.B * 255) or "none"))
+    end
     for _, o in ipairs(panel:GetDescendants()) do
         local extra = ""
         if o:IsA("TextLabel") or o:IsA("TextButton") then
@@ -5028,14 +5101,17 @@ function LootWatcher()
                 end
             elseif CONFIG.DiscordWebhook ~= "" then
                 local ok, panel = pcall(FindLootPanel, during)
+                -- `holder` is on screen the whole run; the item slots
+                -- are only cloned into it at the end. Until they are,
+                -- it is not the reward panel yet - two empty posts
+                -- went out between rooms before this check.
+                if ok and panel and #ItemSlots(panel) == 0
+                and #CONFIG.LootPanelPath > 0 then
+                    panel = nil
+                end
                 if ok and panel then
                     ran = false
                     print("[DQR] Loot: reward panel = " .. panel:GetFullName())
-                    -- The panel can dismiss itself within seconds:
-                    -- post what is there now, and only wait for more
-                    -- if it is still empty.
-                    local icons, names = CollectLoot(panel)
-                    if #icons == 0 and #names == 0 then S(0.8) end
                     local okR, err = pcall(ReportLoot, panel)
                     if not okR then print("[DQR] Loot: post crashed: " .. tostring(err)) end
                 elseif not ok and not warned then
@@ -5162,7 +5238,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.3 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.4 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     ApplyClass()
     NukeGraphics()
     S(2.5)
