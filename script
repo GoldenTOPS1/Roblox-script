@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.4
+--  DQR AUTO FARM v10.6
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -47,7 +47,7 @@ local CONFIG = {
     HideArmour     = true,   -- hide accessories / armour meshes
     HideWeapon     = false,  -- also hide the equipped weapon
     StripTextures  = true,   -- kill decals and textures in the world
-    ShowLog        = true,   -- log window on screen from the start; F7 hides it
+    ShowLog        = false,  -- log window starts hidden; F7 shows it
     LowerGraphics  = true,
 
     -- ---- ENGAGEMENT DISTANCE -------------------------------
@@ -4769,16 +4769,18 @@ end
 --   rewardGuiHolder.Frame.Gold   the gold earned
 -- No name labels anywhere, so names cannot be reported; the glow's
 -- tint is read as the rarity instead. Returns one record per item.
+-- Dungeon Quest's tiers, by colour: Common grey, Uncommon green, Rare
+-- blue, Epic purple, Legendary yellow, Ultimate red.
 local function ItemSlots(panel)
     local function Rarity(c)
         if not c then return nil end
-        local h, s, v = c:ToHSV()
-        if s < 0.25 then return v > 0.6 and "Common" or "Common" end
-        if h < 0.04 or h > 0.93 then return "Mythic" end
-        if h < 0.17 then return "Legendary" end
-        if h < 0.47 then return "Uncommon" end
-        if h < 0.72 then return "Rare" end
-        return "Epic"
+        local h, s = c:ToHSV()
+        if s < 0.25 then return "Common" end          -- grey
+        if h < 0.04 or h > 0.93 then return "Ultimate" end  -- red
+        if h < 0.2 then return "Legendary" end        -- yellow / orange
+        if h < 0.47 then return "Uncommon" end        -- green
+        if h < 0.72 then return "Rare" end            -- blue
+        return "Epic"                                 -- purple
     end
     local items = {}
     for _, o in ipairs(panel:GetDescendants()) do
@@ -5238,7 +5240,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.4 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.6 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     ApplyClass()
     NukeGraphics()
     S(2.5)
