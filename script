@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.14
+--  DQR AUTO FARM v10.15
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -1401,11 +1401,31 @@ local function StartMoving(getDestFn)
         local pos  = root.Position
         local dest = getDestFn()
 
+        -- The destination has moved away from what the route was
+        -- computed for - an escape or a dodge has taken over from the
+        -- walk toward the mob. Drop the route NOW. The path worker
+        -- only dropped it after three clear readings at 0.4s each, and
+        -- for that 1.2s these waypoints kept walking the bot toward
+        -- the mob while the dodge thought it was walking away - which
+        -- is why attacks landed during the approach and not in the
+        -- fight.
+        if dest and pathGoal and #pathQueue > 0
+        and (dest - pathGoal).Magnitude > CONFIG.RepathDist then
+            ClearPath()
+        end
+        local destFar = dest and (Vector3.new(dest.X - pos.X, 0, dest.Z - pos.Z)).Magnitude
+                             > CONFIG.PathMinDist
+
         -- Follow the path queue when we have one, else head straight
         local step = dest
 
         -- An unstick manoeuvre outranks the path and the destination:
         -- the whole point is to stop heading where we were heading.
+        -- Not while standing in a hazard, though: then the escape's
+        -- destination outranks everything.
+        if unstickDir and tick() < unstickUntil and HazardAt and HazardAt(pos) then
+            unstickUntil = 0
+        end
         if unstickDir and tick() < unstickUntil then
             step = pos + unstickDir * CONFIG.UnstickDist
         elseif dest and #pathQueue > 0 then
@@ -1445,9 +1465,11 @@ local function StartMoving(getDestFn)
                     human.Jump = true
                 end
             end
-        elseif dest and steerDir then
+        elseif dest and steerDir and destFar then
             -- No path and the direct line is blocked: follow the clear
             -- heading the path worker probed instead of pressing into it.
+            -- Only for a distant destination: a dodge or escape is a
+            -- few studs off and is walked straight, not steered.
             step = pos + steerDir * CONFIG.ProbeDist
         end
 
@@ -1515,7 +1537,12 @@ local function StartMoving(getDestFn)
 
         -- Stuck detection: real walking can be blocked, so notice it and
         -- ask for a fresh path (plus a hop to clear small ledges).
-        if dest and (dest - pos).Magnitude > CONFIG.WaypointReach then
+        -- Standing still on purpose - waiting for a hazard across the
+        -- route to clear - is not being stuck, and treating it as such
+        -- sent the bot on an unstick manoeuvre in a random direction,
+        -- sometimes straight into the hazard it was waiting on.
+        if dest and (dest - pos).Magnitude > CONFIG.WaypointReach
+        and tick() >= hazardWaitUntil then
             local now = tick()
             if not stuckAt or (pos - stuckAt).Magnitude > CONFIG.StuckDist then
                 stuckAt, stuckSince = pos, now
@@ -1571,7 +1598,8 @@ local function StartMoving(getDestFn)
         -- fires. This one asks a harder question: over several seconds,
         -- have we actually GONE anywhere? Staying inside a small circle
         -- while still having somewhere to be means no.
-        if dest and (dest - pos).Magnitude > CONFIG.WaypointReach then
+        if dest and (dest - pos).Magnitude > CONFIG.WaypointReach
+        and tick() >= hazardWaitUntil then
             local now2 = tick()
             if not paceAnchor
             or (pos - paceAnchor).Magnitude > CONFIG.PaceRadius then
@@ -5515,7 +5543,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.14 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.15 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     ApplyClass()
     NukeGraphics()
     S(2.5)
