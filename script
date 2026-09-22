@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.15
+--  DQR AUTO FARM v10.22
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -19,6 +19,20 @@ local CONFIG = {
     Difficulty     = "Nightmare",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
+
+    -- TELEPORT DODGING. true = when a hazard lands on us and a safe
+    -- spot is a few studs away, hop straight there (one CFrame write)
+    -- instead of walking. false = always walk; nothing in the script
+    -- moves the character except the humanoid. The tuning numbers are
+    -- in the TELEPORT DODGE block further down.
+    --
+    -- DEFAULT OFF, and it should stay off: a CFrame write IS what an
+    -- anti-cheat watches for, and a long unattended session tripped
+    -- one. Even short hops add up over hours. Turn it on only while
+    -- you are watching.
+    HazardTeleport = false,
+
+
     UseRemotes     = false,  -- blind-firing guessed remotes; off by default
     DebugGui       = false,  -- full button dump on every queue (F6 does it too)
 
@@ -113,6 +127,16 @@ local CONFIG = {
     -- happened to drop for a while, so it is off unless needed.
     FreshSightRule = false,
 
+    -- Target choice. With PreferGroups on, the pick is not simply the
+    -- nearest mob but the one with the most company within GroupRadius
+    -- - standing in the middle of a pack means every swing and every
+    -- spell hits several of them. GroupWeight is how many studs of
+    -- extra walking one extra neighbour is worth; turn it down to stay
+    -- lazier, up to range further for a bigger pile.
+    PreferGroups   = true,
+    GroupRadius    = 14,
+    GroupWeight    = 12,
+
     -- Crowd handling: keep clear of mobs other than the one being hit
     AvoidOtherMobs = true,
     MobAvoidRadius = 12,     -- "too close to another mob" distance
@@ -148,6 +172,14 @@ local CONFIG = {
                              -- two hazards' pads is a last resort, not
                              -- a choice: a one-stud gap between beams
                              -- used to win on distance alone
+    -- Standing in a gap between markers is safe right up until the next
+    -- one closes it, and by then there is nowhere to go. So when the
+    -- room around us drops below SafeMargin, move to open ground
+    -- straight away rather than wait to be hit - but only if the new
+    -- spot is at least RepositionGain studs roomier, or the bot shuffles
+    -- between two equally cramped spots forever.
+    SafeMargin     = 6,
+    RepositionGain = 3,
     -- Nothing may stop the bot for good. An attack marker lasts
     -- seconds: a source still producing a footprint after HazardMaxAge
     -- is decoration and stops counting. "Hazard between us and the
@@ -159,22 +191,32 @@ local CONFIG = {
     WaitGiveUp     = 10,
     StallTime      = 30,
     StallMute      = 20,
-    -- Hazard escapes: hop straight to the nearest safe spot when it is
-    -- close, walk when it is not. The hop is a CFrame write - a short
-    -- one, never more often than the cooldown - because a game may
-    -- treat larger or constant jumps as teleporting. Afterwards the
-    -- bot stands its ground and keeps attacking for as long as the
-    -- hazard is still beside it and the spot stays safe, rather than
-    -- walking straight back into it.
-    HazardTeleport = true,
+    -- ---- TELEPORT DODGE ------------------------------------
+    -- All ignored when HazardTeleport is false (it is at the top of
+    -- this block). The hop is a CFrame write - a short one, never more
+    -- often than the cooldown - because a game may treat larger or
+    -- constant jumps as teleporting. Afterwards the bot stands its
+    -- ground and keeps attacking for as long as the hazard is still
+    -- beside it and the spot stays safe, rather than walking straight
+    -- back into it.
     TeleportMax    = 10,     -- hop at most this far; further = walk
+    TeleportMinDist= 3,      -- ...and no shorter than this. In a tight
+                             -- gap the nearest safe spot is a stud or
+                             -- two away, and hopping that repeatedly is
+                             -- all of the anti-cheat risk for none of
+                             -- the benefit - walk those instead
     TeleportClear  = 2,      -- land this far outside the hazard's pad
                              -- (pad 4 + 2 = 6 studs off its visible edge:
                              -- the damage is often wider than the paint)
     TeleportCooldown = 0.65,
+    TeleportsPerMin = 12,    -- hard ceiling, however busy the fight. A
+                             -- cooldown alone allows ~90 a minute, which
+                             -- over an unattended night is a lot of
+                             -- CFrame writes for an anti-cheat to see.
     RestNearHazard = 12,     -- after an escape, rest while a hazard is
                              -- still within this many studs...
     RestMaxTime    = 8,      -- ...but never for longer than this
+    -- --------------------------------------------------------
     -- Route around beams instead of only escaping once standing in one.
     -- Costs two maths lookups per orbit candidate and a couple more on
     -- the path worker's thread; nothing is added to the frame handler.
@@ -189,7 +231,20 @@ local CONFIG = {
     MobMoveEps     = 1.5,    -- ...meaning it moved less than this
     CircleSpeed    = 0.85,
     ScanRate       = 0.05,
-    AimCamera      = true,   -- point the camera at the mob (DQR aims from camera)
+    -- How attacks are aimed, and who owns the camera:
+    --   "camera" - the bot points the camera at the mob and attacks at
+    --              screen centre. Reliable, but the camera is not yours.
+    --   "mouse"  - the camera is YOURS, free to look anywhere. The bot
+    --              puts the cursor on the mob's screen position instead.
+    --              Works only if the game aims from the mouse, and only
+    --              while the mob is on screen - if you look away it
+    --              falls back to screen centre and may miss. Try it and
+    --              watch whether damage numbers keep appearing.
+    --   "off"    - the bot never touches the camera or the cursor.
+    -- The character's own facing is turned toward the mob in every
+    -- mode, so anything the game resolves from the body still lands.
+    AimMode        = "camera",
+    AimCamera      = true,   -- legacy; "camera" mode implies it
     CameraHeight   = 12,
     CameraBack     = 17,
 
@@ -209,6 +264,10 @@ local CONFIG = {
     PaceGiveUp     = 2,      -- pacing bouts before abandoning the target
     LoopStallTime  = 6,      -- secs without a farm tick = dead thread
     AgentMaxSlope  = 45,     -- steeper than this = route around, not up
+    JumpMax        = 7,      -- a humanoid clears about this; a waypoint
+                             -- higher than this is a wall, not a step
+    DropMax        = 12,     -- a drop bigger than this on the way to a
+                             -- spot means a ledge: find another way
     AgentWidth     = 2.5,    -- half body width for clearance raycasts
     PathHoldClear  = 3,      -- clear readings needed to drop a live path
     NoProgressTime = 5,      -- secs of no closing before repath/give up
@@ -969,14 +1028,37 @@ local function NearbyParts(pos, radius)
 end
 
 -- Is there floor under this spot? Stops an escape from sending the bot
--- off a ledge or out over a pit.
+-- off a ledge or out over a pit. Returns the floor's height too.
 local function HasGround(p)
     local char = GetChar()
     local rp = RaycastParams.new()
     rp.FilterType = EXCLUDE
     rp.FilterDescendantsInstances = {char, RangeBarPart}
-    return workspace:Raycast(p + Vector3.new(0, 6, 0),
-        Vector3.new(0, -CONFIG.GroundProbe, 0), rp) ~= nil
+    local hit = workspace:Raycast(p + Vector3.new(0, 6, 0),
+        Vector3.new(0, -CONFIG.GroundProbe, 0), rp)
+    if not hit then return false, nil end
+    return true, hit.Position.Y
+end
+
+-- Is there continuous floor all the way from `a` to `b`, with no drop
+-- bigger than DropMax along it? Checking only the destination is not
+-- enough: a walk to a perfectly good spot can cross the lip of a pit
+-- or the edge of a walkway on the way, and the bot walks off it.
+local function GroundOnPath(a, b)
+    local d = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+    local len = d.Magnitude
+    if len < 0.5 then return true end
+    local u = d / len
+    local prev = a.Y
+    local s = 2
+    while s <= len do
+        local ok, y = HasGround(Vector3.new(a.X, a.Y, a.Z) + u * s)
+        if not ok then return false end                  -- a hole
+        if prev - y > CONFIG.DropMax then return false end -- a ledge
+        prev = y
+        s = s + 2
+    end
+    return true
 end
 
 -- Would walking from `a` to `b` put us in a hazard on the way, or at
@@ -1027,14 +1109,16 @@ local function SafeStep(pos, dir, dist)
             dir.X * math.cos(a) - dir.Z * math.sin(a), 0,
             dir.X * math.sin(a) + dir.Z * math.cos(a))
         local p = pos + d * dist
-        if not HazardOnPath(pos, p) and LineClear(pos, p) and HasGround(p) then
+        if not HazardOnPath(pos, p) and LineClear(pos, p)
+        and HasGround(p) and GroundOnPath(pos, p) then
             return p
         end
     end
 
     -- Boxed in at full range: settle for a shorter hop.
     local half = pos + dir * (dist * 0.5)
-    if not HazardOnPath(pos, half) and LineClear(pos, half) and HasGround(half) then
+    if not HazardOnPath(pos, half) and LineClear(pos, half)
+    and HasGround(half) and GroundOnPath(pos, half) then
         return half
     end
     return nil
@@ -1459,9 +1543,18 @@ local function StartMoving(getDestFn)
             if wp then
                 step = wp.Position
                 -- Jump for a flagged waypoint, and for any real step up:
-                -- the pathfinder does not always mark a ledge.
-                if wp.Action == Enum.PathWaypointAction.Jump
-                or (wp.Position.Y - pos.Y) > 3 then
+                -- the pathfinder does not always mark a ledge. But a
+                -- humanoid clears about seven studs, so anything taller
+                -- is not a step up at all - it is a wall the route has
+                -- misjudged, and hammering Jump at it just grinds. Drop
+                -- that waypoint and get a different route.
+                local rise = wp.Position.Y - pos.Y
+                if rise > CONFIG.JumpMax then
+                    table.remove(pathQueue, 1)
+                    forceRepath = true
+                    wpStuck = 0
+                elseif wp.Action == Enum.PathWaypointAction.Jump
+                or rise > 3 then
                     human.Jump = true
                 end
             end
@@ -1658,10 +1751,12 @@ local function StartMoving(getDestFn)
         end
 
         -- Aim the camera at the mob too - DQR resolves attacks from the
-        -- camera/mouse ray, not from the character's own facing.
+        -- camera/mouse ray, not from the character's own facing. Only
+        -- in "camera" mode: the other modes leave the camera to you and
+        -- aim the cursor instead (see AimMode).
         local cam = workspace.CurrentCamera
         if cam then
-            if CONFIG.AimCamera and fp and look then
+            if CONFIG.AimMode == "camera" and CONFIG.AimCamera and fp and look then
                 if cam.CameraType ~= Enum.CameraType.Scriptable then
                     cam.CameraType = Enum.CameraType.Scriptable
                 end
@@ -2518,7 +2613,8 @@ local function GetNearestMob()
                         end
                         local d = (mr.Position - root.Position).Magnitude
                         local rec = {Model=obj, Root=mr, Humanoid=hum,
-                                     Distance=d, Boss=isBoss, Radius=rad}
+                                     Distance=d, Boss=isBoss, Radius=rad,
+                                     Blocked=blocked ~= nil}
                         -- Every live mob goes in the list, blacklisted or
                         -- not: we still need to steer around one we have
                         -- given up on attacking.
@@ -2586,6 +2682,33 @@ local function GetNearestMob()
             print("[DQR] All targets were blacklisted - clearing and "
                 .. "taking the nearest.")
         end
+    end
+
+    -- Prefer the middle of a pack over whatever happens to be nearest.
+    -- Standing among four mobs means every swing and every spell hits
+    -- four; picking the nearest one repeatedly pulls the bot to the
+    -- edge of a group and it fights them one at a time. Each mob is
+    -- scored by how many others are within GroupRadius of it, against
+    -- the extra walking to reach it. A boss is left alone - it has no
+    -- pack, and its ranges are its own.
+    if CONFIG.PreferGroups and best and not best.Boss and #mobList > 1 then
+        local bestScore = -math.huge
+        local pick = best
+        for _, rec in ipairs(mobList) do
+            if not rec.Blocked and not rec.Boss then
+                local mates = 0
+                for _, o in ipairs(mobList) do
+                    if o ~= rec
+                    and (o.Root.Position - rec.Root.Position).Magnitude
+                        < CONFIG.GroupRadius then
+                        mates = mates + 1
+                    end
+                end
+                local score = mates * CONFIG.GroupWeight - rec.Distance
+                if score > bestScore then bestScore, pick = score, rec end
+            end
+        end
+        best = pick
     end
 
     cachedMobs  = mobList
@@ -2688,6 +2811,11 @@ end
 -- ============================================================
 --  COMBAT - spells + melee swing
 -- ============================================================
+-- Block-scoped so only DoMelee and DoSpell reach the main chunk: it is
+-- at Luau's limit of 200 live locals (see the note above Footprint).
+local DoMelee, DoSpell
+do
+
 local spellSlot   = false
 local lastSpell   = 0
 local lastMelee   = 0
@@ -2698,18 +2826,34 @@ local function FireKey(kc)
     pcall(function() VIM:SendKeyEvent(false, kc, false, game) end)
 end
 
-local function DoMelee()
+-- Where on screen an attack should be aimed. In "camera" mode the bot
+-- owns the camera and points it at the mob, so the centre of the
+-- viewport IS the mob. In "mouse" mode the camera is yours: the mob is
+-- wherever it happens to be on screen, so aim there instead - and fall
+-- back to the centre when it is behind you or off screen, where no
+-- screen point exists.
+local function AimPoint(aimAt)
+    local cam = workspace.CurrentCamera
+    local vp  = cam and cam.ViewportSize or Vector2.new(800, 600)
+    local x, y = vp.X / 2, vp.Y / 2
+    if cam and aimAt and CONFIG.AimMode == "mouse" then
+        local ok, sp, onScreen = pcall(function()
+            local p, v = cam:WorldToViewportPoint(aimAt)
+            return p, v
+        end)
+        if ok and onScreen and sp then x, y = sp.X, sp.Y end
+    end
+    return x, y
+end
+
+function DoMelee(aimAt)
     -- Left click swing - DQR auto-attacks on left mouse
     local now = tick()
     if now - lastMelee < CONFIG.MeleeRate then return end
     lastMelee = now
     task.spawn(function()
         pcall(function()
-            -- Aim at screen centre, not (0,0). The camera is pointed at the
-            -- mob, so the centre of the viewport is the mob.
-            local cam = workspace.CurrentCamera
-            local vp  = cam and cam.ViewportSize or Vector2.new(800, 600)
-            local x, y = vp.X / 2, vp.Y / 2
+            local x, y = AimPoint(aimAt)
             VIM:SendMouseMoveEvent(x, y, game)
             VIM:SendMouseButtonEvent(x, y, 0, true,  game, 0)
             S(0.05)
@@ -2718,16 +2862,27 @@ local function DoMelee()
     end)
 end
 
-local function DoSpell(dist, range)
+function DoSpell(dist, range, aimAt)
     if dist > (range or CONFIG.AttackRange) then return end
     local now = tick()
     if now - lastSpell < CONFIG.AttackRate then return end
     lastSpell = now
     spellSlot = not spellSlot
     task.spawn(function()
+        -- Put the cursor on the mob first: a spell cast toward the
+        -- mouse needs it there, and a spell that ignores the mouse
+        -- does not care either way.
+        if CONFIG.AimMode == "mouse" and aimAt then
+            pcall(function()
+                local x, y = AimPoint(aimAt)
+                VIM:SendMouseMoveEvent(x, y, game)
+            end)
+        end
         FireKey(spellSlot and Enum.KeyCode.Q or Enum.KeyCode.E)
     end)
 end
+
+end -- of the combat block
 
 -- ============================================================
 --  THREAT DETECTION
@@ -3668,10 +3823,13 @@ local function FindEscape(pos, mobPos, keepWithin, outward, ignoreHuge, prevDir)
         table.sort(list, ByScore)
         for i = 1, math.min(#list, 6) do
             local p = list[i].p
-            if LineClear(pos, p) and HasGround(p) then return p end
+            if LineClear(pos, p) and HasGround(p) and GroundOnPath(pos, p) then
+                return p
+            end
         end
     end
-    if bestBad and LineClear(pos, bestBad) and HasGround(bestBad) then
+    if bestBad and LineClear(pos, bestBad) and HasGround(bestBad)
+    and GroundOnPath(pos, bestBad) then
         return bestBad
     end
     return nil
@@ -3766,12 +3924,27 @@ end
 -- flick left, right, left between two strips and get hit anyway. A
 -- reversal is walked instead. (lastBlink / lastBlinkDir are declared
 -- above HopClear, since NearestClear reads them too.)
+local hopTimes = {}
 local function TryHop(root, land)
+    -- The one gate every hop passes through, so turning the switch
+    -- off is enough on its own - no call site can hop around it.
+    if not CONFIG.HazardTeleport then return false end
     local now = tick()
     if now - lastBlink < CONFIG.TeleportCooldown then return false end
+    -- Budget: at most TeleportsPerMin in any rolling minute. The
+    -- cooldown alone allowed about ninety a minute in a busy fight,
+    -- and that volume of CFrame writes is what an anti-cheat notices.
+    while hopTimes[1] and now - hopTimes[1] > 60 do table.remove(hopTimes, 1) end
+    if #hopTimes >= CONFIG.TeleportsPerMin then
+        if CONFIG.HazardDebug then
+            print("[DQR] Hop budget spent for this minute - walking.")
+        end
+        return false
+    end
     local pos = root.Position
     local dir = Vector3.new(land.X - pos.X, 0, land.Z - pos.Z)
-    if dir.Magnitude < 0.5 then return false end
+    -- Too short to be worth a CFrame write: walk it.
+    if dir.Magnitude < CONFIG.TeleportMinDist then return false end
     dir = dir.Unit
     if lastBlinkDir and now - lastBlink < 2 and dir:Dot(lastBlinkDir) < -0.3 then
         return false
@@ -3781,7 +3954,10 @@ local function TryHop(root, land)
         root.AssemblyLinearVelocity = Vector3.zero
         root.CFrame = CFrame.new(land) * rot
     end)
-    if ok then lastBlink, lastBlinkDir = now, dir end
+    if ok then
+        lastBlink, lastBlinkDir = now, dir
+        hopTimes[#hopTimes + 1] = now
+    end
     return ok
 end
 
@@ -4014,6 +4190,30 @@ function ScanHazards()
             hazardCache.holdP = nil
             hazardCache.restUntil = now + CONFIG.RestMaxTime
         end
+
+        -- Cramped: standing clear, but only just, with markers around.
+        -- Waiting here until one of them closes the gap means escaping
+        -- from inside it, with less room and less time; going now is
+        -- the same move made early. Only for a meaningfully roomier
+        -- spot, or the bot shuffles between equally tight gaps.
+        if #hazardShapes > 0 then
+            local room = HazardClearance(pos, true)
+            if room < CONFIG.SafeMargin then
+                local better = FindEscape(pos, mobPos, keep, outward, true)
+                if better
+                and HazardClearance(better, true) > room + CONFIG.RepositionGain then
+                    esc = better
+                    hazardCache.holdP     = better
+                    hazardCache.holdUntil = now + 1.0
+                    hazardCache.commitUntil = now + 2.0
+                    hazardCache.restUntil = 0
+                    if CONFIG.HazardDebug then
+                        print(("[DQR] Cramped (%d studs of room) - moving to open ground.")
+                            :format(room))
+                    end
+                end
+            end
+        end
         -- Resting: the hazard we just left is still beside us, this
         -- spot is safe, the target is still in reach. Stand here and
         -- keep hitting rather than walk back toward the ring - the
@@ -4021,8 +4221,9 @@ function ScanHazards()
         -- ended, straight back into whatever we had just left. Ends
         -- when the hazard goes, the spot stops being safe (the
         -- normal escape then runs), the target moves off, or the
-        -- clock runs out.
-        if now < hazardCache.restUntil then
+        -- clock runs out. Skipped when the reposition above already
+        -- decided to move.
+        if not esc and now < hazardCache.restUntil then
             local c = HazardClearance(pos, true)
             -- "In reach" is the class's own fighting distance, not
             -- spell range: a Warrior resting thirty studs out was
@@ -4507,11 +4708,11 @@ local function MainLoop()
 
         -- MELEE when very close
         if dist <= meleeR then
-            DoMelee()
+            DoMelee(mobPos)
         end
 
         -- SPELLS when in range
-        DoSpell(dist, spellR)
+        DoSpell(dist, spellR, mobPos)
 
         -- Seed orbit on new target
         if not seeded then SeedOrbit(mobPos) end
@@ -4675,7 +4876,12 @@ local function MainLoop()
         -- Surrounded? Then orbiting is the wrong idea entirely - any
         -- circle around one mob runs through the others. Back out to the
         -- edge of the pack and fight from there instead.
-        if CONFIG.AvoidOtherMobs then
+        --
+        -- Not while PreferGroups is on: that deliberately walks us into
+        -- the middle of a pack so every swing hits several mobs, and
+        -- this would walk us straight back out again. The two rules
+        -- want opposite things, and the group one is the newer intent.
+        if CONFIG.AvoidOtherMobs and not CONFIG.PreferGroups then
             local pack, centre = Crowd(root.Position, CONFIG.CrowdRadius)
             if centre and #pack >= CONFIG.CrowdCount then
                 local away = Vector3.new(root.Position.X - centre.X, 0,
@@ -5543,7 +5749,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.15 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.22 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     ApplyClass()
     NukeGraphics()
     S(2.5)
