@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.0
+--  DQR AUTO FARM v10.1
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -45,7 +45,7 @@ local CONFIG = {
     HideArmour     = true,   -- hide accessories / armour meshes
     HideWeapon     = false,  -- also hide the equipped weapon
     StripTextures  = true,   -- kill decals and textures in the world
-    ShowLog        = false,  -- log window starts hidden; F7 shows it
+    ShowLog        = true,   -- log window on screen from the start; F7 hides it
     LowerGraphics  = true,
 
     -- ---- ENGAGEMENT DISTANCE -------------------------------
@@ -962,9 +962,16 @@ local function HazardOnPath(a, b)
     local len = d.Magnitude
     if len < 0.5 then return HazardAt(b) end
     local u = d / len
+    -- Samples still inside the hazard we START in do not count: from
+    -- inside a footprint every move begins that way, and counting
+    -- them froze the bot on the spot when there was no exit. Leaving
+    -- one is fine; walking into one is not, and so is ending in one.
+    local inside = HazardAt(a)
     local s = 3
     while s < len do
-        if HazardAt(a + u * s) then return true end
+        local h = HazardAt(a + u * s)
+        if h and not inside then return true end
+        inside = h
         s = s + 3
     end
     return HazardAt(b)
@@ -3732,8 +3739,16 @@ function ScanHazards()
         -- clock runs out.
         if now < hazardCache.restUntil then
             local c = HazardClearance(pos, true)
-            local inReach = keep == nil or mobPos == nil
-                or Vector3.new(mobPos.X - pos.X, 0, mobPos.Z - pos.Z).Magnitude <= keep
+            -- "In reach" is the class's own fighting distance, not
+            -- spell range: a Warrior resting thirty studs out was
+            -- standing idle between spell cooldowns while the boss
+            -- stood there. Further out than this, the normal approach
+            -- closes in - by a route that crosses no hazard.
+            local fightR = math.max(CONFIG.MeleeRange,
+                                    CONFIG.CircleRadius + CONFIG.HoldSlack)
+                         + (tgt and tgt.Radius or 0)
+            local inReach = mobPos == nil
+                or Vector3.new(mobPos.X - pos.X, 0, mobPos.Z - pos.Z).Magnitude <= fightR
             if c > 0 and c < CONFIG.RestNearHazard and inReach then
                 esc = pos
                 hazardCache.resting = true
@@ -4924,33 +4939,56 @@ function LootDump()
     print("[DQR] === END LOOT PANEL ===")
 end
 
--- While the farm runs, remembers what is on screen. Once it stops -
--- the run is over - looks for a frame that is new since, with item
--- slots on it, and posts it. Once per run: re-armed by the next farm.
+-- While there is something to fight, remembers what is on screen.
+-- The moment there is not - the last mob is down - looks for a frame
+-- that is new since, with item slots on it, and posts it. Recording
+-- used to run for as long as the FARM was running, but the reward
+-- panel comes up before the farm notices the lobby is back, so it
+-- was recorded as "seen during the fight" and then ruled out.
 function LootWatcher()
-    local ran, stoppedAt = false, 0
+    local ran, stoppedAt, warned = false, 0, false
     while true do
         S(0.5)
-        if Farm.Running then
-            if not ran then during = {} end
+        local fighting = Farm.Running and GetNearestMob() ~= nil
+        if fighting then
+            if not ran then
+                during, warned = {}, false
+                if CONFIG.DiscordWebhook == "" then
+                    print("[DQR] Loot: DiscordWebhook is empty - nothing will be posted.")
+                end
+            end
             ran, stoppedAt = true, 0
             for f in pairs(VisibleTops()) do during[f] = true end
         elseif ran then
-            -- The run is over. Look for the panel for a while; give
-            -- up after that rather than mistake some later menu for it.
-            if stoppedAt == 0 then stoppedAt = tick() end
-            if tick() - stoppedAt > 30 then
+            if stoppedAt == 0 then
+                stoppedAt = tick()
+                print("[DQR] Loot: fighting stopped - watching for the reward panel.")
+            end
+            if tick() - stoppedAt > 45 then
+                -- Give up rather than mistake some later menu for it,
+                -- and say what was there so the path can be set.
                 ran = false
+                print("[DQR] Loot: no reward panel found in 45s. Frames on screen now:")
+                for f in pairs(VisibleTops()) do
+                    print(("  %s | slots=%d | seen during fight=%s")
+                        :format(f:GetFullName(), SlotCount(f),
+                                tostring(during[f] == true)))
+                end
             elseif CONFIG.DiscordWebhook ~= "" then
                 local ok, panel = pcall(FindLootPanel, during)
                 if ok and panel then
                     ran = false
+                    print("[DQR] Loot: reward panel = " .. panel:GetFullName())
                     -- The panel can dismiss itself within seconds:
                     -- post what is there now, and only wait for more
                     -- if it is still empty.
                     local icons, names = CollectLoot(panel)
                     if #icons == 0 and #names == 0 then S(0.8) end
-                    pcall(ReportLoot, panel)
+                    local okR, err = pcall(ReportLoot, panel)
+                    if not okR then print("[DQR] Loot: post crashed: " .. tostring(err)) end
+                elseif not ok and not warned then
+                    warned = true
+                    print("[DQR] Loot: panel search failed: " .. tostring(panel))
                 end
             end
         end
@@ -5072,7 +5110,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.0 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.1 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     ApplyClass()
     NukeGraphics()
     S(2.5)
