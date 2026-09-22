@@ -16,7 +16,7 @@ local CONFIG = {
     Class          = "Warrior",
 
     TargetDungeon  = "King's Castle",
-    Difficulty     = "Insane",
+    Difficulty     = "Nightmare",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
     UseRemotes     = false,  -- blind-firing guessed remotes; off by default
