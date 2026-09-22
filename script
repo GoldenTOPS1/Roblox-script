@@ -31,7 +31,7 @@ local CONFIG = {
     -- item slots on it; set LootPanelPath to name it exactly instead.
     -- F10 lists the candidates and dumps the chosen one; the console
     -- command DQR_LootTest() sends a test post without finishing a run.
-    DiscordWebhook = "",
+    DiscordWebhook = "https://discord.com/api/webhooks/1551757053096362044/1G7sFx_N2JIec7uGvZZoSc2jldRWB704U0R4u4o4Ccs4ElPZ4wMDauZDKv0WZmwaY8Z1",
     LootPanelPath  = {},     -- e.g. {"rewardGui", "main"}; {} = detect
 
     -- Local-only vanity. Changes what YOUR client draws, nothing else:
