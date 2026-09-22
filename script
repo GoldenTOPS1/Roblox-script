@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v9.7
+--  DQR AUTO FARM v9.9
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log
@@ -194,6 +194,11 @@ local CONFIG = {
     ShowRangeBar   = true,
     BarWidth       = 4,
     BarMaxLen      = 200,
+    -- Destination markers: a green sphere where the bot has decided to
+    -- go, and a smaller yellow-green one where it is walking to right
+    -- now when that differs (the next pathfinding waypoint, or an
+    -- unstick heading).
+    ShowDest       = true,
 }
 
 -- ============================================================
@@ -522,6 +527,65 @@ end
 
 -- Declared early: the raycast in LineClear has to exclude it.
 local RangeBarPart = nil
+
+-- Destination markers (see ShowDest). CanQuery off, so no query or
+-- raycast ever sees them; named DQR_ so the hazard scanners skip them.
+-- (Block-scoped for the main chunk's 200-local limit.)
+local ShowDest, ClearDest
+do
+
+local DestBall, StepBall = nil, nil
+
+local function MarkerBall(name, size, color, tr)
+    local p = Instance.new("Part")
+    p.Name         = name
+    p.Shape        = Enum.PartType.Ball
+    p.Size         = Vector3.new(size, size, size)
+    p.Anchored     = true
+    p.CanCollide   = false
+    p.CanQuery     = false
+    p.CanTouch     = false
+    p.CastShadow   = false
+    p.Material     = Enum.Material.SmoothPlastic
+    p.Color        = color
+    p.Transparency = tr
+    p.Parent       = workspace
+    return p
+end
+
+-- Show where we are going (`dest`) and, when it is somewhere else,
+-- where we are walking to right now (`step`). nil hides a marker.
+function ShowDest(dest, step)
+    if not CONFIG.ShowDest then return end
+    if not DestBall or not DestBall.Parent then
+        DestBall = MarkerBall("DQR_Dest", 3, Color3.fromRGB(40, 230, 90), 0.45)
+    end
+    if not StepBall or not StepBall.Parent then
+        StepBall = MarkerBall("DQR_Step", 1.8, Color3.fromRGB(170, 240, 60), 0.5)
+    end
+    if dest then
+        DestBall.CFrame = CFrame.new(dest.X, dest.Y + 1, dest.Z)
+    else
+        DestBall.CFrame = CFrame.new(0, -500, 0)
+    end
+    if step and dest and (step - dest).Magnitude > 1.5 then
+        StepBall.CFrame = CFrame.new(step.X, step.Y + 1, step.Z)
+    elseif step and not dest then
+        StepBall.CFrame = CFrame.new(step.X, step.Y + 1, step.Z)
+    else
+        StepBall.CFrame = CFrame.new(0, -500, 0)
+    end
+end
+
+function ClearDest()
+    -- Not ipairs over {DestBall, StepBall}: a nil first entry ends
+    -- the walk before the second.
+    if DestBall and DestBall.Parent then DestBall:Destroy() end
+    if StepBall and StepBall.Parent then StepBall:Destroy() end
+    DestBall, StepBall = nil, nil
+end
+
+end -- of the marker block
 
 -- Forward declaration. The hazard footprints are built far below, but
 -- the path worker up here consults them. Assigned, not shadowed.
@@ -872,11 +936,34 @@ local function HasGround(p)
         Vector3.new(0, -CONFIG.GroundProbe, 0), rp) ~= nil
 end
 
+-- Would walking from `a` to `b` put us in a hazard on the way, or at
+-- the end? Sampled every three studs. Pure maths against the hazard
+-- footprints, so cheap enough for every candidate step. Only the
+-- hazard ESCAPE used to know about the footprints; every other move -
+-- the sidestep from a projectile, the retreat when too close, the
+-- walk back in toward the mob - picked its spot by walkability alone
+-- and marched straight back through the ring the bot had just left.
+local function HazardOnPath(a, b)
+    if not HazardAt then return false end
+    local d = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+    local len = d.Magnitude
+    if len < 0.5 then return HazardAt(b) end
+    local u = d / len
+    local s = 3
+    while s < len do
+        if HazardAt(a + u * s) then return true end
+        s = s + 3
+    end
+    return HazardAt(b)
+end
+
 -- The nearest heading to `dir` that is actually walkable for `dist`
 -- studs, or nil if the bot is boxed in. Every evasive move goes through
 -- this: dodges, retreats and hazard escapes all used to be plain
 -- "position + direction * distance" with no check that anything was
 -- there, which is how the bot kept reversing into walls and pillars.
+-- And nothing here may cross a hazard: a sidestep that took us through
+-- a beam was worse than no sidestep at all.
 local function SafeStep(pos, dir, dist)
     dir = Vector3.new(dir.X, 0, dir.Z)
     if dir.Magnitude < 0.01 then return nil end
@@ -890,12 +977,16 @@ local function SafeStep(pos, dir, dist)
             dir.X * math.cos(a) - dir.Z * math.sin(a), 0,
             dir.X * math.sin(a) + dir.Z * math.cos(a))
         local p = pos + d * dist
-        if LineClear(pos, p) and HasGround(p) then return p end
+        if not HazardOnPath(pos, p) and LineClear(pos, p) and HasGround(p) then
+            return p
+        end
     end
 
     -- Boxed in at full range: settle for a shorter hop.
     local half = pos + dir * (dist * 0.5)
-    if LineClear(pos, half) and HasGround(half) then return half end
+    if not HazardOnPath(pos, half) and LineClear(pos, half) and HasGround(half) then
+        return half
+    end
     return nil
 end
 
@@ -1237,6 +1328,7 @@ local function StartMoving(getDestFn)
         if human.Health <= 0 then
             if #pathQueue > 0 then ClearPath() end
             stuckAt, commandSince = nil, 0
+            ShowDest(nil, nil)
             return
         end
 
@@ -1297,6 +1389,9 @@ local function StartMoving(getDestFn)
             -- heading the path worker probed instead of pressing into it.
             step = pos + steerDir * CONFIG.ProbeDist
         end
+
+        -- Where we are going, and where we are walking to right now.
+        ShowDest(dest, step)
 
         -- Walk. This is what makes the animation play.
         local dir = nil
@@ -1495,6 +1590,7 @@ local function StopMoving()
         moveConn = nil
     end
     ClearPath()
+    ClearDest()
     local hm = GetHuman()
     if hm then pcall(function() hm:Move(Vector3.zero, false) end) end
     -- Hand the controls back so you can move the character yourself.
@@ -3843,9 +3939,7 @@ local function ClearRingAngle(mobPos, r, natural, from)
         for _, s in ipairs({1, -1}) do
             local a = natural + s * k * math.pi / 12
             local p = AngleTo(mobPos, r, a)
-            if not HazardAt(p) and not HazardAt((from + p) * 0.5) then
-                return a
-            end
+            if not HazardOnPath(from, p) then return a end
         end
     end
     return nil
@@ -3906,12 +4000,12 @@ local function BestOrbitAngle(mobPos, radius, targetModel, pos, natural)
         if not LineClear(pos, p) then score = score - 25 end
 
         -- Do not circle INTO a beam, and do not cross one on the way.
-        -- Two maths lookups against a short list - no raycasts, no
-        -- instance access, and nothing added to the frame handler.
+        -- Maths against a short list - no raycasts, no instance
+        -- access, and nothing added to the frame handler.
         if CONFIG.AvoidHazardPaths then
             if HazardAt(p) then
                 score = score - 300
-            elseif HazardAt((pos + p) * 0.5) then
+            elseif HazardOnPath(pos, p) then
                 score = score - 200
             end
         end
@@ -4203,15 +4297,24 @@ local function MainLoop()
         if still or target.Boss then
             if flat > ringR + CONFIG.HoldSlack then
                 -- Walk in to the nearest point on the ring - or to the
-                -- nearest clear one, if that spot is inside a hazard.
+                -- nearest one the walk to which crosses no hazard. If
+                -- there is none, stand here: after a hop had put a
+                -- ring between us and the boss, this walked straight
+                -- back through it.
                 local ang = math.atan2(root.Position.Z - mobPos.Z,
                                        root.Position.X - mobPos.X)
                 local spot = AngleTo(mobPos, ringR, ang)
-                if CONFIG.AvoidHazardPaths and HazardAt(spot) then
+                if CONFIG.AvoidHazardPaths and HazardOnPath(root.Position, spot) then
                     local clear = ClearRingAngle(mobPos, ringR, ang,
                                                  root.Position)
                     if clear then
                         ang, spot = clear, AngleTo(mobPos, ringR, clear)
+                    else
+                        spot = nil
+                        if now - lastTeleWarn > 2 then
+                            lastTeleWarn = now
+                            print("[DQR] Hazard between us and the target - waiting it out.")
+                        end
                     end
                 end
                 orbitAngle  = ang
@@ -4292,6 +4395,12 @@ local function MainLoop()
         end
 
         currentDest = GetOrbitPos(mobPos, radius)
+        -- Every angle penalised for crossing a hazard still leaves one
+        -- as the "best": if that one crosses too, stand instead.
+        if CONFIG.AvoidHazardPaths
+        and HazardOnPath(root.Position, currentDest) then
+            currentDest = nil
+        end
         ShowRangeBar(root, mobPos, dist)
 
         S(CONFIG.ScanRate)
@@ -4668,7 +4777,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v9.7 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
+    print("[DQR] v9.9 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag")
     ApplyClass()
     NukeGraphics()
     S(2.5)
