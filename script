@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.2
+--  DQR AUTO FARM v10.3
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -32,7 +32,9 @@ local CONFIG = {
     -- F10 lists the candidates and dumps the chosen one; the console
     -- command DQR_LootTest() sends a test post without finishing a run.
     DiscordWebhook = "https://discord.com/api/webhooks/1551757053096362044/1G7sFx_N2JIec7uGvZZoSc2jldRWB704U0R4u4o4Ccs4ElPZ4wMDauZDKv0WZmwaY8Z1",
-    LootPanelPath  = {},     -- e.g. {"rewardGui", "main"}; {} = detect
+    -- Found by the detector on 2026-09-21: the reward panel is
+    -- PlayerGui.rewardGuiHolder.holder. {} = detect it again.
+    LootPanelPath  = {"rewardGuiHolder", "holder"},
 
     -- Local-only vanity. Changes what YOUR client draws, nothing else:
     -- the server, other players and your actual save are untouched.
@@ -5160,7 +5162,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.2 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.3 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     ApplyClass()
     NukeGraphics()
     S(2.5)
