@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.9
+--  DQR AUTO FARM v10.11
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -98,8 +98,9 @@ local CONFIG = {
     -- Palace's green ones bigger still, and a marker on terrain is a
     -- slab sunk a few studs in to show through the grass. Red is
     -- trusted outright. The others are also floor and foliage colours
-    -- (King's Castle has an orange floor), so those must be non-solid
-    -- or have just appeared or moved as well.
+    -- (King's Castle has an orange floor, the dojo an orange-tan one),
+    -- so those must be non-solid, or solid but just moved / faded in /
+    -- grown - never "just spawned", since rooms are built as you go.
     RedMaxY        = 6,
     RedMaxWide     = 200,    -- Miyamoto Musashi's ring covers half the arena
     -- A part first seen well inside the scan radius (rather than
@@ -2809,7 +2810,12 @@ end
 local function WarnColor(c)
     local r, g, b = c.R, c.G, c.B
     if r > 0.55 and g < 0.45 and b < 0.45 then return "red" end
-    if r > 0.75 and g >= 0.3 and g < 0.7 and b < 0.3 and g < r * 0.75 then
+    -- Paint, not wood. Judged by saturation: attack orange - bright,
+    -- yellow-orange, or a translucent part whose Color is still vivid
+    -- - is saturated, while the dojo's orange-tan planks are muted
+    -- (a plank is about 0.55 saturated; paint is 0.8 and up).
+    local h, s, v = c:ToHSV()
+    if h >= 0.04 and h <= 0.15 and s >= 0.65 and v >= 0.8 then
         return "orange"
     end
     if b > 0.45 and r > 0.35 and g < 0.4 and g < math.min(r, b) * 0.75 then
@@ -2865,17 +2871,36 @@ local function IsTelegraph(o, pos, radius)
     -- record to be compared against.
     local fresh = sweepFresh and pos ~= nil
                   and NearDist(o, pos) < radius * 0.6
-    local active, why = LooksActive(o, fresh, warn ~= nil)
+    local active, why = LooksActive(o, fresh)
     if o.Transparency > 0.95 then return false end
 
     if warn == "red" then return true end
     if warn then
         -- Orange, purple and green are floor and foliage colours too.
-        -- An attack marker is not solid, or has done SOMETHING lately -
-        -- appeared, moved, faded in, grown, turned up beside us; a
-        -- castle floor or a lawn is solid and has never done anything.
-        if not o.CanCollide or active then return true end
-        return WarnReject(o, warn, "solid and static - scenery")
+        -- An attack marker is not solid - or, if it is, it has MOVED,
+        -- FADED IN or GROWN, which floors never do. "Just spawned" is
+        -- not enough for a solid part: the game builds each room's
+        -- floor as you reach it, so for eight seconds every plank of
+        -- the dojo was a freshly spawned orange hazard and the bot
+        -- stood on it waiting for an exit.
+        if not o.CanCollide then return true end
+        if why == "moved" or why == "faded" or why == "grew" then return true end
+        return WarnReject(o, warn, "solid and never moved - scenery")
+    end
+    -- HazardDebug: a flat part that is NOT in a warning colour but is
+    -- either non-solid or doing something - i.e. could be a marker in
+    -- a colour this list does not know - with its exact Color, so the
+    -- colour can be added from the log rather than guessed from a
+    -- screenshot. Solid, static floor tiles are not reported.
+    if CONFIG.HazardDebug and (not o.CanCollide or active) then
+        local now = tick()
+        if not warnRejectAt[o] or now - warnRejectAt[o] > 5 then
+            warnRejectAt[o] = now
+            local c = o.Color
+            print(("[DQR] Flat part, colour unknown to the scanner: %s col=%.2f,%.2f,%.2f size=%s solid=%s active=%s")
+                :format(o:GetFullName(), c.R, c.G, c.B, tostring(PartSize(o)),
+                        tostring(o.CanCollide), tostring(why)))
+        end
     end
     if not active then return false end
 
@@ -5284,7 +5309,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.9 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.11 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     ApplyClass()
     NukeGraphics()
     S(2.5)
