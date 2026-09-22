@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.1
+--  DQR AUTO FARM v10.2
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -2480,7 +2480,14 @@ local function GetNearestMob()
                 if anchor then Consider(anchor, true) end
             end
         end
-        if #mobList > 0 then
+        -- Once every few seconds, not every scan: on a big map this
+        -- fires on every tick that the nearest mob is beyond the widest
+        -- ring, and flooded the log with nothing new. (The timestamp
+        -- rides on mobShape under a string key - strings are never
+        -- collected from a weak-keyed table - to spare a top-level
+        -- local; the main chunk is near Luau's limit of 200.)
+        if #mobList > 0 and now - (mobShape.fullScanWarn or 0) > 5 then
+            mobShape.fullScanWarn = now
             print(("[DQR] Broadphase missed %d mob(s) - found them by "
                 .. "full scan."):format(#mobList))
         end
@@ -4726,58 +4733,98 @@ local function HttpRequest(opts)
     return nil, "this executor has no request function"
 end
 
--- Every top-level frame (a ScreenGui's direct child) on screen right
--- now, as a set. Our own log window excluded.
-local function VisibleTops()
+-- Every GUI object actually on screen, at any depth, as a set. Walks
+-- down from each enabled ScreenGui and stops at the first invisible
+-- frame, since nothing under one can show - far cheaper than testing
+-- every descendant's ancestry. Our own log window is left out.
+local function VisibleSet()
     local out = {}
     local pg = LP:FindFirstChildOfClass("PlayerGui")
     if not pg then return out end
-    for _, sg in ipairs(pg:GetChildren()) do
-        if sg:IsA("ScreenGui") and sg.Enabled and sg ~= LogGui then
-            for _, f in ipairs(sg:GetChildren()) do
-                if f:IsA("GuiObject") and VisibleOnScreen(f) then
-                    out[f] = true
+    local function Walk(o)
+        for _, c in ipairs(o:GetChildren()) do
+            if c:IsA("GuiObject") then
+                if c.Visible and c.AbsoluteSize.X >= 1 then
+                    out[c] = true
+                    Walk(c)
                 end
+            else
+                Walk(c)
             end
         end
+    end
+    for _, sg in ipairs(pg:GetChildren()) do
+        if sg:IsA("ScreenGui") and sg.Enabled and sg ~= LogGui then Walk(sg) end
     end
     return out
 end
 
--- Item slots on a frame: 3D previews and pictures.
-local function SlotCount(frame)
+-- Item slots under a frame: 3D previews and pictures, on screen.
+local function SlotCount(frame, vis)
     local n = 0
     for _, o in ipairs(frame:GetDescendants()) do
-        if o:IsA("ViewportFrame")
-        or ((o:IsA("ImageLabel") or o:IsA("ImageButton")) and o.Image ~= "") then
+        if (not vis or vis[o])
+        and (o:IsA("ViewportFrame")
+             or ((o:IsA("ImageLabel") or o:IsA("ImageButton")) and o.Image ~= "")) then
             n = n + 1
         end
     end
     return n
 end
 
--- The reward panel. With LootPanelPath set, that frame. Otherwise the
--- frame on screen now that was NOT on screen during the fight
--- (`during` is the set the watcher collected) with the most item
--- slots on it - the HUD is always up, so it never qualifies; the
--- reward panel only comes up at the end.
-local function FindLootPanel(during)
-    if CONFIG.LootPanelPath and #CONFIG.LootPanelPath > 0 then
-        return PathVisible(CONFIG.LootPanelPath)
-    end
+-- The candidates for the reward panel, best first: whatever is on
+-- screen now that was NOT on screen during the fight (`during`, the
+-- set the watcher collected), grouped under the nearest ancestor that
+-- WAS - because the panel is either a frame that just appeared, or an
+-- old frame that just had its item slots cloned into it - scored by
+-- how many item slots each group holds. Looking only at a ScreenGui's
+-- direct children missed a panel nested inside an always-on container.
+local function LootCandidates(during)
     -- The lobby's own GUIs are hidden during a run and back
     -- afterwards, so they read as "new" too - and the main menu is
     -- full of icons.
     local lobbyGuis = {introGui = true, mainInterface = true, queueGui = true,
                        friendsList = true, leaderboard = true}
-    local best, bestN = nil, 0
-    for f in pairs(VisibleTops()) do
-        if not (during and during[f]) and not lobbyGuis[f.Parent.Name] then
-            local n = SlotCount(f)
-            if n > bestN then best, bestN = f, n end
+    local vis = VisibleSet()
+    local roots, byParent = {}, {}
+    for o in pairs(vis) do
+        if not (during and during[o]) then
+            local p = o.Parent
+            local parentNew = p and p:IsA("GuiObject") and vis[p]
+                              and not (during and during[p])
+            if not parentNew then
+                local sg = o
+                while sg and not sg:IsA("ScreenGui") do sg = sg.Parent end
+                if sg and not lobbyGuis[sg.Name] then
+                    roots[#roots + 1] = o
+                    if p and p:IsA("GuiObject") then
+                        byParent[p] = (byParent[p] or 0) + 1
+                    end
+                end
+            end
         end
     end
-    if bestN >= 2 then return best end   -- one slot is a button icon
+    -- Several new siblings under one old frame: that frame is the
+    -- panel. A lone new frame is the panel itself.
+    local cands, seen = {}, {}
+    for _, o in ipairs(roots) do
+        local p = o.Parent
+        local frame = (p and byParent[p] and byParent[p] >= 2) and p or o
+        if not seen[frame] then
+            seen[frame] = true
+            cands[#cands + 1] = {frame = frame, slots = SlotCount(frame, vis)}
+        end
+    end
+    table.sort(cands, function(a, b) return a.slots > b.slots end)
+    return cands
+end
+
+local function FindLootPanel(during)
+    if CONFIG.LootPanelPath and #CONFIG.LootPanelPath > 0 then
+        return PathVisible(CONFIG.LootPanelPath)
+    end
+    local c = LootCandidates(during)[1]
+    if c and c.slots >= 2 then return c.frame end   -- one slot is a button icon
     return nil
 end
 
@@ -4910,14 +4957,18 @@ local during = {}
 -- choose. Run it on the reward screen; if it picks the wrong frame,
 -- the right one's path goes in LootPanelPath.
 function LootDump()
-    print("[DQR] === FRAMES ON SCREEN ===")
-    for f in pairs(VisibleTops()) do
-        print(("%s | slots=%d | up during the fight=%s")
-            :format(f:GetFullName(), SlotCount(f), tostring(during[f] == true)))
+    print("[DQR] === NEW SINCE THE FIGHT (best first) ===")
+    local cands = LootCandidates(during)
+    for i, c in ipairs(cands) do
+        if i > 15 then break end
+        print(("%s | slots=%d"):format(c.frame:GetFullName(), c.slots))
+    end
+    if #cands == 0 then
+        print("[DQR] Nothing on screen is new since the fight.")
     end
     local panel = FindLootPanel(during)
     if not panel then
-        print("[DQR] No frame qualifies as the reward panel (new since the fight, 2+ slots).")
+        print("[DQR] No candidate has 2+ item slots, so none qualifies as the reward panel.")
         return
     end
     print("[DQR] === LOOT PANEL: " .. panel:GetFullName() .. " ===")
@@ -4958,7 +5009,7 @@ function LootWatcher()
                 end
             end
             ran, stoppedAt = true, 0
-            for f in pairs(VisibleTops()) do during[f] = true end
+            for o in pairs(VisibleSet()) do during[o] = true end
         elseif ran then
             if stoppedAt == 0 then
                 stoppedAt = tick()
@@ -4968,11 +5019,10 @@ function LootWatcher()
                 -- Give up rather than mistake some later menu for it,
                 -- and say what was there so the path can be set.
                 ran = false
-                print("[DQR] Loot: no reward panel found in 45s. Frames on screen now:")
-                for f in pairs(VisibleTops()) do
-                    print(("  %s | slots=%d | seen during fight=%s")
-                        :format(f:GetFullName(), SlotCount(f),
-                                tostring(during[f] == true)))
+                print("[DQR] Loot: no reward panel found in 45s. New since the fight now:")
+                for i, c in ipairs(LootCandidates(during)) do
+                    if i > 15 then break end
+                    print(("  %s | slots=%d"):format(c.frame:GetFullName(), c.slots))
                 end
             elseif CONFIG.DiscordWebhook ~= "" then
                 local ok, panel = pcall(FindLootPanel, during)
@@ -5110,7 +5160,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.1 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.2 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     ApplyClass()
     NukeGraphics()
     S(2.5)
