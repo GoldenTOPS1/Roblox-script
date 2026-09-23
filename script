@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.45
+--  DQR AUTO FARM v10.47
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -19,6 +19,22 @@ local CONFIG = {
     Difficulty     = "Insane",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
+
+    -- CARRY MODE. false = start the run the moment the lobby is made,
+    -- which is what it has always done. true = after creating the
+    -- lobby, WAIT on the party screen until everyone named in CarryFor
+    -- has joined, then start.
+    --
+    -- Only affects the lobby's party screen. The in-dungeon START
+    -- button has no player list to read, so it is never gated - once a
+    -- run has begun the bot starts it as usual.
+    --
+    -- CarryWait is how many seconds to wait before starting anyway;
+    -- 0 waits indefinitely, which is usually what you want, since
+    -- starting without the people you are carrying defeats the point.
+    CarryMode      = true,
+    CarryFor       = {"RateFire"},
+    CarryWait      = 0,
 
     -- TELEPORT DODGING. true = when a hazard lands on us and a safe
     -- spot is a few studs away, hop straight there (one CFrame write)
@@ -143,7 +159,7 @@ local CONFIG = {
                              -- foot level, else it is floor decoration
     FootOffset     = 3,      -- studs from HumanoidRootPart down to feet
     RecentWindow   = 8,      -- a part this new counts as an attack
-    HazardDebug    = true,  -- log what the hazard scanner reacts to AND
+    HazardDebug    = false,  -- log what the hazard scanner reacts to AND
                              -- draw every footprint it sees as a red
                              -- slab on the floor (F9 dumps the details)
 
@@ -254,7 +270,16 @@ local CONFIG = {
     -- Workspace.Map.Models.*. Attacks live at the top of Workspace
     -- (laserBeam, preCast) or under the mob that cast them.
     MapFolders     = {Map = true, Terrain = true, Camera = true,
-                      Lighting = true},
+                      Lighting = true, borders = true},
+    -- Dungeon Quest names its attack volumes, and the naming is
+    -- consistent across every dungeon: the floor telegraph is
+    -- "<attack>.precast" and the damage volume is "<attack>.hitBox" -
+    -- electricTowerHit.precast, droneShot.shot.precast,
+    -- firstBossFlameShot.precast, thirdBossRandomLine.hitBox. That is
+    -- a far stronger signal than colour or shape ever was, so a part
+    -- whose name (or its parent's) contains one of these is taken as
+    -- a hazard outright, skipping the size and colour tests.
+    HazardNames    = {"precast", "hitbox"},
     HazardMaxAge   = 20,
     HazardBanTime  = 120,    -- once something has been judged scenery,
                              -- ignore it for this long. A one-sweep ban
@@ -2664,6 +2689,58 @@ local function RunLobbyFlow()
     end
     S(1.2)
 
+    -- Step 5b: CARRY MODE - hold on the party screen until the people
+    -- being carried have actually joined. Read from the party panel
+    -- itself rather than from Players:GetPlayers(), because the latter
+    -- is everyone on the server, not everyone in this lobby.
+    if CONFIG.CarryMode and CONFIG.CarryFor and #CONFIG.CarryFor > 0 then
+        local function InParty(who)
+            local info = Path(UI.LobbyInfo)
+            if not info then return false end
+            local want = Norm(who)
+            if want == "" then return true end
+            for _, o in ipairs(info:GetDescendants()) do
+                if (o:IsA("TextLabel") or o:IsA("TextButton"))
+                and o.Text ~= "" and Norm(o.Text):find(want, 1, true) then
+                    return true
+                end
+            end
+            return false
+        end
+
+        print(("[DQR] Step 5b: Carry mode - waiting for %s.")
+            :format(table.concat(CONFIG.CarryFor, ", ")))
+        local w, said = 0, 0
+        while true do
+            local missing = {}
+            for _, who in ipairs(CONFIG.CarryFor) do
+                if not InParty(who) then missing[#missing + 1] = who end
+            end
+            if #missing == 0 then
+                print("[DQR]   Everyone is here - starting.")
+                break
+            end
+            -- The party screen is gone: someone else started the run,
+            -- or the lobby was closed. Nothing left to wait for.
+            if not Path(UI.LobbyInfo) then
+                print("[DQR]   Party screen closed while waiting - carrying on.")
+                break
+            end
+            if CONFIG.CarryWait > 0 and w >= CONFIG.CarryWait then
+                print(("[DQR]   Waited %ds for %s - starting without them.")
+                    :format(w, table.concat(missing, ", ")))
+                break
+            end
+            if w - said >= 10 or said == 0 then
+                said = w
+                print(("[DQR]   Still waiting for: %s (%ds)")
+                    :format(table.concat(missing, ", "), w))
+            end
+            S(1)
+            w = w + 1
+        end
+    end
+
     -- Step 6: Start the run from the party screen
     Step(6, "Start run", UI.StartRun, 10)
 
@@ -3374,8 +3451,25 @@ local function IsMapPart(o)
     local n, depth = o.Parent, 0
     while n and n ~= workspace and depth < 10 do
         if CONFIG.MapFolders[n.Name] then return true end
+        -- A creature's own body and equipment are not attacks either.
+        -- Lord Varosh's Molten Greatsword is a long thin glowing mesh
+        -- and was being registered as a laser to dodge - so the bot
+        -- ran from the boss's sword while trying to hit the boss.
+        if n:IsA("Model") and n:FindFirstChildOfClass("Humanoid") then
+            return true
+        end
         n = n.Parent
         depth = depth + 1
+    end
+    return false
+end
+
+-- Named as an attack volume by the game itself. See HazardNames.
+local function NamedHazard(o)
+    local n = o.Name:lower()
+    local pn = o.Parent and o.Parent.Name:lower() or ""
+    for _, frag in ipairs(CONFIG.HazardNames) do
+        if n:find(frag, 1, true) or pn:find(frag, 1, true) then return true end
     end
     return false
 end
@@ -3402,6 +3496,12 @@ end
 local function IsTelegraph(o, pos, radius)
     if not o:IsA("BasePart") then return false end
     if IsOurs(o) or IsMapPart(o) then return false end
+    -- The game says it is an attack. Believe it, and skip the shape
+    -- and colour guesswork entirely - those exist only to infer what
+    -- this states outright. thirdBossRandomLine.hitBox is 39 studs
+    -- tall and was being thrown out as "too thick" while it was
+    -- actively killing us.
+    if NamedHazard(o) then return true end
     -- Warning colours are trusted past the size caps; nothing else is.
     -- Giving every non-solid part the relaxed caps was too generous -
     -- a dungeon full of moving holograms and light panels then had
@@ -6563,7 +6663,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.45 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.47 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
