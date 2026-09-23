@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.38
+--  DQR AUTO FARM v10.39
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -15,8 +15,8 @@ local CONFIG = {
     -- set Class to "" if you want to tune the numbers yourself.
     Class          = "Warrior",
 
-    TargetDungeon  = "The Canals",
-    Difficulty     = "Nightmare",
+    TargetDungeon  = "Orbital Outpost",
+    Difficulty     = "Insane",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
 
@@ -3313,9 +3313,13 @@ local function IsTelegraph(o, pos, radius)
     if not o:IsA("BasePart") then return false end
     if IsOurs(o) then return false end
     -- Warning colours are trusted further than any other: see RedMaxY.
+    -- So is anything you cannot stand on, whatever colour it is: the
+    -- size limits below exist to stop a room's FLOOR being called a
+    -- marker, and a part with no collision is not a floor.
     local warn = WarnColor(o.Color)
-    local maxY    = warn and CONFIG.RedMaxY    or CONFIG.TelegraphMaxY
-    local maxWide = warn and CONFIG.RedMaxWide or CONFIG.TelegraphMaxWide
+    local loose   = warn ~= nil or not o.CanCollide
+    local maxY    = loose and CONFIG.RedMaxY    or CONFIG.TelegraphMaxY
+    local maxWide = loose and CONFIG.RedMaxWide or CONFIG.TelegraphMaxWide
     local s = PartSize(o)
     -- Cheap rejections before touching the CFrame: nothing whose
     -- smallest side is taller than the limit can lie flat any way up.
@@ -3341,43 +3345,30 @@ local function IsTelegraph(o, pos, radius)
     if o.Transparency > 0.95 then return false end
 
     if warn == "red" then return true end
-    if warn then
-        -- Orange, purple and green are floor and foliage colours too.
-        -- An attack marker is not solid - or, if it is, it has MOVED,
-        -- FADED IN or GROWN, which floors never do. "Just spawned" is
-        -- not enough for a solid part: the game builds each room's
-        -- floor as you reach it, so for eight seconds every plank of
-        -- the dojo was a freshly spawned orange hazard and the bot
-        -- stood on it waiting for an exit.
-        if not o.CanCollide then return true end
+
+    -- SOLID parts are the dangerous case for false positives: they are
+    -- the floor you are standing on. One only counts if it has MOVED,
+    -- FADED IN or GROWN, which floors never do. "Just spawned" is not
+    -- enough - the game builds each room's floor as you reach it, so
+    -- for eight seconds every plank of the dojo was a freshly spawned
+    -- orange hazard and the bot stood on it waiting for an exit.
+    if o.CanCollide then
         if why == "moved" or why == "faded" or why == "grew" then return true end
         return WarnReject(o, warn, "solid and never moved - scenery")
     end
-    -- HazardDebug: a flat part that is NOT in a warning colour but is
-    -- either non-solid or doing something - i.e. could be a marker in
-    -- a colour this list does not know - with its exact Color, so the
-    -- colour can be added from the log rather than guessed from a
-    -- screenshot. Solid, static floor tiles are not reported.
-    if CONFIG.HazardDebug and (not o.CanCollide or active) then
-        local now = tick()
-        if not warnRejectAt[o] or now - warnRejectAt[o] > 5 then
-            warnRejectAt[o] = now
-            local c = o.Color
-            print(("[DQR] Flat part, colour unknown to the scanner: %s col=%.2f,%.2f,%.2f size=%s solid=%s active=%s")
-                :format(o:GetFullName(), c.R, c.G, c.B, tostring(PartSize(o)),
-                        tostring(o.CanCollide), tostring(why)))
-        end
-    end
-    if not active then return false end
 
-    -- You stand ON floors, so a solid part is map unless the evidence
-    -- is unambiguous: it was not here a moment ago, or it has just
-    -- been moved into place. Fading in, or turning up in the query
-    -- results, is not enough - a glowing floor inlay does both. (A
-    -- ring marker laid flush with the floor is very often left
-    -- collidable, so rejecting every solid part lost the rings.)
-    if o.CanCollide and why ~= "new" and why ~= "moved" then return false end
-    return true
+    -- NON-SOLID and doing something: a marker, whatever colour it is.
+    --
+    -- Colour used to be required here, and it meant chasing a new
+    -- palette every dungeon - red, then orange, then purple, then
+    -- green, then yellow - while blue had to stay excluded because
+    -- half of Winter Outpost is blue scenery. Behaviour separates them
+    -- far better than colour ever did: scenery is solid, or it never
+    -- changes. A flat, non-solid, walk-through part that just appeared
+    -- or moved or faded in is a telegraph in any dungeon, in any
+    -- colour, including the ones nobody has shown me yet.
+    if active then return true end
+    return false
 end
 
 -- ============================================================
@@ -3581,7 +3572,6 @@ end
 local function IsBlob(o)
     if not o:IsA("BasePart") or IsOurs(o) then return false end
     if o.CanCollide or o.Transparency > 0.9 then return false end
-    if not WarnColor(o.Color) then return false end
     local s = PartSize(o)
     local w, d = s.X, s.Z
     if math.max(w, d) < CONFIG.TelegraphMinLen then return false end
@@ -3590,7 +3580,10 @@ local function IsBlob(o)
     -- than a painted marker (those are handled by IsTelegraph).
     if math.abs(w - d) > math.max(w, d) * 0.35 then return false end
     if s.Y < math.max(w, d) * 0.3 then return false end
-    return true
+    -- Colour is not required - the balls come in green, blue, purple
+    -- and yellow depending on the dungeon. Being a walk-through blob
+    -- that just appeared, moved or lit up is the whole test.
+    return LooksActive(o) or WarnColor(o.Color) ~= nil
 end
 
 local function CollectTelegraphs(pos)
@@ -6397,7 +6390,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.38 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.39 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
     -- the end of boot is not reached until a dungeon is up, and if the
