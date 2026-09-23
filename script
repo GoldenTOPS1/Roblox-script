@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.40
+--  DQR AUTO FARM v10.41
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -16,7 +16,7 @@ local CONFIG = {
     Class          = "Warrior",
 
     TargetDungeon  = "Orbital Outpost",
-    Difficulty     = "insane",
+    Difficulty     = "Insane",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
 
@@ -3337,14 +3337,15 @@ end
 local function IsTelegraph(o, pos, radius)
     if not o:IsA("BasePart") then return false end
     if IsOurs(o) then return false end
-    -- Warning colours are trusted further than any other: see RedMaxY.
-    -- So is anything you cannot stand on, whatever colour it is: the
-    -- size limits below exist to stop a room's FLOOR being called a
-    -- marker, and a part with no collision is not a floor.
+    -- Warning colours are trusted past the size caps; nothing else is.
+    -- Giving every non-solid part the relaxed caps was too generous -
+    -- a dungeon full of moving holograms and light panels then had
+    -- room-sized "hazards" in it that nobody could see. An unknown
+    -- colour still counts (see the bottom of this function), but it
+    -- has to be marker-sized: thin, and not wider than a strip.
     local warn = WarnColor(o.Color)
-    local loose   = warn ~= nil or not o.CanCollide
-    local maxY    = loose and CONFIG.RedMaxY    or CONFIG.TelegraphMaxY
-    local maxWide = loose and CONFIG.RedMaxWide or CONFIG.TelegraphMaxWide
+    local maxY    = warn and CONFIG.RedMaxY    or CONFIG.TelegraphMaxY
+    local maxWide = warn and CONFIG.RedMaxWide or CONFIG.TelegraphMaxWide
     local s = PartSize(o)
     -- Cheap rejections before touching the CFrame: nothing whose
     -- smallest side is taller than the limit can lie flat any way up.
@@ -4292,7 +4293,8 @@ end
 hazardCache = {t = 0, escape = nil, radial = false, radialN = 0,
                backoffR = nil, backoffFor = nil,
                holdP = nil, holdUntil = 0, commitUntil = 0,
-               restUntil = 0, resting = false, sheltering = false}
+               restUntil = 0, resting = false, sheltering = false,
+               waitSince = 0, waitBlock = 0}
 
 -- A sidestep out of a projectile's way, shared by the main loop and
 -- the dodge watcher: to whichever side the thing is NOT drifting
@@ -5149,6 +5151,13 @@ local function MainLoop()
                                                  root.Position)
                     if clear then
                         ang, spot = clear, AngleTo(mobPos, ringR, clear)
+                    elseif now < (hazardCache.waitBlock or 0) then
+                        -- Already waited this one out and gave up.
+                        -- Walk through it; `spot` keeps its value.
+                        if now - lastTeleWarn > 3 then
+                            lastTeleWarn = now
+                            print("[DQR] Hazard still in the way - walking through it.")
+                        end
                     else
                         -- Wait for it to go - but not forever. A
                         -- hazard that never goes is not one, and the
@@ -5164,19 +5173,35 @@ local function MainLoop()
                                 lastTeleWarn = now
                                 print("[DQR] Hazard between us and the target - waiting it out.")
                             end
-                        elseif now - lastTeleWarn > 2 then
-                            lastTeleWarn = now
-                            print(("[DQR] Waited %ds on that hazard - walking anyway.")
-                                :format(now - since))
+                        else
+                            -- Giving up has to STICK. Clearing the
+                            -- timer here and nothing else meant the
+                            -- next tick started a fresh ten-second
+                            -- wait: the bot walked for one frame every
+                            -- ten seconds, which from outside is
+                            -- standing still forever. Block waiting
+                            -- entirely for a while so it actually goes.
+                            hazardCache.waitSince = 0
+                            hazardCache.waitBlock = now + CONFIG.WaitGiveUp * 3
+                            -- Not throttled by lastTeleWarn: the
+                            -- waiting message keeps that timer hot, so
+                            -- this one never got printed and the give-up
+                            -- was invisible in the log.
+                            print(("[DQR] Waited %ds on that hazard - walking "
+                                .. "through it now."):format(now - since))
                         end
                     end
                 end
-                if not waiting then hazardCache.waitSince = 0 end
+                -- Only a genuinely clear route resets the clock.
+                if not waiting and spot and now >= (hazardCache.waitBlock or 0) then
+                    hazardCache.waitSince = 0
+                end
                 orbitAngle  = ang
                 currentDest = spot
             else
                 currentDest = nil      -- stand still, keep attacking
                 hazardCache.waitSince = 0
+                hazardCache.waitBlock = 0
             end
             ShowRangeBar(root, mobPos, dist)
             S(CONFIG.ScanRate)
@@ -6415,7 +6440,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.40 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.41 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
     -- the end of boot is not reached until a dungeon is up, and if the
