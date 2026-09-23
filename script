@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.27
+--  DQR AUTO FARM v10.29
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -5795,14 +5795,27 @@ end
 
 function Farm.StatusWatcher()
     local msgId, base, startedAt = nil, nil, tick()
+    local said, lastErr = false, 0
     while true do
         S(math.max(2, CONFIG.StatusInterval or 5))
         local url = CONFIG.StatusWebhook
-        if url ~= "" and url:find("^https://") then
+        if type(url) ~= "string" or url == "" then
+            if not said then
+                said = true
+                print("[DQR] Status: StatusWebhook is empty - no status posts.")
+            end
+        elseif not url:find("^https://") then
+            if not said then
+                said = true
+                print("[DQR] Status: StatusWebhook does not look like a URL.")
+            end
+        else
             -- A different webhook means a different channel: start a
             -- new message rather than edit an id that is not there.
             if base ~= url then base, msgId = url, nil end
-            pcall(function()
+            -- Errors here used to vanish into the pcall, so a single
+            -- nil index meant silence forever with nothing to go on.
+            local ok, err = pcall(function()
                 local HttpS = game:GetService("HttpService")
                 local human = GetHuman()
                 local dead  = not human or human.Health <= 0
@@ -5879,8 +5892,26 @@ function Farm.StatusWatcher()
                         Body = body,
                     })
                     local code = res and (res.StatusCode or res.Status)
-                    -- Deleted, or the channel was purged: post again.
-                    if code == 404 or code == 400 then msgId = nil end
+                    -- 404 is the ONLY code meaning the message is gone.
+                    -- 400 means Discord rejected this particular
+                    -- payload, and treating that as "gone" abandoned a
+                    -- perfectly good message and started a second one -
+                    -- which is why a run ending left one frozen embed
+                    -- and a new one beside it. Keep the id and say what
+                    -- Discord objected to instead.
+                    if code == 404 then
+                        msgId = nil
+                        print("[DQR] Status message is gone - posting a new one.")
+                    elseif code == 400 then
+                        if tick() - lastErr > 15 then
+                            lastErr = tick()
+                            print("[DQR] Status: Discord rejected the update: "
+                                .. tostring(res and res.Body))
+                        end
+                    elseif code == 429 then
+                        -- Rate limited. Skip a beat rather than hammer.
+                        S(2)
+                    end
                 else
                     res = HttpRequest({
                         Url = base .. "?wait=true", Method = "POST",
@@ -5899,9 +5930,16 @@ function Farm.StatusWatcher()
                             print("[DQR] Status: posted but could not read the "
                                 .. "message id - it will repost each tick.")
                         end
+                    else
+                        print("[DQR] Status: no reply from the webhook - does "
+                            .. "this executor have a request function?")
                     end
                 end
             end)
+            if not ok and tick() - lastErr > 15 then
+                lastErr = tick()
+                print("[DQR] Status update failed: " .. tostring(err))
+            end
         end
     end
 end
@@ -6021,7 +6059,13 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.27 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.29 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    -- The status feed starts HERE, not at the end of boot. It is how
+    -- you check on the bot, so it has to be running before the bot is:
+    -- the end of boot is not reached until a dungeon is up, and if the
+    -- queue stalls it is never reached at all - which is why nothing
+    -- was ever posting.
+    task.spawn(Farm.StatusWatcher)
     ApplyClass()
     NukeGraphics()
     S(2.5)
@@ -6062,7 +6106,6 @@ task.spawn(function()
     task.spawn(StartWatcher)
     task.spawn(VanityWatcher)
     task.spawn(LootWatcher)
-    task.spawn(Farm.StatusWatcher)
 end)
 
 -- ============================================================
