@@ -13,7 +13,7 @@ local CONFIG = {
     -- Picks the engagement distances below. Anything you set by hand in
     -- the ENGAGEMENT DISTANCE block is overwritten by this at boot, so
     -- set Class to "" if you want to tune the numbers yourself.
-    Class          = "Mage",
+    Class          = "Warrior",
 
     TargetDungeon  = "Ghastly Harbor",
     Difficulty     = "Nightmare",
