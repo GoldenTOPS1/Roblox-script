@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.39
+--  DQR AUTO FARM v10.40
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -2342,19 +2342,37 @@ local function PathVisible(parts)
 end
 
 -- A dungeon row / difficulty button: the clickable TextButton is a child
--- of a frame named after the dungeon or difficulty.
-local function DungeonBtn(name)
-    local list = Path(UI.DungeonList)
-    if not list then return nil end
-    local row = list:FindFirstChild(name)
+-- of a frame named after the dungeon or difficulty. Matched without
+-- regard for case or stray spaces - "Insane" in CONFIG should find a
+-- frame called "insane" or "INSANE" too, rather than reporting that a
+-- difficulty plainly on screen does not exist.
+local function RowIn(parent, name)
+    if not parent then return nil end
+    local row = parent:FindFirstChild(name)
+    if not row then
+        local want = Norm(name)
+        for _, c in ipairs(parent:GetChildren()) do
+            if Norm(c.Name) == want then row = c break end
+        end
+    end
     return row and row:FindFirstChildWhichIsA("TextButton") or nil
 end
 
+-- What is actually in there, for a miss message worth reading.
+local function NamesIn(parent)
+    if not parent then return "(panel not found)" end
+    local names = {}
+    for _, c in ipairs(parent:GetChildren()) do names[#names + 1] = c.Name end
+    if #names == 0 then return "(empty)" end
+    return table.concat(names, ", ")
+end
+
+local function DungeonBtn(name)
+    return RowIn(Path(UI.DungeonList), name)
+end
+
 local function DifficultyBtn(name)
-    local root = Path(UI.DiffRoot)
-    if not root then return nil end
-    local row = root:FindFirstChild(name)
-    return row and row:FindFirstChildWhichIsA("TextButton") or nil
+    return RowIn(Path(UI.DiffRoot), name)
 end
 
 -- Rows live in a ScrollingFrame; a row scrolled out of view has a valid
@@ -2525,26 +2543,33 @@ local function RunLobbyFlow()
         ScrollIntoView(db)
         ClickButton(db)
     else
-        local list = Path(UI.DungeonList)
         print("[DQR]   MISS - no row named '" .. CONFIG.TargetDungeon .. "'.")
-        if list then
-            local names = {}
-            for _, c in ipairs(list:GetChildren()) do names[#names+1] = c.Name end
-            print("[DQR]   Available: " .. table.concat(names, ", "))
-        end
+        print("[DQR]   Available: " .. NamesIn(Path(UI.DungeonList)))
         lobbyFlowActive = false
         return
     end
     S(0.8)
 
     -- Step 4: difficulty - same shape, frame named Easy/Medium/Hard/...
+    -- Waited for, exactly like the dungeon row above. It used to be
+    -- checked ONCE, 0.8s after the dungeon was picked, and the
+    -- difficulty buttons are built after that choice - so a difficulty
+    -- sitting in plain sight was reported missing purely because the
+    -- panel had not finished populating.
     print("[DQR] Step 4: Difficulty " .. CONFIG.Difficulty)
-    local fb = DifficultyBtn(CONFIG.Difficulty)
+    local fb, dw = DifficultyBtn(CONFIG.Difficulty), 0
+    while not fb and dw < 8 do
+        S(0.4) dw = dw + 0.4
+        fb = DifficultyBtn(CONFIG.Difficulty)
+    end
     if fb then
         ClickButton(fb)
     else
+        -- Say what IS there. The dungeon step has always done this and
+        -- it is how every naming mismatch so far got solved.
         print("[DQR]   MISS - no difficulty frame named '"
             .. CONFIG.Difficulty .. "'.")
+        print("[DQR]   Available: " .. NamesIn(Path(UI.DiffRoot)))
     end
     S(0.8)
 
@@ -6390,7 +6415,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.39 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.40 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
     -- the end of boot is not reached until a dungeon is up, and if the
