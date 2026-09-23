@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.37
+--  DQR AUTO FARM v10.38
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -15,7 +15,7 @@ local CONFIG = {
     -- set Class to "" if you want to tune the numbers yourself.
     Class          = "Warrior",
 
-    TargetDungeon  = "Ghastly Harbor",
+    TargetDungeon  = "The Canals",
     Difficulty     = "Nightmare",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
@@ -319,6 +319,11 @@ local CONFIG = {
     PaceGiveUp     = 2,      -- pacing bouts before abandoning the target
     LoopStallTime  = 6,      -- secs without a farm tick = dead thread
     AgentMaxSlope  = 45,     -- steeper than this = route around, not up
+    DescendDrop    = 8,      -- when the target is at least this far
+                             -- BELOW us and no route exists, walk off
+                             -- the edge toward it. Roblox's pathfinder
+                             -- never routes off a ledge, so without
+                             -- this the bot paces a bridge forever
     JumpMax        = 7,      -- a humanoid clears about this; a waypoint
                              -- higher than this is a wall, not a step
     DropMax        = 12,     -- a drop bigger than this on the way to a
@@ -1020,6 +1025,7 @@ local unreachable = {}   -- model -> tick() until which to ignore it
 local pathTargetModel = nil  -- what MainLoop is currently chasing
 local engageRing = 0     -- MainLoop's current fighting distance to it
 local hazardWaitUntil = 0  -- route crossed a hazard: stand until then
+local descendUntil = 0     -- deliberately walking off a ledge until then
 
 local function ClearPath()
     pathQueue = {}
@@ -1261,6 +1267,28 @@ local function PathWorker(getDestFn)
                                     root.Position + steerDir * CONFIG.ProbeDist) then
                                 steerDir   = ClearDirection(root.Position, dest)
                                 steerUntil = tick() + CONFIG.SteerDwell
+                            end
+                            -- The target is BELOW us and there is no
+                            -- route. Roblox's pathfinder will not send
+                            -- an agent off a ledge, so on a bridge or a
+                            -- balcony it returns nothing and the bot
+                            -- paces the edge forever - but a humanoid
+                            -- can just walk off and fall. Head straight
+                            -- at it and let gravity finish the job.
+                            if dest.Y < root.Position.Y - CONFIG.DescendDrop then
+                                local dd = Vector3.new(dest.X - root.Position.X, 0,
+                                                       dest.Z - root.Position.Z)
+                                if dd.Magnitude > 1 then
+                                    steerDir     = dd.Unit
+                                    steerUntil   = tick() + CONFIG.SteerDwell
+                                    descendUntil = tick() + 3
+                                    if pathFail % 5 == 1 then
+                                        print(("[DQR] Target is %d studs below "
+                                            .. "and unroutable - walking off the "
+                                            .. "edge toward it."):format(
+                                            root.Position.Y - dest.Y))
+                                    end
+                                end
                             end
                             if pathFail % 5 == 1 then
                                 print("[DQR] No path to target ("
@@ -1694,8 +1722,11 @@ local function StartMoving(getDestFn)
         -- route to clear - is not being stuck, and treating it as such
         -- sent the bot on an unstick manoeuvre in a random direction,
         -- sometimes straight into the hazard it was waiting on.
+        -- ...and not while deliberately walking off a ledge: standing
+        -- at the edge about to drop looks exactly like being wedged,
+        -- and an unstick manoeuvre would turn us round and undo it.
         if dest and (dest - pos).Magnitude > CONFIG.WaypointReach
-        and tick() >= hazardWaitUntil then
+        and tick() >= hazardWaitUntil and tick() >= descendUntil then
             local now = tick()
             if not stuckAt or (pos - stuckAt).Magnitude > CONFIG.StuckDist then
                 stuckAt, stuckSince = pos, now
@@ -1752,7 +1783,7 @@ local function StartMoving(getDestFn)
         -- have we actually GONE anywhere? Staying inside a small circle
         -- while still having somewhere to be means no.
         if dest and (dest - pos).Magnitude > CONFIG.WaypointReach
-        and tick() >= hazardWaitUntil then
+        and tick() >= hazardWaitUntil and tick() >= descendUntil then
             local now2 = tick()
             if not paceAnchor
             or (pos - paceAnchor).Magnitude > CONFIG.PaceRadius then
@@ -3235,7 +3266,11 @@ local function WarnColor(c)
     -- - is saturated, while the dojo's orange-tan planks are muted
     -- (a plank is about 0.55 saturated; paint is 0.8 and up).
     local h, s, v = c:ToHSV()
-    if h >= 0.04 and h <= 0.15 and s >= 0.65 and v >= 0.8 then
+    -- Through to YELLOW, not just orange: Pirate Island paints golden
+    -- ellipses on the deck and they sat a hair outside a 0.15 ceiling.
+    -- Saturation and brightness stay strict, which is what keeps sand
+    -- and wood - muted, whatever their hue - out of the list.
+    if h >= 0.04 and h <= 0.19 and s >= 0.65 and v >= 0.8 then
         return "orange"
     end
     -- Purple through magenta and pink. Loose on saturation on purpose:
@@ -6362,7 +6397,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.37 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.38 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
     -- the end of boot is not reached until a dungeon is up, and if the
