@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.43
+--  DQR AUTO FARM v10.44
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -232,7 +232,12 @@ local CONFIG = {
     -- Samurai Palace's flat green discs (which ARE hazards) by being
     -- tall for its width. OverheadHeight is how far above the
     -- character a freshly spawned part counts as "marked".
-    ShelterRescue  = true,
+    -- OFF. Built from one screenshot and never confirmed to work, and
+    -- it treats a big green dome as a SAFE zone - while Lord Varosh
+    -- paints green cylinders that are the opposite. A guess that makes
+    -- the bot stand in a confirmed hazard is worse than no feature, so
+    -- it stays off unless the Crystal Golem is actually being farmed.
+    ShelterRescue  = false,
     ShelterMinSize = 14,
     OverheadHeight = 6,
     -- Nothing may stop the bot for good. An attack marker lasts
@@ -242,7 +247,19 @@ local CONFIG = {
     -- if there is a live target whose health has not dropped while we
     -- have not moved for StallTime, hazards are ignored for StallMute
     -- seconds and the fight resumes. The bot stood all night once.
+    -- Containers whose contents are the BUILT MAP, never an attack.
+    -- Anything under one of these is decoration however it is coloured
+    -- and however much it flickers - WallDetailStripe and FloorPlate,
+    -- which pinned the bot in the sci-fi dungeon, are both
+    -- Workspace.Map.Models.*. Attacks live at the top of Workspace
+    -- (laserBeam, preCast) or under the mob that cast them.
+    MapFolders     = {Map = true, Terrain = true, Camera = true,
+                      Lighting = true},
     HazardMaxAge   = 20,
+    HazardBanTime  = 120,    -- once something has been judged scenery,
+                             -- ignore it for this long. A one-sweep ban
+                             -- was useless: the capped broadphase drops
+                             -- a part for a moment and its clock reset.
     HazardStuckTime= 12,     -- continuously "in a hazard" for longer
                              -- than this = the scanner is wrong, not
                              -- the game. No real telegraph outlasts it.
@@ -3347,6 +3364,22 @@ local function WarnColor(c)
     return nil
 end
 
+-- Part of the built map? Dungeon Quest keeps its geometry under a
+-- container of its own, and an attack is never in there. This is the
+-- single most reliable test in the whole scanner: it does not care
+-- about colour, size, transparency or how much a decoration flickers.
+-- WallDetailStripe and FloorPlate - both Workspace.Map.Models.* - are
+-- what had the bot standing still in empty corridors.
+local function IsMapPart(o)
+    local n, depth = o.Parent, 0
+    while n and n ~= workspace and depth < 10 do
+        if CONFIG.MapFolders[n.Name] then return true end
+        n = n.Parent
+        depth = depth + 1
+    end
+    return false
+end
+
 -- HazardDebug: a warning-coloured part the size caps threw out, named
 -- once every few seconds, so a ring the bot walked through can be
 -- traced to the cap that rejected it.
@@ -3368,7 +3401,7 @@ end
 -- well inside the radius appeared there.
 local function IsTelegraph(o, pos, radius)
     if not o:IsA("BasePart") then return false end
-    if IsOurs(o) then return false end
+    if IsOurs(o) or IsMapPart(o) then return false end
     -- Warning colours are trusted past the size caps; nothing else is.
     -- Giving every non-solid part the relaxed caps was too generous -
     -- a dungeon full of moving holograms and light panels then had
@@ -3483,15 +3516,30 @@ end
 -- fires again later is fresh again.
 local srcFirst = setmetatable({}, {__mode = "k"})
 local srcLast  = setmetatable({}, {__mode = "k"})
+local srcBan   = setmetatable({}, {__mode = "k"})
 local function TooOld(src)
     if not src then return false end
-    local now  = tick()
+    local now = tick()
+    -- Once judged decoration, it stays decoration for a good while.
+    -- Without this the ban lasted a single sweep: the broadphase query
+    -- is capped and truncates, so a part drops out of the results for
+    -- a moment, the "break of a few seconds" rule below resets its
+    -- clock, and it comes straight back as a fresh hazard. The log
+    -- showed exactly that - "aged out" and re-added in the same second,
+    -- over and over.
+    local ban = srcBan[src]
+    if ban then
+        if now < ban then return true end
+        srcBan[src], srcFirst[src], srcLast[src] = nil, nil, nil
+    end
     local last = srcLast[src]
     if not last or now - last > 3 then srcFirst[src] = now end
     srcLast[src] = now
     if now - srcFirst[src] > CONFIG.HazardMaxAge then
-        if CONFIG.HazardDebug and now - srcFirst[src] < CONFIG.HazardMaxAge + 0.2 then
-            print("[DQR] Hazard aged out - decoration: " .. src:GetFullName())
+        srcBan[src] = now + CONFIG.HazardBanTime
+        if CONFIG.HazardDebug then
+            print(("[DQR] Hazard aged out - decoration, ignored for %ds: %s")
+                :format(CONFIG.HazardBanTime, src:GetFullName()))
         end
         return true
     end
@@ -3628,7 +3676,7 @@ end
 -- it. The Overlords' purple spheres park on the ground and tick, and
 -- nothing in the script looked at them.
 local function IsBlob(o)
-    if not o:IsA("BasePart") or IsOurs(o) then return false end
+    if not o:IsA("BasePart") or IsOurs(o) or IsMapPart(o) then return false end
     if o.CanCollide or o.Transparency > 0.9 then return false end
     local s = PartSize(o)
     local w, d = s.X, s.Z
@@ -3726,6 +3774,9 @@ end
 function BeamShaped(o)
     if not o:IsA("BasePart") then return false end
     if IsOurs(o) then return false end
+    -- Map geometry is full of long thin things: rails, pipes, trim,
+    -- wall stripes. None of them is a laser.
+    if IsMapPart(o) then return false end
     local s = PartSize(o)
     local x, y, z = s.X, s.Y, s.Z
     local minLen, maxThick = CONFIG.BeamMinLen, CONFIG.BeamMaxThick
@@ -6512,7 +6563,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.43 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.44 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
     -- the end of boot is not reached until a dungeon is up, and if the
