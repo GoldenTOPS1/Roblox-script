@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.31
+--  DQR AUTO FARM v10.32
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -5815,9 +5815,64 @@ function Farm.StatusDump()
     print("[DQR] === END HUD PANEL ===")
 end
 
+-- The status message id, kept somewhere it survives the script being
+-- executed again - a new run, a rejoin, a manual re-execute. Without
+-- this every fresh start posts a brand new embed and leaves the last
+-- one frozen in the channel. File first (survives anything), then the
+-- executor's shared global table (survives a re-execute in the same
+-- session). The webhook is stored beside the id, so pointing the
+-- script at a different channel does not try to edit a message that
+-- lives in the old one.
+local STATUS_KEY = "DQR_status.txt"
+
+function Hud.LoadId(url)
+    local raw
+    local rf = Env("readfile")
+    if typeof(rf) == "function" then
+        local ok, v = pcall(rf, STATUS_KEY)
+        if ok and type(v) == "string" then raw = v end
+    end
+    if not raw then
+        local g = Env("getgenv")
+        if typeof(g) == "function" then
+            local ok, t = pcall(g)
+            if ok and type(t) == "table" and type(t.DQR_Status) == "string" then
+                raw = t.DQR_Status
+            end
+        end
+    end
+    if type(raw) ~= "string" then return nil end
+    local u, id = raw:match("^(.-)\n(.+)$")
+    if u == url and id then
+        id = id:gsub("%s", "")
+        if id ~= "" then return id end
+    end
+    return nil
+end
+
+function Hud.SaveId(url, id)
+    local data = tostring(url) .. "\n" .. tostring(id or "")
+    local wf = Env("writefile")
+    if typeof(wf) == "function" then pcall(wf, STATUS_KEY, data) end
+    local g = Env("getgenv")
+    if typeof(g) == "function" then
+        local ok, t = pcall(g)
+        if ok and type(t) == "table" then t.DQR_Status = data end
+    end
+end
+
+-- Remove a status message we are about to replace, so old embeds do
+-- not pile up in the channel.
+function Hud.DeleteMsg(url, id)
+    if not id or not url then return end
+    pcall(function()
+        HttpRequest({Url = url .. "/messages/" .. id, Method = "DELETE"})
+    end)
+end
+
 function Farm.StatusWatcher()
     local msgId, base, startedAt = nil, nil, tick()
-    local said, lastErr = false, 0
+    local said, lastErr, loaded = false, 0, false
     while true do
         S(math.max(2, CONFIG.StatusInterval or 5))
         local url = CONFIG.StatusWebhook
@@ -5832,9 +5887,24 @@ function Farm.StatusWatcher()
                 print("[DQR] Status: StatusWebhook does not look like a URL.")
             end
         else
-            -- A different webhook means a different channel: start a
-            -- new message rather than edit an id that is not there.
-            if base ~= url then base, msgId = url, nil end
+            -- First tick: pick up the message this script was editing
+            -- before it was restarted, so a new run keeps updating the
+            -- same embed instead of posting another one.
+            if not loaded then
+                loaded = true
+                msgId  = Hud.LoadId(url)
+                if msgId then
+                    print("[DQR] Status: continuing the message from the "
+                        .. "previous run.")
+                end
+            end
+            -- A different webhook means a different channel. Clear the
+            -- old message out rather than orphan it there.
+            if base ~= nil and base ~= url then
+                Hud.DeleteMsg(base, msgId)
+                msgId = nil
+            end
+            base = url
             -- Errors here used to vanish into the pcall, so a single
             -- nil index meant silence forever with nothing to go on.
             local ok, err = pcall(function()
@@ -5923,6 +5993,7 @@ function Farm.StatusWatcher()
                     -- Discord objected to instead.
                     if code == 404 then
                         msgId = nil
+                        Hud.SaveId(base, nil)
                         print("[DQR] Status message is gone - posting a new one.")
                     elseif code == 400 then
                         if tick() - lastErr > 15 then
@@ -5945,6 +6016,9 @@ function Farm.StatusWatcher()
                             return HttpS:JSONDecode(res.Body) end)
                         if okj and type(data) == "table" and data.id then
                             msgId = tostring(data.id)
+                            -- Remembered, so the next run edits this
+                            -- one instead of posting another.
+                            Hud.SaveId(base, msgId)
                             print(("[DQR] Status embed posted - updating "
                                 .. "every %ss from now on."):format(
                                 tostring(CONFIG.StatusInterval)))
@@ -6081,7 +6155,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.31 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.32 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
     -- the end of boot is not reached until a dungeon is up, and if the
