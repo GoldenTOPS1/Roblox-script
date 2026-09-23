@@ -17,7 +17,7 @@ local CONFIG = {
 
     TargetDungeon  = "Orbital Outpost",
     Difficulty     = "Nightmare",
-    Hardcore       = false,  -- true = also press HARDCORE MODE
+    Hardcore       = true,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
 
     -- CARRY MODE. false = start the run the moment the lobby is made,
