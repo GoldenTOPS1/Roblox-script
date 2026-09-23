@@ -128,7 +128,7 @@ local CONFIG = {
     --   "both"  - fire the Tool AND click. Use this to find out which
     --             one the game wants; then set it to whichever worked.
     -- Spells are keyboard (Q/E) in every mode and never use the mouse.
-    MeleeMode      = "tool",
+    MeleeMode      = "click",
 
     -- Walk speed: SetWalkSpeed=false leaves whatever the game gives you
     SetWalkSpeed   = true,
