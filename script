@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.32
+--  DQR AUTO FARM v10.34
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -110,7 +110,7 @@ local CONFIG = {
                              -- step clears it and a long one is time
                              -- spent not fighting. A fat projectile
                              -- overrides this - see ThreatMaxSize.
-    ThreatMaxSize  = 30,     -- biggest thing still treated as a thrown
+    ThreatMaxSize  = 40,     -- biggest thing still treated as a thrown
                              -- projectile rather than scenery. The
                              -- Overlords' purple spheres are twenty-odd
                              -- studs across, and a 12-stud cap meant
@@ -214,6 +214,15 @@ local CONFIG = {
     -- between two equally cramped spots forever.
     SafeMargin     = 6,
     RepositionGain = 3,
+    -- Shelter. Some bosses mark you - the Crystal Golem drops a
+    -- crystal on your head - and the answer is not to dodge but to get
+    -- inside the green dome and stay there. A dome is told from
+    -- Samurai Palace's flat green discs (which ARE hazards) by being
+    -- tall for its width. OverheadHeight is how far above the
+    -- character a freshly spawned part counts as "marked".
+    ShelterRescue  = true,
+    ShelterMinSize = 14,
+    OverheadHeight = 6,
     -- Nothing may stop the bot for good. An attack marker lasts
     -- seconds: a source still producing a footprint after HazardMaxAge
     -- is decoration and stops counting. "Hazard between us and the
@@ -2920,12 +2929,10 @@ end -- of the combat block
 
 -- ============================================================
 --  THREAT DETECTION
+--  Projectiles are recognised by how they move, not by what colour
+--  they are. A colour list was tried and kept missing things - the
+--  Overlords' blue-purple spheres among them.
 -- ============================================================
-local function ColorIsThreat(c)
-    return (c.R > 0.6 and c.G < 0.35 and c.B < 0.35)
-        or (c.R > 0.6 and c.G < 0.35 and c.B > 0.5)
-        or (c.R > 0.7 and c.G > 0.3  and c.B < 0.1)
-end
 
 -- Anything this script spawned into the world. The range bar is red,
 -- flat and long, i.e. it matches the telegraph test perfectly - and you
@@ -2965,10 +2972,18 @@ local function ScanThreatsRaw()
         -- scenery and they were never dodged.
         if math.max(s.X, s.Y, s.Z) > CONFIG.ThreatMaxSize then return end
         local rad = math.max(s.X, s.Y, s.Z) / 2
-        local born = recentParts[obj]
-        if not (obj.Material == Enum.Material.Neon or ColorIsThreat(obj.Color)
-                or (born ~= nil and now - born < CONFIG.RecentWindow)) then
-            return
+        -- Judged by BEHAVIOUR, not by looks. The old gate demanded
+        -- Neon, or a red/orange/pink colour, or a part that had just
+        -- spawned - and a deep blue-purple ball drawn from an effect
+        -- pool (so never "new") matched none of the three and was
+        -- dropped before the motion test ever ran. What actually makes
+        -- something a projectile is that it is not part of the map,
+        -- not a creature, and moving at us; the motion test below
+        -- decides, and it is far harder to fool than a colour list.
+        if obj.CanCollide then return end        -- map geometry
+        local owner = obj:FindFirstAncestorOfClass("Model")
+        if owner and owner:FindFirstChildOfClass("Humanoid") then
+            return                               -- a mob or a player
         end
         local vel = obj.AssemblyLinearVelocity
         local rec = threatSeen[obj]
@@ -3035,6 +3050,8 @@ do
 -- that a part first seen well inside its radius must have come to us?
 local sweepFresh = false
 local settledPos, settledAt = nil, 0
+-- The nearest shelter dome this sweep, and how far away it was.
+local shelterAt, shelterBest = nil, nil
 
 -- A part's shape in WORLD terms: how tall it stands, and its two
 -- horizontal extents with their directions. Reading Size.Y for the
@@ -3397,11 +3414,57 @@ end
 
 -- Records the footprint of every ground telegraph near `pos`. Just the
 -- shapes: deciding where to go is done afterwards, over all of them.
+-- A big green DOME is shelter, not a hazard. The Crystal Golem drops
+-- a crystal on your head and standing inside the dome is what saves
+-- you - so it has to be told apart from Samurai Palace's flat green
+-- discs, which are the opposite. Height does it: a dome is tall for
+-- its width, a painted disc is not.
+local function IsShelter(o)
+    if not o:IsA("BasePart") or IsOurs(o) then return false end
+    if o.CanCollide or o.Transparency > 0.9 then return false end
+    local s = PartSize(o)
+    local w = math.max(s.X, s.Z)
+    if w < CONFIG.ShelterMinSize then return false end
+    if s.Y < w * 0.25 then return false end        -- flat: a disc, not a dome
+    local h, sat, v = o.Color:ToHSV()
+    return h >= 0.20 and h <= 0.45 and sat >= 0.30 and v >= 0.45
+end
+
+-- A ball of damage sitting on the floor. Not flat, so the telegraph
+-- test throws it out; not moving, so the projectile test never sees
+-- it. The Overlords' purple spheres park on the ground and tick, and
+-- nothing in the script looked at them.
+local function IsBlob(o)
+    if not o:IsA("BasePart") or IsOurs(o) then return false end
+    if o.CanCollide or o.Transparency > 0.9 then return false end
+    if not WarnColor(o.Color) then return false end
+    local s = PartSize(o)
+    local w, d = s.X, s.Z
+    if math.max(w, d) < CONFIG.TelegraphMinLen then return false end
+    if math.max(w, d) > CONFIG.RedMaxWide then return false end
+    -- Round seen from above, and tall enough that it is a body rather
+    -- than a painted marker (those are handled by IsTelegraph).
+    if math.abs(w - d) > math.max(w, d) * 0.35 then return false end
+    if s.Y < math.max(w, d) * 0.3 then return false end
+    return true
+end
+
 local function CollectTelegraphs(pos)
     if not CONFIG.DodgeTelegraph then return end
     local radius = CONFIG.DodgeRange
     for _, o in ipairs(HazardCandidates(pos, radius)) do
-        if IsTelegraph(o, pos, radius) and not PlayerOwned(o) then
+        -- Shelter is recorded, never treated as something to avoid.
+        if CONFIG.ShelterRescue and IsShelter(o) then
+            local d = (o.Position - pos).Magnitude
+            if d < (shelterBest or math.huge) then
+                shelterBest, shelterAt = d, o.Position
+            end
+        elseif IsBlob(o) and not PlayerOwned(o)
+        and math.abs(o.Position.Y - pos.Y) < 20 then
+            local s = PartSize(o)
+            NoteDisc(o.Position.X, o.Position.Y, o.Position.Z,
+                     math.max(s.X, s.Z) / 2 + CONFIG.TelegraphPad, o)
+        elseif IsTelegraph(o, pos, radius) and not PlayerOwned(o) then
             local _, a, b, va = Footprint(o)
             -- A ring AoE is as wide as it is long. Treating it as a box
             -- would pick one of its axes and walk us along a chord;
@@ -4067,7 +4130,7 @@ end
 hazardCache = {t = 0, escape = nil, radial = false, radialN = 0,
                backoffR = nil, backoffFor = nil,
                holdP = nil, holdUntil = 0, commitUntil = 0,
-               restUntil = 0, resting = false}
+               restUntil = 0, resting = false, sheltering = false}
 
 -- A sidestep out of a projectile's way, shared by the main loop and
 -- the dodge watcher: to whichever side the thing is NOT drifting
@@ -4133,8 +4196,37 @@ function ScanHazards()
 
     -- Rebuilt every sweep, and completely, before anything is decided.
     table.clear(hazardShapes)
+    shelterAt, shelterBest = nil, nil
     CollectTelegraphs(pos)
     CollectBeams(pos)
+
+    -- Something dropping on our head - the Crystal Golem marks you
+    -- with a crystal, and the only answer is to get under the dome.
+    -- This outranks every other movement: a hazard on the floor costs
+    -- a fraction of what the crystal does.
+    if CONFIG.ShelterRescue and shelterAt then
+        local overhead = false
+        for _, o in ipairs(NearbyParts(pos + Vector3.new(0, 16, 0), 12)) do
+            if not IsOurs(o) and not o.CanCollide and recentParts[o]
+            and o.Position.Y > pos.Y + CONFIG.OverheadHeight
+            and not PlayerOwned(o) then
+                overhead = true
+                break
+            end
+        end
+        hazardCache.sheltering = overhead
+        if overhead then
+            hazardCache.escape = shelterAt
+            hazardCache.holdP, hazardCache.commitUntil = shelterAt, now + 3
+            if CONFIG.HazardDebug then
+                print(("[DQR] Marked from above - running for the dome (%d studs).")
+                    :format(shelterBest or 0))
+            end
+            return shelterAt
+        end
+    else
+        hazardCache.sheltering = false
+    end
     if CONFIG.HazardDebug then pcall(DrawHazards) end
 
     -- Is the target fanning beams out around itself? Measured every
@@ -4778,14 +4870,20 @@ local function MainLoop()
             -- into the hazard the moment the escape had us clear of it.
             -- Not while merely resting beside one: that spot is safe,
             -- and backing further off it costs attacks for nothing.
-            if target.Boss and not hazardCache.resting then
+            -- Running for shelter is not backing off a hazard, and
+            -- must not push the fighting distance out: the dome is
+            -- where it is.
+            if target.Boss and not hazardCache.resting
+            and not hazardCache.sheltering then
                 hazardBackoff = now + CONFIG.BeamBackoffTime
             end
             currentDest = Vector3.new(escape.X, root.Position.Y, escape.Z)
             ShowRangeBar(root, mobPos, dist)
             if now - lastTeleWarn > 2 then
                 lastTeleWarn = now
-                print(hazardCache.resting
+                print(hazardCache.sheltering
+                    and "[DQR] Marked from above - getting under the dome."
+                    or hazardCache.resting
                     and "[DQR] Clear of the hazard - holding here until it goes."
                     or hazardCache.radial
                     and "[DQR] In a beam fan - stepping clear and backing out."
@@ -6155,7 +6253,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.32 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.34 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
     -- the end of boot is not reached until a dungeon is up, and if the
