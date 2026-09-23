@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.29
+--  DQR AUTO FARM v10.31
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -108,7 +108,13 @@ local CONFIG = {
     DodgeStep      = 8,      -- a sidestep out of a projectile's way: an
                              -- orb is a few studs across, so a short
                              -- step clears it and a long one is time
-                             -- spent not fighting
+                             -- spent not fighting. A fat projectile
+                             -- overrides this - see ThreatMaxSize.
+    ThreatMaxSize  = 30,     -- biggest thing still treated as a thrown
+                             -- projectile rather than scenery. The
+                             -- Overlords' purple spheres are twenty-odd
+                             -- studs across, and a 12-stud cap meant
+                             -- they were never dodged at all.
     AttackRate     = 0.3,    -- spell cast rate
     MeleeRate      = 0.2,    -- melee swing rate
 
@@ -2949,12 +2955,16 @@ local function ScanThreatsRaw()
     if not root then return false, nil end
     local now, me, char = tick(), root.Position, GetChar()
     local threatSeen = threatCache.seen
-    local best, bestT, bestV = nil, math.huge, nil
+    local best, bestT, bestV, bestR = nil, math.huge, nil, 0
     local function Consider(obj)
         if not obj:IsA("BasePart") or IsOurs(obj) then return end
         if char and obj:IsDescendantOf(char) then return end
         local s = obj.Size
-        if math.max(s.X, s.Y, s.Z) > 12 then return end   -- not a projectile
+        -- Big projectiles exist: the Overlords throw purple spheres
+        -- twenty-odd studs across. A flat 12-stud cap called those
+        -- scenery and they were never dodged.
+        if math.max(s.X, s.Y, s.Z) > CONFIG.ThreatMaxSize then return end
+        local rad = math.max(s.X, s.Y, s.Z) / 2
         local born = recentParts[obj]
         if not (obj.Material == Enum.Material.Neon or ColorIsThreat(obj.Color)
                 or (born ~= nil and now - born < CONFIG.RecentWindow)) then
@@ -2973,10 +2983,12 @@ local function ScanThreatsRaw()
         local u = vel / speed
         local along = d:Dot(u)
         if along <= 0 then return end                     -- moving away
-        if (d - u * along).Magnitude > 7 then return end  -- will pass wide
+        -- "Passes wide" has to account for how fat the thing is: a
+        -- twenty-stud ball missing our centre by ten still swallows us.
+        if (d - u * along).Magnitude > 7 + rad then return end
         local tti = along / speed
         if tti > 2.5 then return end                      -- not yet a worry
-        if tti < bestT then best, bestT, bestV = obj, tti, vel end
+        if tti < bestT then best, bestT, bestV, bestR = obj, tti, vel, rad end
     end
     for _, obj in ipairs(NearbyParts(me, CONFIG.DodgeRange)) do Consider(obj) end
     -- Spawned parts too: the broadphase skips CanQuery-off effects.
@@ -2986,18 +2998,19 @@ local function ScanThreatsRaw()
             Consider(p)
         end
     end
-    if best then return true, best.Position, bestT, bestV end
+    if best then return true, best.Position, bestT, bestV, bestR end
     return false, nil
 end
 
 local function ScanThreats()
     local now = tick()
-    if now - threatCache.t < CONFIG.ThreatTTL then
-        return threatCache.hit, threatCache.pos, threatCache.tti, threatCache.vel
+    if now - threatCache.t >= CONFIG.ThreatTTL then
+        threatCache.t = now
+        threatCache.hit, threatCache.pos, threatCache.tti,
+        threatCache.vel, threatCache.rad = ScanThreatsRaw()
     end
-    threatCache.t = now
-    threatCache.hit, threatCache.pos, threatCache.tti, threatCache.vel = ScanThreatsRaw()
-    return threatCache.hit, threatCache.pos, threatCache.tti, threatCache.vel
+    return threatCache.hit, threatCache.pos, threatCache.tti,
+           threatCache.vel, threatCache.rad
 end
 
 -- ============================================================
@@ -3099,12 +3112,18 @@ local function WarnColor(c)
     if h >= 0.04 and h <= 0.15 and s >= 0.65 and v >= 0.8 then
         return "orange"
     end
-    -- Purple through magenta, by hue: the Overlords' strips are pink-
-    -- purple, which the old "more blue than red" test called not purple.
-    if h >= 0.72 and h <= 0.95 and s >= 0.45 and v >= 0.5 then
+    -- Purple through magenta and pink. Loose on saturation on purpose:
+    -- Enchanted Forest's markers run from vivid magenta strips to pale
+    -- washed-out pink ellipses, and a 0.45 floor threw the pale ones
+    -- away. What keeps the purple GROUND of that dungeon out is not
+    -- the colour test but the solid-and-never-moved guard below.
+    if h >= 0.70 and h <= 0.97 and s >= 0.18 and v >= 0.35 then
         return "purple"
     end
-    if g > 0.55 and r < 0.55 and b < 0.55 and g > math.max(r, b) * 1.3 then
+    -- Green, by hue. The old test demanded r < 0.55, and the bright
+    -- lime discs sit above that - so the bot backed into one while
+    -- dodging something else.
+    if h >= 0.20 and h <= 0.45 and s >= 0.30 and v >= 0.45 then
         return "green"
     end
     return nil
@@ -4057,7 +4076,7 @@ hazardCache = {t = 0, escape = nil, radial = false, radialN = 0,
 -- about to land, a hop there instead of a walk. Returns the spot.
 -- Lives on hazardCache rather than as a local: the main chunk is at
 -- Luau's local limit.
-hazardCache.Dodge = function(root, origin, vel, urgent, fallback)
+hazardCache.Dodge = function(root, origin, vel, urgent, fallback, rad)
     local pos = root.Position
     local toward = Vector3.new(origin.X - pos.X, 0, origin.Z - pos.Z)
     if toward.Magnitude < 0.5 then return nil end
@@ -4065,8 +4084,11 @@ hazardCache.Dodge = function(root, origin, vel, urgent, fallback)
     local perp = Vector3.new(-toward.Z, 0, toward.X)
     local lat = vel and perp:Dot(Vector3.new(vel.X, 0, vel.Z)) or 0
     local sign = lat > 1 and -1 or lat < -1 and 1 or fallback
-    local p = SafeStep(pos, perp * sign, CONFIG.DodgeStep)
-           or SafeStep(pos, perp * -sign, CONFIG.DodgeStep)
+    -- Step far enough to actually clear the thing. Eight studs is
+    -- plenty beside a dart and useless beside a twenty-stud ball.
+    local step = math.max(CONFIG.DodgeStep, (rad or 0) + 6)
+    local p = SafeStep(pos, perp * sign, step)
+           or SafeStep(pos, perp * -sign, step)
     if not p then return nil end
     if urgent and CONFIG.HazardTeleport then
         local land = HopClear(pos, p)
@@ -4774,12 +4796,12 @@ local function MainLoop()
         end
 
         -- Dodge - highest movement priority
-        local threatened, tOrigin, tti, tVel = ScanThreats()
+        local threatened, tOrigin, tti, tVel, tRad = ScanThreats()
         if threatened and (now - lastDodge) > CONFIG.DodgeCooldown then
             lastDodge = now
             local sign = math.cos(orbitAngle) > 0 and 1 or -1
             local dodge = hazardCache.Dodge(root, tOrigin, tVel,
-                                            tti ~= nil and tti < 0.6, sign)
+                                            tti ~= nil and tti < 0.6, sign, tRad)
             if dodge then
                 currentDest = dodge
                 ShowRangeBar(root, mobPos, dist)
@@ -5013,13 +5035,13 @@ local function DodgeWatcher()
             continue
         end
 
-        local ok, origin, tti, vel = ScanThreats()
+        local ok, origin, tti, vel, rad = ScanThreats()
         local now = tick()
         if ok and (now - lastDW) > CONFIG.DodgeCooldown then
             lastDW = now
             local sign = math.cos(orbitAngle) > 0 and 1 or -1
             currentDest = hazardCache.Dodge(root, origin, vel,
-                                            tti ~= nil and tti < 0.6, sign)
+                                            tti ~= nil and tti < 0.6, sign, rad)
                        or currentDest
         end
     end
@@ -6059,7 +6081,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.29 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.31 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
     -- the end of boot is not reached until a dungeon is up, and if the
