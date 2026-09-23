@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.42
+--  DQR AUTO FARM v10.43
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -143,7 +143,7 @@ local CONFIG = {
                              -- foot level, else it is floor decoration
     FootOffset     = 3,      -- studs from HumanoidRootPart down to feet
     RecentWindow   = 8,      -- a part this new counts as an attack
-    HazardDebug    = false,  -- log what the hazard scanner reacts to AND
+    HazardDebug    = true,  -- log what the hazard scanner reacts to AND
                              -- draw every footprint it sees as a red
                              -- slab on the floor (F9 dumps the details)
 
@@ -243,6 +243,9 @@ local CONFIG = {
     -- have not moved for StallTime, hazards are ignored for StallMute
     -- seconds and the fight resumes. The bot stood all night once.
     HazardMaxAge   = 20,
+    HazardStuckTime= 12,     -- continuously "in a hazard" for longer
+                             -- than this = the scanner is wrong, not
+                             -- the game. No real telegraph outlasts it.
     WaitGiveUp     = 10,
     StallTime      = 30,
     StallMute      = 20,
@@ -4323,7 +4326,7 @@ hazardCache = {t = 0, escape = nil, radial = false, radialN = 0,
                backoffR = nil, backoffFor = nil,
                holdP = nil, holdUntil = 0, commitUntil = 0,
                restUntil = 0, resting = false, sheltering = false,
-               waitSince = 0, waitBlock = 0}
+               waitSince = 0, waitBlock = 0, inSince = 0}
 
 -- A sidestep out of a projectile's way, shared by the main loop and
 -- the dodge watcher: to whichever side the thing is NOT drifting
@@ -4459,7 +4462,34 @@ function ScanHazards()
     local esc = nil
     local held = hazardCache.holdP
     hazardCache.resting = false
-    if #hazardShapes > 0 and HazardAt(pos) then
+    local inHazard = #hazardShapes > 0 and HazardAt(pos)
+
+    -- Continuously standing in a hazard for longer than any real
+    -- telegraph lasts means the scanner is wrong about something.
+    -- The per-source age-out cannot catch this on its own: a stream of
+    -- freshly spawned effect parts is a NEW source every time, so each
+    -- one looks young while the bot is pinned indefinitely. Judge it
+    -- by the symptom instead - if escaping has not worked for this
+    -- long, the thing being escaped is probably not real - and stop
+    -- listening to the scanner for a while so the run continues.
+    if inHazard then
+        if (hazardCache.inSince or 0) == 0 then hazardCache.inSince = now end
+        if now - hazardCache.inSince > CONFIG.HazardStuckTime then
+            hazardCache.inSince   = 0
+            hazardCache.muteUntil = now + CONFIG.StallMute
+            hazardCache.escape, hazardCache.holdP = nil, nil
+            table.clear(hazardShapes)
+            print(("[DQR] Stood in a 'hazard' for %ds without escaping it - "
+                .. "treating it as a false reading and ignoring hazards for "
+                .. "%ds. Turn on HazardDebug to see what it is.")
+                :format(CONFIG.HazardStuckTime, CONFIG.StallMute))
+            return nil
+        end
+    else
+        hazardCache.inSince = 0
+    end
+
+    if inHazard then
         hazardCache.restUntil = 0
         -- Keep a chosen exit for a moment rather than re-picking every
         -- sweep and zig-zagging between two equally good ones - unless
@@ -5183,7 +5213,20 @@ local function MainLoop()
                     elseif now < (hazardCache.waitBlock or 0) then
                         -- Already waited this one out and gave up.
                         -- Walk through it; `spot` keeps its value.
-                        if now - lastTeleWarn > 3 then
+                        -- If it is STILL claiming to block us a while
+                        -- after that, the reading is wrong: no real
+                        -- telegraph sits across a route this long.
+                        -- Stop believing the scanner for a bit.
+                        if now - (hazardCache.waitBlock or 0)
+                           > CONFIG.HazardStuckTime then
+                            hazardCache.waitBlock = 0
+                            hazardCache.muteUntil = now + CONFIG.StallMute
+                            print(("[DQR] A 'hazard' has blocked the route for "
+                                .. "%ds after giving up on it - false reading, "
+                                .. "ignoring hazards for %ds. HazardDebug will "
+                                .. "name it."):format(CONFIG.HazardStuckTime,
+                                                     CONFIG.StallMute))
+                        elseif now - lastTeleWarn > 3 then
                             lastTeleWarn = now
                             print("[DQR] Hazard still in the way - walking through it.")
                         end
@@ -6469,7 +6512,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.42 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.43 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
     -- the end of boot is not reached until a dungeon is up, and if the
