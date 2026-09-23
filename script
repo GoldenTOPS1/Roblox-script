@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.44
+--  DQR AUTO FARM v10.45
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -6563,7 +6563,8 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.44 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.45 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
     -- the end of boot is not reached until a dungeon is up, and if the
@@ -6616,7 +6617,16 @@ end)
 --  F5 TOGGLE
 -- ============================================================
 UserInputService.InputBegan:Connect(function(inp, gpe)
-    if gpe then return end
+    -- `gpe` (gameProcessedEvent) is true whenever the game's own UI
+    -- took the key - which is most of the time in a dungeon, and is
+    -- why F7 appeared to do nothing. Function keys are ours: nothing
+    -- in the game types an F7, so take them whether or not the game
+    -- claims to have handled it.
+    local k = inp.KeyCode
+    local ours = k == Enum.KeyCode.F5 or k == Enum.KeyCode.F6
+              or k == Enum.KeyCode.F7 or k == Enum.KeyCode.F8
+              or k == Enum.KeyCode.F9 or k == Enum.KeyCode.F10
+    if gpe and not ours then return end
     if inp.KeyCode == Enum.KeyCode.F5 then
         if Farm.Running then Farm.Stop() else Farm.Start() end
     elseif inp.KeyCode == Enum.KeyCode.F6 then
@@ -6624,7 +6634,23 @@ UserInputService.InputBegan:Connect(function(inp, gpe)
         print("[DQR] InLobby() = " .. tostring(InLobby())
             .. "  MobsPresent() = " .. tostring(MobsPresent()))
     elseif inp.KeyCode == Enum.KeyCode.F7 then
-        if LogGui then LogGui.Enabled = not LogGui.Enabled end
+        -- Rebuild it if it never got made, and drag it back on screen:
+        -- the window is draggable, so it can be sitting off the edge
+        -- from a previous session and "nothing happens" looks the same
+        -- as a broken toggle.
+        if not LogGui or not LogGui.Parent then pcall(BuildLogGui) end
+        if LogGui then
+            LogGui.Enabled = not LogGui.Enabled
+            local main = LogGui:FindFirstChild("main")
+            if main and LogGui.Enabled then
+                main.Position = UDim2.new(0, 20, 0, 90)
+            end
+            print("[DQR] Log window " .. (LogGui.Enabled and "shown" or "hidden")
+                .. ". DQR_Copy() puts the whole log on the clipboard.")
+        else
+            print("[DQR] Could not build the log window - use DQR_Copy() "
+                .. "or print(DQR_Log()) in the console instead.")
+        end
     elseif inp.KeyCode == Enum.KeyCode.F8 then
         MobDiag()
     elseif inp.KeyCode == Enum.KeyCode.F9 then
@@ -6640,6 +6666,18 @@ getgenv().DQR_Dump  = DumpGui
 getgenv().DQR_Lobby = InLobby
 getgenv().DQR_Queue = RunLobbyFlow
 getgenv().DQR_Log   = function() return table.concat(LOG, "\n") end
+-- The GUI-free way to get the log out: no window to find, no key to
+-- press, works even if the log window never built.
+getgenv().DQR_Copy  = function()
+    local all = table.concat(LOG, "\n")
+    if Copy(all) then
+        print(("[DQR] %d lines copied to the clipboard."):format(#LOG))
+        return true
+    end
+    print("[DQR] No clipboard function in this executor - printing instead:")
+    print(all)
+    return false
+end
 getgenv().DQR_Mobs  = MobDiag
 getgenv().DQR_Hazards = HazardDiag
 getgenv().DQR_LootDump = LootDump
