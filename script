@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.26
+--  DQR AUTO FARM v10.27
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -65,6 +65,18 @@ local CONFIG = {
     -- When a run drops nothing worth posting: false = stay silent,
     -- true = still post the gold and gems with no items.
     LootPostIfEmpty = false,
+
+    -- Live status: ONE Discord message, edited in place every
+    -- StatusInterval seconds, carrying the same numbers the HUD panel
+    -- in the top-left corner shows - name, level, HP, EXP, gold, gems
+    -- - plus a line on what the bot is doing. Editing one message
+    -- means it never floods the channel; scroll to it whenever you
+    -- want to check in. Empty = off. Use a DIFFERENT webhook from the
+    -- loot one (its own channel) or loot posts will bury it.
+    -- DQR_StatusDump() in the console lists the HUD labels it found,
+    -- if a number comes out wrong.
+    StatusWebhook  = "https://discord.com/api/webhooks/1552146166706339880/_taQGMvg1dmQxDhSWwxSzHGsasOjqNuK86WxwOYyx3QlZGQVdodTgqcXwGGq-H91B1Tg",
+    StatusInterval = 5,
 
     -- Local-only vanity. Changes what YOUR client draws, nothing else:
     -- the server, other players and your actual save are untouched.
@@ -5700,6 +5712,200 @@ function LootWatcher()
     end
 end
 
+-- ============================================================
+--  LIVE STATUS EMBED
+--  The HUD panel in the top-left corner, mirrored into one Discord
+--  message that edits itself every few seconds. (A Roblox script
+--  cannot screenshot itself - no engine or executor API exists for
+--  it - but every number on that panel is readable text, which gets
+--  you the same information.)
+-- ============================================================
+
+-- The three helpers live on one table rather than as three locals,
+-- and the two entry points hang off Farm rather than being
+-- forward-declared: the main chunk is a handful of locals short of
+-- Luau's limit of 200, and this section would have crossed it.
+local Hud = {}
+
+-- 1300000 -> "1.30M", the way the HUD writes it.
+function Hud.Short(n)
+    n = tonumber(n) or 0
+    for _, p in ipairs({{1e12, "T"}, {1e9, "B"}, {1e6, "M"}, {1e3, "K"}}) do
+        if n >= p[1] then return ("%.2f%s"):format(n / p[1], p[2]) end
+    end
+    return ("%d"):format(n)
+end
+
+-- A TextLabel under the HUD panel, found by its own name or its
+-- parent's - the level one lives at playerStatus.Frame.levelBorder.level,
+-- so both halves matter. Returns the text, or nil.
+function Hud.Text(frag)
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    local root = pg and pg:FindFirstChild("playerStatus")
+    if not root then return nil end
+    local hit = nil
+    pcall(function()
+        for _, o in ipairs(root:GetDescendants()) do
+            if o:IsA("TextLabel") and o.Text ~= "" then
+                local n  = o.Name:lower()
+                local pn = (o.Parent and o.Parent.Name or ""):lower()
+                if n:find(frag, 1, true) or pn:find(frag, 1, true) then
+                    hit = o.Text
+                    return
+                end
+            end
+        end
+    end)
+    return hit
+end
+
+-- leaderstats first (the real value), the HUD label second. The
+-- vanity spoofer rewrites HUD text, so a spoofed name or level would
+-- otherwise end up in the status post.
+function Hud.Real(frag)
+    local ls = LP:FindFirstChild("leaderstats")
+    if ls then
+        for _, v in ipairs(ls:GetChildren()) do
+            if v.Name:lower():find(frag, 1, true) and v:IsA("ValueBase") then
+                return tostring(v.Value)
+            end
+        end
+    end
+    return Hud.Text(frag)
+end
+
+-- Console helper: every label on the HUD panel, so a number that
+-- comes out wrong can be traced to the label it should have used.
+function Farm.StatusDump()
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    local root = pg and pg:FindFirstChild("playerStatus")
+    if not root then
+        print("[DQR] No playerStatus GUI found.")
+        return
+    end
+    print("[DQR] === HUD PANEL ===")
+    for _, o in ipairs(root:GetDescendants()) do
+        if o:IsA("TextLabel") then
+            print(("%s = '%s'"):format(
+                o:GetFullName():gsub("^.*playerStatus%.", ""), o.Text))
+        end
+    end
+    print("[DQR] === END HUD PANEL ===")
+end
+
+function Farm.StatusWatcher()
+    local msgId, base, startedAt = nil, nil, tick()
+    while true do
+        S(math.max(2, CONFIG.StatusInterval or 5))
+        local url = CONFIG.StatusWebhook
+        if url ~= "" and url:find("^https://") then
+            -- A different webhook means a different channel: start a
+            -- new message rather than edit an id that is not there.
+            if base ~= url then base, msgId = url, nil end
+            pcall(function()
+                local HttpS = game:GetService("HttpService")
+                local human = GetHuman()
+                local dead  = not human or human.Health <= 0
+                local tgt   = (not dead) and GetNearestMob() or nil
+
+                -- What it is doing, in the order the main loop decides.
+                local doing
+                if dead then                   doing = "Dead - waiting to respawn"
+                elseif InLobbyPlace() then     doing = "In the lobby"
+                elseif lobbyFlowActive then    doing = "Queueing a dungeon"
+                elseif not Farm.Running then   doing = "Idle"
+                elseif hazardCache.escape then
+                    doing = hazardCache.resting and "Holding clear of a hazard"
+                                                or "Escaping a hazard"
+                elseif not tgt then            doing = "No target in range"
+                elseif currentDest == nil then doing = "Standing and attacking"
+                else                           doing = "Moving to target"
+                end
+
+                local fields = {}
+                local function F(n, v)
+                    if v and v ~= "" then
+                        fields[#fields + 1] = {name = n, value = tostring(v),
+                                               inline = true}
+                    end
+                end
+                -- HP from the Humanoid, not the HUD: always accurate,
+                -- and never touched by the vanity spoofer.
+                if human then
+                    F("HP", ("%s / %s"):format(
+                        Hud.Short(human.Health), Hud.Short(human.MaxHealth)))
+                end
+                F("EXP",   Hud.Text("exp"))
+                F("Gold",  Hud.Real("gold"))
+                F("Gems",  Hud.Real("gem") or Hud.Real("diamond"))
+                F("Mobs near", #GetMobs())
+                if tgt then
+                    local h = tgt.Humanoid
+                    F("Target", ("%s\n%d%% at %d studs"):format(tgt.Model.Name,
+                        h.MaxHealth > 0 and h.Health / h.MaxHealth * 100 or 0,
+                        tgt.Distance))
+                end
+                local up = tick() - startedAt
+                F("Uptime", ("%dh %02dm"):format(up / 3600, (up % 3600) / 60))
+
+                local lvl = Hud.Real("level") or Hud.Real("lvl")
+                local col = 5763719
+                if dead then col = 15548997
+                elseif human and human.MaxHealth > 0
+                and human.Health / human.MaxHealth < 0.4 then col = 16426522 end
+
+                local body = HttpS:JSONEncode({
+                    username = "DQR",
+                    embeds = {{
+                        title = ("%s%s"):format(LP.DisplayName,
+                            lvl and ("   -   Level " .. lvl) or ""),
+                        description = ("**%s**\n%s (%s)"):format(doing,
+                            CONFIG.TargetDungeon, CONFIG.Difficulty),
+                        color = col,
+                        fields = fields,
+                        footer = {text = "updated " .. os.date("%H:%M:%S")},
+                    }},
+                })
+
+                -- Edit the one message when we have its id, else post a
+                -- fresh one. ?wait=true makes Discord hand back the
+                -- message it created, which is the only way to learn
+                -- the id needed to edit it later.
+                local res
+                if msgId then
+                    res = HttpRequest({
+                        Url = base .. "/messages/" .. msgId, Method = "PATCH",
+                        Headers = {["Content-Type"] = "application/json"},
+                        Body = body,
+                    })
+                    local code = res and (res.StatusCode or res.Status)
+                    -- Deleted, or the channel was purged: post again.
+                    if code == 404 or code == 400 then msgId = nil end
+                else
+                    res = HttpRequest({
+                        Url = base .. "?wait=true", Method = "POST",
+                        Headers = {["Content-Type"] = "application/json"},
+                        Body = body,
+                    })
+                    if res and res.Body then
+                        local okj, data = pcall(function()
+                            return HttpS:JSONDecode(res.Body) end)
+                        if okj and type(data) == "table" and data.id then
+                            msgId = tostring(data.id)
+                            print(("[DQR] Status embed posted - updating "
+                                .. "every %ss from now on."):format(
+                                tostring(CONFIG.StatusInterval)))
+                        else
+                            print("[DQR] Status: posted but could not read the "
+                                .. "message id - it will repost each tick.")
+                        end
+                    end
+                end
+            end)
+        end
+    end
+end
+
 end -- of the loot block
 
 -- ============================================================
@@ -5815,7 +6021,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.26 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.27 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     ApplyClass()
     NukeGraphics()
     S(2.5)
@@ -5856,6 +6062,7 @@ task.spawn(function()
     task.spawn(StartWatcher)
     task.spawn(VanityWatcher)
     task.spawn(LootWatcher)
+    task.spawn(Farm.StatusWatcher)
 end)
 
 -- ============================================================
@@ -5890,3 +6097,4 @@ getgenv().DQR_Mobs  = MobDiag
 getgenv().DQR_Hazards = HazardDiag
 getgenv().DQR_LootDump = LootDump
 getgenv().DQR_LootTest = function() return ReportLoot(nil) end
+getgenv().DQR_StatusDump = Farm.StatusDump
