@@ -16,7 +16,7 @@ local CONFIG = {
     Class          = "Warrior",
 
     TargetDungeon  = "Orbital Outpost",
-    Difficulty     = "Insane",
+    Difficulty     = "Nightmare",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
 
