@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.34
+--  DQR AUTO FARM v10.36
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -117,6 +117,18 @@ local CONFIG = {
                              -- they were never dodged at all.
     AttackRate     = 0.3,    -- spell cast rate
     MeleeRate      = 0.2,    -- melee swing rate
+    -- How the melee swing is delivered:
+    --   "click" - a real left click at the aim point. What the game
+    --             certainly reacts to, but it presses whatever GUI is
+    --             under that pixel, so a HUD button can be hit.
+    --   "tool"  - Tool:Activate() on the equipped weapon. No cursor,
+    --             no coordinates, nothing for the HUD to intercept -
+    --             but only works if the game listens on the Tool's
+    --             Activated event rather than on the mouse.
+    --   "both"  - fire the Tool AND click. Use this to find out which
+    --             one the game wants; then set it to whichever worked.
+    -- Spells are keyboard (Q/E) in every mode and never use the mouse.
+    MeleeMode      = "tool",
 
     -- Walk speed: SetWalkSpeed=false leaves whatever the game gives you
     SetWalkSpeed   = true,
@@ -2065,6 +2077,30 @@ local function ScreenPointOf(gui)
     return x, y
 end
 
+-- Which clickable GUI objects sit under a screen point, topmost first.
+-- A synthetic click goes to whatever is there, not to whatever we
+-- meant - which is how the bot kept opening the Inventory: a click
+-- aimed at the world, or at a button whose position had shifted,
+-- landed on the HUD button that happened to be under that pixel.
+local function ButtonsAtPoint(x, y)
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    if not pg then return {} end
+    local out = {}
+    local ok, list = pcall(function()
+        -- Roblox reports positions WITHOUT the topbar inset, while the
+        -- click we send is in viewport coordinates, so take it back off.
+        return pg:GetGuiObjectsAtPosition(x, y - GuiService:GetGuiInset().Y)
+    end)
+    if not ok or not list then return out end
+    for _, o in ipairs(list) do
+        if (o:IsA("TextButton") or o:IsA("ImageButton"))
+        and not (LogGui and o:IsDescendantOf(LogGui)) then
+            out[#out + 1] = o
+        end
+    end
+    return out
+end
+
 local function ClickButton(btn)
     -- Prefer a genuine click when the button is on screen: it triggers
     -- whatever the game actually listens on (MouseButton1Down, InputBegan
@@ -2075,16 +2111,30 @@ local function ClickButton(btn)
         -- Blink it off for the duration rather than making you drag it.
         local wasOpen = LogGui and LogGui.Enabled
         if wasOpen then LogGui.Enabled = false end
-        local ok = pcall(function()
-            VIM:SendMouseMoveEvent(x, y, game)
-            S(0.08)
-            VIM:SendMouseButtonEvent(x, y, 0, true,  game, 0)
-            S(0.08)
-            VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
-        end)
-        if wasOpen then LogGui.Enabled = true end
-        print(("[DQR]   click @ %d,%d ok=%s"):format(x, y, tostring(ok)))
-        if ok then return true end
+        -- Is the button we mean actually under that pixel? If some
+        -- other control is on top - or the button has moved since its
+        -- position was read - a real click would press THAT instead,
+        -- which is how the Inventory kept opening itself. Drive the
+        -- signal directly in that case rather than clicking blind.
+        local hit = ButtonsAtPoint(x, y)[1]
+        local mine = hit and (hit == btn or hit:IsDescendantOf(btn)
+                              or btn:IsDescendantOf(hit))
+        if hit and not mine then
+            if wasOpen then LogGui.Enabled = true end
+            print(("[DQR]   %s is under that point, not %s - firing the "
+                .. "signal instead."):format(hit.Name, btn.Name))
+        else
+            local ok = pcall(function()
+                VIM:SendMouseMoveEvent(x, y, game)
+                S(0.08)
+                VIM:SendMouseButtonEvent(x, y, 0, true,  game, 0)
+                S(0.08)
+                VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+            end)
+            if wasOpen then LogGui.Enabled = true end
+            print(("[DQR]   click @ %d,%d ok=%s"):format(x, y, tostring(ok)))
+            if ok then return true end
+        end
     end
 
     -- Hidden or input blocked - drive the signal directly. getconnections
@@ -2889,14 +2939,41 @@ local function AimPoint(aimAt)
     return x, y
 end
 
+-- The equipped weapon, if it is a Tool. Roblox weapons usually are,
+-- and a Tool can be swung without touching the mouse at all.
+local function EquippedTool()
+    local c = GetChar()
+    return c and c:FindFirstChildOfClass("Tool")
+end
+
 function DoMelee(aimAt)
     -- Left click swing - DQR auto-attacks on left mouse
     local now = tick()
     if now - lastMelee < CONFIG.MeleeRate then return end
     lastMelee = now
+
+    -- Tool:Activate() fires the weapon's Activated event directly. No
+    -- cursor, no screen coordinates, nothing for a HUD button to catch
+    -- - which removes the whole class of problem where a swing opens
+    -- the Inventory. It only works if the game listens on Activated
+    -- rather than on the mouse itself, so it is opt-in: see MeleeMode.
+    if CONFIG.MeleeMode ~= "click" then
+        local tool = EquippedTool()
+        if tool then
+            task.spawn(function() pcall(function() tool:Activate() end) end)
+            if CONFIG.MeleeMode == "tool" then return end
+        end
+    end
+
     task.spawn(function()
         pcall(function()
             local x, y = AimPoint(aimAt)
+            -- A swing is aimed at the WORLD. If a HUD button happens to
+            -- be under that pixel the click presses it instead, and at
+            -- five swings a second that is how the Inventory kept
+            -- flying open mid-fight. Skip the swing; the next one is
+            -- 0.2s away.
+            if ButtonsAtPoint(x, y)[1] then return end
             VIM:SendMouseMoveEvent(x, y, game)
             VIM:SendMouseButtonEvent(x, y, 0, true,  game, 0)
             S(0.05)
@@ -2918,7 +2995,11 @@ function DoSpell(dist, range, aimAt)
         if CONFIG.AimMode == "mouse" and aimAt then
             pcall(function()
                 local x, y = AimPoint(aimAt)
-                VIM:SendMouseMoveEvent(x, y, game)
+                -- Parking the cursor on a HUD button is harmless by
+                -- itself, but the next melee swing would click it.
+                if not ButtonsAtPoint(x, y)[1] then
+                    VIM:SendMouseMoveEvent(x, y, game)
+                end
             end)
         end
         FireKey(spellSlot and Enum.KeyCode.Q or Enum.KeyCode.E)
@@ -6253,7 +6334,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.34 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.36 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
     -- the end of boot is not reached until a dungeon is up, and if the
