@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.41
+--  DQR AUTO FARM v10.42
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -2348,21 +2348,50 @@ end
 -- difficulty plainly on screen does not exist.
 local function RowIn(parent, name)
     if not parent then return nil end
-    local row = parent:FindFirstChild(name)
-    if not row then
-        local want = Norm(name)
-        for _, c in ipairs(parent:GetChildren()) do
-            if Norm(c.Name) == want then row = c break end
+    local want = Norm(name)
+    -- The row is usually a direct child, but not always: the
+    -- difficulty buttons live one level down, inside a wrapper called
+    -- difficultyPanel, so a direct-children-only search reported that
+    -- Insane did not exist while it sat plainly on screen. Look one
+    -- level deeper before giving up, which survives the panel being
+    -- re-nested again.
+    local function Find(node, depth)
+        for _, c in ipairs(node:GetChildren()) do
+            if Norm(c.Name) == want then
+                local b = c:FindFirstChildWhichIsA("TextButton")
+                if b then return b end
+            end
         end
+        if depth <= 0 then return nil end
+        for _, c in ipairs(node:GetChildren()) do
+            if c:IsA("GuiObject") then
+                local b = Find(c, depth - 1)
+                if b then return b end
+            end
+        end
+        return nil
     end
-    return row and row:FindFirstChildWhichIsA("TextButton") or nil
+    return Find(parent, 2)
 end
 
--- What is actually in there, for a miss message worth reading.
+-- What is actually in there, for a miss message worth reading. Two
+-- levels deep, since the thing we wanted may be nested - listing only
+-- the direct children once reported "difficultyPanel" and left the
+-- actual difficulty names unseen.
 local function NamesIn(parent)
     if not parent then return "(panel not found)" end
     local names = {}
-    for _, c in ipairs(parent:GetChildren()) do names[#names + 1] = c.Name end
+    for _, c in ipairs(parent:GetChildren()) do
+        local kids = {}
+        for _, g in ipairs(c:GetChildren()) do
+            if g:IsA("GuiObject") then kids[#kids + 1] = g.Name end
+        end
+        if #kids > 0 then
+            names[#names + 1] = c.Name .. " {" .. table.concat(kids, ", ") .. "}"
+        else
+            names[#names + 1] = c.Name
+        end
+    end
     if #names == 0 then return "(empty)" end
     return table.concat(names, ", ")
 end
@@ -6440,7 +6469,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.41 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.42 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
     -- the end of boot is not reached until a dungeon is up, and if the
