@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.36
+--  DQR AUTO FARM v10.37
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -333,6 +333,11 @@ local CONFIG = {
     -- instead of walking the whole map, and cache their verdicts so the
     -- two 20Hz threads share one scan instead of doing two each.
     MobScanRadius  = 600,    -- outermost ring when nothing is near
+    MobRadiusMax   = 25,     -- no mob is wider than this. GetExtentsSize
+                             -- spans the whole model including anything
+                             -- parented to it, and an unclamped reading
+                             -- inflates every range that is measured
+                             -- from the mob's surface.
     BossHealthHint = 5000,   -- MaxHealth above this counts as an enemy
                              -- even without a health bar over its head;
                              -- above this AND no bar over its head = a
@@ -2702,6 +2707,17 @@ local function GetNearestMob()
                             rad = (okx and sz)
                                 and math.max(0, math.max(sz.X, sz.Z) / 2 - 2)
                                 or 0
+                            -- Clamped. GetExtentsSize spans everything
+                            -- in the model, so one stray part - an
+                            -- effect parented to the rig, a projectile
+                            -- it fired - makes a mob read as hundreds
+                            -- of studs wide. Every range is
+                            -- "base + radius", so that turned melee
+                            -- range into 300 studs: the bot stood a
+                            -- football pitch away swinging at air and
+                            -- oscillating around a fighting distance
+                            -- that did not exist.
+                            rad = math.min(rad, CONFIG.MobRadiusMax)
                             mobRadius[obj] = rad
                         end
                         local d = (mr.Position - root.Position).Magnitude
@@ -2760,20 +2776,32 @@ local function GetNearestMob()
         end
     end
 
-    -- Failsafe: if everything in range is blacklisted we would return
-    -- nil and the bot would stand idle being beaten on. Mobs being
-    -- present but all "unreachable" means the blacklist is wrong, not
-    -- that there is nothing to fight - so drop it and take the nearest.
+    -- Failsafe: everything in range is blacklisted. A mob standing next
+    -- to us being called "unreachable" means the blacklist is wrong, so
+    -- take it anyway. But one across the map is unreachable because it
+    -- genuinely is - behind a door, in a room we have not opened - and
+    -- wiping the blacklist to chase it again is what produced the loop:
+    -- target, fail to path, blacklist, wipe, target the same one. Leave
+    -- those entries alone and let them expire on their own clock, so
+    -- the retry comes every UnreachableFor seconds instead of every
+    -- tick.
     if not best and #mobList > 0 then
-        table.clear(unreachable)
+        local near = nil
         for _, rec in ipairs(mobList) do
-            if rec.Distance < bestD then
-                bestD, best = rec.Distance, rec
+            if rec.Distance < bestD and rec.Distance <= CONFIG.MobRadiusMax * 4 then
+                bestD, near = rec.Distance, rec
             end
         end
-        if best then
-            print("[DQR] All targets were blacklisted - clearing and "
-                .. "taking the nearest.")
+        if near then
+            table.clear(unreachable)
+            best = near
+            print("[DQR] All targets blacklisted but one is "
+                .. math.floor(bestD) .. " studs away - clearing and taking it.")
+        elseif now - (mobShape.blockedWarn or 0) > 10 then
+            mobShape.blockedWarn = now
+            print(("[DQR] All %d mob(s) unreachable and far off - waiting "
+                .. "for the blacklist to expire rather than pacing.")
+                :format(#mobList))
         end
     end
 
@@ -6334,7 +6362,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.36 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.37 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
     -- the end of boot is not reached until a dungeon is up, and if the
