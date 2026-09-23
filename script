@@ -15,7 +15,7 @@ local CONFIG = {
     -- set Class to "" if you want to tune the numbers yourself.
     Class          = "Mage",
 
-    TargetDungeon  = "The Canals",
+    TargetDungeon  = "Ghastly Harbor",
     Difficulty     = "Nightmare",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
