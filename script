@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.47
+--  DQR AUTO FARM v10.48
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -159,7 +159,7 @@ local CONFIG = {
                              -- foot level, else it is floor decoration
     FootOffset     = 3,      -- studs from HumanoidRootPart down to feet
     RecentWindow   = 8,      -- a part this new counts as an attack
-    HazardDebug    = false,  -- log what the hazard scanner reacts to AND
+    HazardDebug    = true,  -- log what the hazard scanner reacts to AND
                              -- draw every footprint it sees as a red
                              -- slab on the floor (F9 dumps the details)
 
@@ -1253,20 +1253,35 @@ local function ClearDirection(pos, target)
 end
 
 local function ComputePath(from, to)
-    local path = PathfindingService:CreatePath({
-        AgentRadius   = 3,
-        AgentHeight   = 5,
-        AgentCanJump  = true,
-        -- 60 let it try to climb mountainsides. 45 makes the pathfinder
-        -- route around steep terrain instead of up it.
-        AgentMaxSlope = CONFIG.AgentMaxSlope,
-    })
-    local ok = pcall(function() path:ComputeAsync(from, to) end)
-    if not ok or path.Status ~= Enum.PathStatus.Success then return nil end
-    local wps, out = path:GetWaypoints(), {}
-    for i = 2, #wps do out[#out + 1] = wps[i] end  -- [1] is where we stand
-    if #out == 0 then return nil end
-    return out
+    -- Three attempts, each more forgiving than the last.
+    --
+    -- Roblox refuses a route outright when the agent will not fit
+    -- through it or the ground is steeper than it allows - and a
+    -- flight of stairs is exactly that: narrow, and steep. In
+    -- Volcanic Chambers the bot paced at the bottom of a staircase
+    -- for minutes, blacklisting mobs 250 studs away as "unreachable",
+    -- because the only route to them was up steps the strict agent
+    -- could not use.
+    --
+    -- The first, strictest attempt is the one that keeps it off
+    -- mountainsides, so it still gets first refusal. The looser ones
+    -- only run when it has already given up, where a rough route is
+    -- worth far more than none.
+    for _, try in ipairs({{3, CONFIG.AgentMaxSlope}, {2, 60}, {1.5, 89}}) do
+        local path = PathfindingService:CreatePath({
+            AgentRadius   = try[1],
+            AgentHeight   = 5,
+            AgentCanJump  = true,
+            AgentMaxSlope = try[2],
+        })
+        local ok = pcall(function() path:ComputeAsync(from, to) end)
+        if ok and path.Status == Enum.PathStatus.Success then
+            local wps, out = path:GetWaypoints(), {}
+            for i = 2, #wps do out[#out + 1] = wps[i] end  -- [1] is here
+            if #out > 0 then return out end
+        end
+    end
+    return nil
 end
 
 -- Runs on its own thread: ComputeAsync yields and must never be called
@@ -6663,7 +6678,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.47 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.48 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
