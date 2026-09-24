@@ -16,7 +16,7 @@ local CONFIG = {
     Class          = "Mage",
 
     TargetDungeon  = "Enchanted Forest",
-    Difficulty     = "Insane",
+    Difficulty     = "Nightmare",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
 
