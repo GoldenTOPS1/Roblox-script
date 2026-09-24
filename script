@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.59
+--  DQR AUTO FARM v10.60
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -233,6 +233,12 @@ local CONFIG = {
                              -- first clear ring can be outside it, and
                              -- capping walked the bot back into the fan
     HoldSlack      = 2,      -- within CircleRadius + this = at fighting distance
+    StrandedTime   = 10,     -- seconds of failing to close on a target
+                             -- that is OUT of range before giving up on
+                             -- reaching it and casting from where we
+                             -- are. Grinding into a rock achieves
+                             -- nothing; a spell that falls short costs
+                             -- one cooldown.
     CloseGiveUp    = 4,      -- seconds of failing to close the distance
                              -- before settling for the range we have,
                              -- provided the target is reachable by a
@@ -5827,13 +5833,45 @@ local function MainLoop()
             end)
         end
 
+        -- Can we actually get any closer? Some bosses stand on ground
+        -- the bot cannot walk onto - the Ancient Enchanted Tree is on
+        -- a platform across a gap, with a rock in the way - so the
+        -- ring point the approach aims at is inside geometry and the
+        -- bot grinds at it for the whole fight. `cl.since` is the
+        -- last time the distance actually came down. Tracked per
+        -- target on hazardCache rather than in a local: the main
+        -- chunk is at Luau's limit.
+        local cl = hazardCache.close
+        if not cl or cl.model ~= target.Model or flat < cl.best - 2 then
+            cl = {model = target.Model, best = flat, since = now, said = 0}
+            hazardCache.close = cl
+        end
+        local held = now - cl.since
+        -- Close enough already: stop walking, fight from here.
+        local blocked = held > CONFIG.CloseGiveUp and flat <= spellR
+        -- Not close enough, and not getting any closer either. Grinding
+        -- into a rock for the rest of the run achieves nothing, and a
+        -- spell that falls short costs one cooldown - so stand still
+        -- and throw them anyway. If they connect, the health bar moves
+        -- and the fight is on; if they do not, the stall and pacing
+        -- watchdogs move us on to something else as they always did.
+        local stranded = held > CONFIG.StrandedTime
+        if (blocked or stranded) and cl.said ~= 2 then
+            cl.said = 2
+            print(("[DQR] Cannot get closer to %s than %d studs - %s.")
+                :format(target.Model.Name, flat,
+                        blocked and "it is in range from here, fighting from the spot"
+                        or "out of range and unreachable, casting at it anyway"))
+        end
+
         -- MELEE when very close
         if dist <= meleeR then
             DoMelee(mobPos)
         end
 
-        -- SPELLS when in range
-        DoSpell(dist, spellR, mobPos)
+        -- SPELLS when in range - or, when stranded, at whatever range
+        -- we are stuck at.
+        DoSpell(dist, stranded and math.max(spellR, dist + 5) or spellR, mobPos)
 
         -- Seed orbit on new target
         if not seeded then SeedOrbit(mobPos) end
@@ -5962,22 +6000,9 @@ local function MainLoop()
         -- the target IS in range from here, this is as close as we get.
         -- Stand and fight. Tracked per target, on hazardCache rather
         -- than in a local - the main chunk is at Luau's limit.
-        local cl = hazardCache.close
-        if not cl or cl.model ~= target.Model or flat < cl.best - 2 then
-            cl = {model = target.Model, best = flat, since = now, said = false}
-            hazardCache.close = cl
-        end
-        local blocked = (now - cl.since) > CONFIG.CloseGiveUp
-                        and flat <= spellR
-        if blocked and not cl.said then
-            cl.said = true
-            print(("[DQR] Cannot get closer to %s than %d studs - it is in "
-                .. "range from here, so fighting from the spot.")
-                :format(target.Model.Name, flat))
-        end
-
         if still or target.Boss then
-            if flat > ringR + CONFIG.HoldSlack and not blocked then
+            if flat > ringR + CONFIG.HoldSlack
+            and not blocked and not stranded then
                 -- Walk in to the nearest point on the ring - or to the
                 -- nearest one the walk to which crosses no hazard. If
                 -- there is none, stand here: after a hop had put a
@@ -6146,7 +6171,7 @@ local function MainLoop()
         currentDest = GetOrbitPos(mobPos, radius)
         -- Orbiting a target we cannot reach walks the same unreachable
         -- circle as the approach did. See `blocked` above.
-        if blocked then currentDest = nil end
+        if blocked or stranded then currentDest = nil end
         -- Every angle penalised for crossing a hazard still leaves one
         -- as the "best": if that one crosses too, stand instead.
         if CONFIG.AvoidHazardPaths and not Rushing()
@@ -7306,7 +7331,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.59 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.60 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
