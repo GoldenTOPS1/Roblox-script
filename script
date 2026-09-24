@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.51
+--  DQR AUTO FARM v10.52
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -447,8 +447,8 @@ local CONFIG = {
 --  MinRange with it).
 local CLASS_RANGES = {
     Warrior = {
-        CircleRadius = 9,  MeleeRange = 16, MinRange = 6,
-        MaxRange     = 20, AttackRange = 30,
+        CircleRadius = 15,  MeleeRange = 16, MinRange = 15,
+        MaxRange     = 20, AttackRange = 35,
     },
     Tank = {
         CircleRadius = 8,  MeleeRange = 16, MinRange = 5,
@@ -1306,8 +1306,11 @@ local function Floor(p)
     local rp = RaycastParams.new()
     rp.FilterType = EXCLUDE
     rp.FilterDescendantsInstances = {GetChar(), RangeBarPart}
-    local hit = workspace:Raycast(p + Vector3.new(0, 45, 0),
-                                  Vector3.new(0, -130, 0), rp)
+    -- Tall enough to clear a whole flight: a probe that starts
+    -- below the staircase it is looking for finds the floor
+    -- underneath it instead, which is where we already are.
+    local hit = workspace:Raycast(p + Vector3.new(0, 60, 0),
+                                  Vector3.new(0, -160, 0), rp)
     if not hit then return nil end
     return hit.Position + Vector3.new(0, 3, 0)
 end
@@ -1352,7 +1355,16 @@ function ComputePath(from, to)
     -- 1. The endpoint may simply be off the navmesh: a mob standing on
     --    a rock, a step, the lip of a platform. Try the floor beneath
     --    it, then a few paces around it.
-    local near = {Floor(to)}
+    -- The floor under the mob gets the loosest agent as well:
+    -- if the only way up to it is a flight of steps, the middle
+    -- agent will refuse that too, and this is the one endpoint
+    -- worth spending a second call on.
+    local base = Floor(to)
+    if base then
+        local r = Route(from, base, {{2, 60}, {1.5, 89}})
+        if r then return r end
+    end
+    local near = {}
     for _, deg in ipairs({0, 90, 180, 270}) do
         local a = math.rad(deg)
         near[#near + 1] = Floor(to + Vector3.new(math.cos(a), 0,
@@ -1387,18 +1399,23 @@ function ComputePath(from, to)
     local cands = {}
     for deg = 0, 345, 15 do
         local a = math.rad(deg)
-        for _, dist in ipairs({30, 60}) do
+        for _, dist in ipairs({20, 35, 55, 80}) do
             local p = Floor(from + Vector3.new(math.cos(a), 0,
                                                math.sin(a)) * dist)
             if p then
                 local d = Vector3.new(p.X - to.X, 0, p.Z - to.Z).Magnitude
                 local gain = 0
+                -- The further up the target is, the more a probe
+                -- that climbs is worth: mobs sixty studs overhead
+                -- are reached by finding ANY way up, not by
+                -- shaving studs off the map distance.
+                local w = math.abs(up) > 25 and 4 or 2
                 if math.abs(up) > 6 then
                     gain = math.clamp(
-                        (p.Y - from.Y) * (up > 0 and 1 or -1), -20, 20)
+                        (p.Y - from.Y) * (up > 0 and 1 or -1), -30, 30)
                 end
-                if d < flat - 4 or gain > 4 then
-                    cands[#cands + 1] = {p = p, d = d, score = d - gain * 2}
+                if d < flat - 4 or gain > 3 then
+                    cands[#cands + 1] = {p = p, d = d, score = d - gain * w}
                 end
             end
         end
@@ -3557,7 +3574,7 @@ end
 -- The game's warning colours, or nil. Red is the classic; The King
 -- paints orange strips, some mobs paint the same rectangle a red one
 -- would in purple, and Samurai Palace paints huge green circles.
--- Cyan/blue are handled by the beam tests.
+-- Ice Temple paints its floor in bright cyan strips.
 local function WarnColor(c)
     local r, g, b = c.R, c.G, c.B
     if r > 0.55 and g < 0.45 and b < 0.45 then return "red" end
@@ -3586,6 +3603,22 @@ local function WarnColor(c)
     -- dodging something else.
     if h >= 0.20 and h <= 0.45 and s >= 0.30 and v >= 0.45 then
         return "green"
+    end
+    -- Bright cyan through azure: the Ice Temple's floor strips,
+    -- and the Ice Elemental's rings. Cyan was left off this list
+    -- for a long time because half of Winter Outpost is blue -
+    -- but being on it does NOT make a part a hazard. All it does
+    -- is relax the size caps from marker-sized (2 x 30) to
+    -- attack-sized (6 x 200), which is what those strips need:
+    -- they are far wider than a marker and were being thrown
+    -- out as "too wide" before anything else got a look. The
+    -- solid-and-never-moved guard below is what still keeps the
+    -- scenery out, and it is the test that has always done the
+    -- real work here.
+    -- Brightness is the other half: the dark navy floor those
+    -- strips are painted on shares their hue and fails v.
+    if h >= 0.45 and h <= 0.62 and s >= 0.35 and v >= 0.55 then
+        return "cyan"
     end
     return nil
 end
@@ -6926,7 +6959,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.51 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.52 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
