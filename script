@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.52
+--  DQR AUTO FARM v10.53
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -180,7 +180,8 @@ local CONFIG = {
     -- (King's Castle has an orange floor, the dojo an orange-tan one),
     -- so those must be non-solid, or solid but just moved / faded in /
     -- grown - never "just spawned", since rooms are built as you go.
-    RedMaxY        = 6,
+    RedMaxY        = 10,     -- Ice Temple's floor strips are 8.3
+                             -- studs thick and were thrown out at 6
     RedMaxWide     = 200,    -- Miyamoto Musashi's ring covers half the arena
     -- A part first seen well inside the scan radius (rather than
     -- entering at its edge as we walk) counts as an attack that was
@@ -279,7 +280,17 @@ local CONFIG = {
     -- a far stronger signal than colour or shape ever was, so a part
     -- whose name (or its parent's) contains one of these is taken as
     -- a hazard outright, skipping the size and colour tests.
-    HazardNames    = {"precast", "hitbox"},
+    -- "damagepart" catches Ice Temple's secondBossDamageParts,
+    -- whose slabs are too thick for any size cap worth keeping.
+    HazardNames    = {"precast", "hitbox", "damagepart"},
+    -- OUR OWN effects, by name. Dungeon Quest is PvE - nothing a
+    -- player casts can hurt the party - but a spell is a big
+    -- glowing thing that just appeared and grew, which is the
+    -- scanner's definition of a telegraph. The Mage's Geyser had
+    -- the bot fleeing its own spell several times a minute. Match
+    -- is on the part's name or its parent's, lowercased: add any
+    -- other your class casts, as F9 or HazardDebug names them.
+    IgnoreNames    = {"geyser"},
     HazardMaxAge   = 20,
     HazardBanTime  = 120,    -- once something has been judged scenery,
                              -- ignore it for this long. A one-sweep ban
@@ -1077,6 +1088,10 @@ local forceRepath = false
 local steerDir   = nil   -- fallback heading when no path exists
 local steerUntil = 0     -- keep that heading at least this long
 local wpStuck    = 0     -- seconds spent failing to reach pathQueue[1]
+-- When a waypoint was last actually REACHED. A global on purpose:
+-- the main chunk is at Luau's local limit. See the progress
+-- watchdog for what it is for.
+wpProgressAt = 0
 local clearStreak = 0    -- consecutive "line is clear" readings
 local stuckCount  = 0    -- consecutive stuck events at one spot
 local paceAnchor  = nil  -- where we were when the pacing window opened
@@ -1658,7 +1673,18 @@ local function PathWorker(getDestFn)
                     bestFar, bestFarAt = far, tick()
                 elseif far < bestFar - 3 then
                     bestFar, bestFarAt = far, tick()
-                elseif tick() - bestFarAt > CONFIG.NoProgressTime then
+                -- Walking a route counts as progress even when the
+                -- straight-line distance barely moves, because a
+                -- detour around an obstacle is SUPPOSED to go
+                -- sideways. When the only way up to something is
+                -- a staircase off to one side, every step of the
+                -- climb reads as "not closing" - so the watchdog
+                -- ran out, called the mob unreachable and threw
+                -- away a detour that was working. Reaching
+                -- waypoints is the honest signal: a bot that is
+                -- wedged reaches none (wpStuck covers that case).
+                elseif tick() - math.max(bestFarAt, wpProgressAt)
+                       > CONFIG.NoProgressTime then
                     bestFar, bestFarAt = far, tick()
                     forceRepath = true
                     pathFail = pathFail + 1
@@ -1860,6 +1886,7 @@ local function StartMoving(getDestFn)
             if flatD < CONFIG.WaypointReach
             and math.abs(dy) < CONFIG.WaypointReachY then
                 table.remove(pathQueue, 1)
+                wpProgressAt = tick()
                 wpStuck = 0
                 wp = pathQueue[1]
             else
@@ -3396,7 +3423,18 @@ end -- of the combat block
 -- stand at one end of it, so without this the bot dodges its own line
 -- forever.
 local function IsOurs(o)
-    return o == RangeBarPart or o.Name:sub(1, 4) == "DQR_"
+    if o == RangeBarPart or o.Name:sub(1, 4) == "DQR_" then
+        return true
+    end
+    -- ...and our own spells: see IgnoreNames.
+    local n  = o.Name:lower()
+    local pn = o.Parent and o.Parent.Name:lower() or ""
+    for _, frag in ipairs(CONFIG.IgnoreNames) do
+        if n:find(frag, 1, true) or pn:find(frag, 1, true) then
+            return true
+        end
+    end
+    return false
 end
 
 -- Projectiles. Two things the old version got wrong, and both were
@@ -6959,7 +6997,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.52 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.53 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
