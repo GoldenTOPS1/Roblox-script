@@ -32,7 +32,7 @@ local CONFIG = {
     -- CarryWait is how many seconds to wait before starting anyway;
     -- 0 waits indefinitely, which is usually what you want, since
     -- starting without the people you are carrying defeats the point.
-    CarryMode      = true,
+    CarryMode      = false,
     CarryFor       = {"RateFire"},
     CarryWait      = 0,
 
