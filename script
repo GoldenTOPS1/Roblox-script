@@ -15,8 +15,8 @@ local CONFIG = {
     -- set Class to "" if you want to tune the numbers yourself.
     Class          = "Mage",
 
-    TargetDungeon  = "Volcanic Chambers",
-    Difficulty     = "Nightmare",
+    TargetDungeon  = "Enchanted Forest",
+    Difficulty     = "Insane",
     Hardcore       = true,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
 
