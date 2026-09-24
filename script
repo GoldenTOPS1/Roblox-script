@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.48
+--  DQR AUTO FARM v10.49
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -316,6 +316,23 @@ local CONFIG = {
     RestNearHazard = 12,     -- after an escape, rest while a hazard is
                              -- still within this many studs...
     RestMaxTime    = 8,      -- ...but never for longer than this
+    -- --------------------------------------------------------
+    -- SWAMPED: when there is nowhere left to dodge TO.
+    -- Some bosses - Volcanic Chambers' especially - cover the whole
+    -- arena in overlapping lines at once. There is no safe spot to
+    -- find, so hunting for one means taking the entire barrage while
+    -- standing still or pacing. Charging the boss and burning it down
+    -- trades damage for damage, and the fight ending is the only
+    -- thing that ends the hazards. Set false to always try to dodge.
+    RushWhenSwamped = true,
+    SwampedTime    = 1.5,    -- seconds with no exit at all before the
+                             -- charge starts (one bad sweep is noise)
+    RushTime       = 8,      -- seconds committed to it. Hazards are
+                             -- ignored entirely for this long: no
+                             -- escapes, no backing off a beam fan, no
+                             -- routing around anything. Then it looks
+                             -- for an exit again, and charges again if
+                             -- there still is not one.
     -- --------------------------------------------------------
     -- Route around beams instead of only escaping once standing in one.
     -- Costs two maths lookups per orbit candidate and a couple more on
@@ -1252,22 +1269,16 @@ local function ClearDirection(pos, target)
     return nil
 end
 
-local function ComputePath(from, to)
-    -- Three attempts, each more forgiving than the last.
-    --
-    -- Roblox refuses a route outright when the agent will not fit
-    -- through it or the ground is steeper than it allows - and a
-    -- flight of stairs is exactly that: narrow, and steep. In
-    -- Volcanic Chambers the bot paced at the bottom of a staircase
-    -- for minutes, blacklisting mobs 250 studs away as "unreachable",
-    -- because the only route to them was up steps the strict agent
-    -- could not use.
-    --
-    -- The first, strictest attempt is the one that keeps it off
-    -- mountainsides, so it still gets first refusal. The looser ones
-    -- only run when it has already given up, where a rough route is
-    -- worth far more than none.
-    for _, try in ipairs({{3, CONFIG.AgentMaxSlope}, {2, 60}, {1.5, 89}}) do
+-- Pathfinding, and what to do when Roblox simply says there is no
+-- route. Block-scoped: the failure counter and the two helpers would
+-- otherwise cost the main chunk registers it does not have, and
+-- ComputePath itself is a global for the same reason (one caller).
+do
+local pathFails, nextDetour = 0, 0
+
+-- One ComputeAsync per agent shape in `tries`; first success wins.
+local function Route(from, to, tries)
+    for _, try in ipairs(tries) do
         local path = PathfindingService:CreatePath({
             AgentRadius   = try[1],
             AgentHeight   = 5,
@@ -1282,6 +1293,113 @@ local function ComputePath(from, to)
         end
     end
     return nil
+end
+
+-- The floor under `p`, found from well above it. ComputeAsync wants a
+-- point that is actually ON the navmesh, and a probe starting at our
+-- own height only ever finds the floor we are already standing on -
+-- which is precisely the floor a staircase leads away from.
+local function Floor(p)
+    local rp = RaycastParams.new()
+    rp.FilterType = EXCLUDE
+    rp.FilterDescendantsInstances = {GetChar(), RangeBarPart}
+    local hit = workspace:Raycast(p + Vector3.new(0, 45, 0),
+                                  Vector3.new(0, -130, 0), rp)
+    if not hit then return nil end
+    return hit.Position + Vector3.new(0, 3, 0)
+end
+
+function ComputePath(from, to)
+    -- Three attempts at the real thing, each more forgiving than the
+    -- last. Roblox refuses a route outright when the agent will not
+    -- fit through it or the ground is steeper than it allows - and a
+    -- flight of stairs is exactly that: narrow, and steep. The
+    -- strictest attempt is the one that keeps the bot off
+    -- mountainsides, so it still gets first refusal; the looser ones
+    -- run only once it has already given up, where a rough route is
+    -- worth far more than none.
+    local direct = Route(from, to,
+        {{3, CONFIG.AgentMaxSlope}, {2, 60}, {1.5, 89}})
+    if direct then
+        pathFails = 0
+        return direct
+    end
+
+    -- Twice in a row with nothing is not a hiccup: there is no route
+    -- to that exact point, and steering at it only grinds into
+    -- whatever is in the way. In Volcanic Chambers the bot paced at
+    -- the foot of a staircase for minutes, blacklisting mobs 250
+    -- studs off as "unreachable", because the way up was to one side
+    -- and nothing ever looked anywhere but straight ahead.
+    --
+    -- So stop asking for the whole journey and ask for a leg of it.
+    -- Anywhere reachable that ends up meaningfully closer will do;
+    -- from there the next call asks again. It is hill climbing on the
+    -- navmesh, and it finds the stairs, ramps and doorways that no
+    -- straight-line probe ever will.
+    pathFails = pathFails + 1
+    local now = tick()
+    if pathFails < 2 or now < nextDetour then return nil end
+    nextDetour = now + 2    -- fifteen ComputeAsyncs is not a thing to
+                            -- do at 2.5Hz, however stuck we are
+    local mid  = {{2, 60}}
+    local soft = {{1.5, 89}}
+    local flat = Vector3.new(to.X - from.X, 0, to.Z - from.Z).Magnitude
+
+    -- 1. The endpoint may simply be off the navmesh: a mob standing on
+    --    a rock, a step, the lip of a platform. Try the floor beneath
+    --    it, then a few paces around it.
+    local near = {Floor(to)}
+    for _, deg in ipairs({0, 90, 180, 270}) do
+        local a = math.rad(deg)
+        near[#near + 1] = Floor(to + Vector3.new(math.cos(a), 0,
+                                                 math.sin(a)) * 7)
+    end
+    for _, p in ipairs(near) do
+        local r = Route(from, p, mid)
+        if r then return r end
+    end
+
+    -- 2. A destination across the map can be unroutable in one call
+    --    while the ground halfway there is perfectly fine.
+    if flat > 60 then
+        for _, f in ipairs({0.66, 0.4}) do
+            local p = Floor(from:Lerp(to, f))
+            if p then
+                local r = Route(from, p, mid)
+                if r then return r end
+            end
+        end
+    end
+
+    -- 3. The way on may not point at the target at all. Fan out, keep
+    --    only the probes that end up meaningfully closer to it, and
+    --    take the best one that routes.
+    local cands = {}
+    for deg = 0, 345, 15 do
+        local a = math.rad(deg)
+        for _, dist in ipairs({30, 60}) do
+            local p = Floor(from + Vector3.new(math.cos(a), 0,
+                                               math.sin(a)) * dist)
+            if p then
+                local d = Vector3.new(p.X - to.X, 0, p.Z - to.Z).Magnitude
+                if d < flat - 10 then
+                    cands[#cands + 1] = {p = p, d = d}
+                end
+            end
+        end
+    end
+    table.sort(cands, function(x, y) return x.d < y.d end)
+    for i = 1, math.min(#cands, 8) do
+        local r = Route(from, cands[i].p, soft)
+        if r then
+            print(("[DQR] No route to the target - detouring via ground "
+                .. "%d studs from it."):format(cands[i].d))
+            return r
+        end
+    end
+    return nil
+end
 end
 
 -- Runs on its own thread: ComputeAsync yields and must never be called
@@ -1401,7 +1519,8 @@ local function PathWorker(getDestFn)
                 -- never in the frame handler - the previous attempt put
                 -- it at 60Hz and that alone made the game unplayable.
                 -- A couple of maths lookups, a few times a second.
-                if CONFIG.AvoidHazardPaths and HazardAt then
+                if CONFIG.AvoidHazardPaths and HazardAt
+                and not (Rushing and Rushing()) then
                     -- The WHOLE route, not just the next waypoint: a
                     -- path that bent around a wall and then cut across
                     -- two green lines passed the old one-point test.
@@ -2286,36 +2405,6 @@ local function FindButtons(matches)
     return vis
 end
 
--- `verify` (optional) returns true once the click has visibly taken
--- effect. Without it a click counts as done the moment input is sent,
--- which is how "Create Lobby" could report success while nothing moved.
-local function FindAndFireBtn(matches, timeout, verify)
-    timeout = timeout or 8
-    local elapsed = 0
-    repeat
-        local found = FindButtons(matches)
-        for _, obj in ipairs(found) do
-            print(("[DQR] Clicking %s  text='%s'  visible=%s")
-                :format(obj:GetFullName(), ButtonText(obj),
-                        tostring(VisibleOnScreen(obj))))
-            ClickButton(obj)
-            if not verify then return true end
-            local w = 0
-            repeat S(0.25) w = w + 0.25 until verify() or w >= 1.5
-            if verify() then
-                print("[DQR]   verified.")
-                return true
-            end
-            print("[DQR]   click had no effect, trying next candidate.")
-        end
-        if #found == 0 then print("[DQR]   (no candidates yet)") end
-        S(0.5)
-        elapsed = elapsed + 0.5
-    until elapsed >= timeout
-    print("[DQR] No button worked after " .. timeout .. "s.")
-    return false
-end
-
 -- Prints every button in PlayerGui. Run this in the lobby and paste the
 -- output if a step still misses - it gives the real names to match on.
 local function DumpGui()
@@ -3119,11 +3208,6 @@ local function IsInDungeon()
     -- even when a popup is hiding the lobby's own buttons.
     if InLobbyPlace() and not MobsPresent() then return false end
     return MobsPresent()
-end
-
-local function IsInDungeonSafe()
-    if not IsInDungeon() then return false end
-    S(2) return IsInDungeon()
 end
 
 -- ============================================================
@@ -4494,6 +4578,15 @@ hazardCache = {t = 0, escape = nil, radial = false, radialN = 0,
                restUntil = 0, resting = false, sheltering = false,
                waitSince = 0, waitBlock = 0, inSince = 0}
 
+-- Charging: hazards are being ignored on purpose, because there
+-- was nowhere left to dodge to. Every piece of code that would
+-- otherwise steer around a footprint, back off a beam fan or
+-- stand and wait asks this first. Global, and read from the path
+-- worker's thread as well as the farm loop.
+function Rushing()
+    return tick() < (hazardCache.rushUntil or 0)
+end
+
 -- A sidestep out of a projectile's way, shared by the main loop and
 -- the dodge watcher: to whichever side the thing is NOT drifting
 -- toward (`fallback` decides when it is coming dead straight), by
@@ -4629,6 +4722,17 @@ function ScanHazards()
     local held = hazardCache.holdP
     hazardCache.resting = false
     local inHazard = #hazardShapes > 0 and HazardAt(pos)
+
+    -- Charging. Nothing below this runs: no escape, no rest, no
+    -- repositioning, and the stood-in-a-hazard watchdog is not
+    -- measuring anything meaningful while we are deliberately
+    -- standing in one. See RushWhenSwamped.
+    if Rushing() then
+        hazardCache.escape,  hazardCache.holdP     = nil, nil
+        hazardCache.resting, hazardCache.restUntil = false, 0
+        hazardCache.inSince = 0
+        return nil
+    end
 
     -- Continuously standing in a hazard for longer than any real
     -- telegraph lasts means the scanner is wrong about something.
@@ -4774,6 +4878,25 @@ function ScanHazards()
             end
         end
     end
+    -- Standing in it with nowhere at all to go: every heading,
+    -- at every distance, covered. Waiting in the open for a gap
+    -- that is not coming just means taking the whole barrage on
+    -- the spot - so stop dodging, walk into the target and burn
+    -- it down. Damage races damage, and killing the thing is
+    -- what ends the hazards.
+    if inHazard and not esc and CONFIG.RushWhenSwamped then
+        if (hazardCache.noExitSince or 0) == 0 then
+            hazardCache.noExitSince = now
+        elseif now - hazardCache.noExitSince > CONFIG.SwampedTime then
+            hazardCache.noExitSince = 0
+            hazardCache.rushUntil   = now + CONFIG.RushTime
+            print(("[DQR] Nowhere to dodge to - the area is covered "
+                .. "end to end. Charging the target and burning it "
+                .. "down for %ds."):format(CONFIG.RushTime))
+        end
+    else
+        hazardCache.noExitSince = 0
+    end
     hazardCache.escape = esc
     return esc
 end
@@ -4790,6 +4913,11 @@ function HazardDiag()
     local pos, now = root.Position, tick()
     local reach = CONFIG.DodgeRange * 2
     print("[DQR] === HAZARD DIAG ===")
+    if Rushing() then
+        print(("[DQR] CHARGING - nowhere to dodge to, ignoring hazards "
+            .. "for another %.1fs. (RushWhenSwamped)")
+            :format(hazardCache.rushUntil - tick()))
+    end
 
     -- What the last sweep is treating as dangerous right now, and
     -- what each footprint was made from. The first thing to read when
@@ -5207,10 +5335,13 @@ local function MainLoop()
         -- Bosses only, and a real fan: one beam straight through a
         -- mob's root reads as a spoke each way, so two "spokes" is a
         -- single laser, not something to stand back from.
-        if target.Boss and hazardCache.radialN >= 3 then
+        if target.Boss and hazardCache.radialN >= 3
+        and not Rushing() then
             hazardBackoff = now + CONFIG.BeamBackoffTime
         end
-        if hazardBackoff > now then
+        -- Charging in: fight from wherever we get to, not from
+        -- the far side of a fan we have given up on dodging.
+        if hazardBackoff > now and not Rushing() then
             local want = math.min(
                 hazardCache.backoffR or (ringR + CONFIG.BeamSpread),
                 CONFIG.BeamBackoffMax)
@@ -5371,7 +5502,8 @@ local function MainLoop()
                                        root.Position.X - mobPos.X)
                 local spot = AngleTo(mobPos, ringR, ang)
                 local waiting = false
-                if CONFIG.AvoidHazardPaths and HazardOnPath(root.Position, spot) then
+                if CONFIG.AvoidHazardPaths and not Rushing()
+                and HazardOnPath(root.Position, spot) then
                     local clear = ClearRingAngle(mobPos, ringR, ang,
                                                  root.Position)
                     if clear then
@@ -5421,6 +5553,14 @@ local function MainLoop()
                             -- entirely for a while so it actually goes.
                             hazardCache.waitSince = 0
                             hazardCache.waitBlock = now + CONFIG.WaitGiveUp * 3
+                            -- And commit to it: charge the target
+                            -- down rather than keep edging around
+                            -- something we have just decided is not
+                            -- real. See RushWhenSwamped.
+                            if CONFIG.RushWhenSwamped then
+                                hazardCache.rushUntil =
+                                    now + CONFIG.RushTime
+                            end
                             -- Not throttled by lastTeleWarn: the
                             -- waiting message keeps that timer hot, so
                             -- this one never got printed and the give-up
@@ -5521,7 +5661,7 @@ local function MainLoop()
         currentDest = GetOrbitPos(mobPos, radius)
         -- Every angle penalised for crossing a hazard still leaves one
         -- as the "best": if that one crosses too, stand instead.
-        if CONFIG.AvoidHazardPaths
+        if CONFIG.AvoidHazardPaths and not Rushing()
         and HazardOnPath(root.Position, currentDest) then
             currentDest = nil
         end
@@ -6678,7 +6818,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.48 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.49 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
