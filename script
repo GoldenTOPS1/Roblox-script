@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.54
+--  DQR AUTO FARM v10.55
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -280,9 +280,15 @@ local CONFIG = {
     -- a far stronger signal than colour or shape ever was, so a part
     -- whose name (or its parent's) contains one of these is taken as
     -- a hazard outright, skipping the size and colour tests.
-    -- "damagepart" catches Ice Temple's secondBossDamageParts,
-    -- whose slabs are too thick for any size cap worth keeping.
-    HazardNames    = {"precast", "hitbox", "damagepart"},
+    -- NOT "damagepart". Aquatic Temple's secondBossDamageParts are
+    -- the floor panels themselves - one of them is 373x51 studs, the
+    -- whole walkway - and they are only lethal while they are lit.
+    -- Naming them here skipped the colour test, which is the one
+    -- thing that tells an armed panel from the floor it is painted
+    -- on, and the bot spent the run standing in a "hazard" the size
+    -- of the map with NO EXIT FOUND. They are caught by colour and
+    -- the lit test instead; see WarnColor and LooksActive.
+    HazardNames    = {"precast", "hitbox"},
     -- OUR OWN effects, by name. Dungeon Quest is PvE - nothing a
     -- player casts can hurt the party - but a spell is a big
     -- glowing thing that just appeared and grew, which is the
@@ -987,7 +993,8 @@ function LooksActive(o, fresh, trusted)
     if not rec then
         local why = new and "new" or fresh and "fresh" or nil
         effectSeen[o] = {pos = o.Position, tr = o.Transparency,
-                         size = PartSize(o), moved = why and now or 0,
+                         size = PartSize(o), col = o.Color,
+                         moved = why and now or 0,
                          why = why, seen = now}
         if why == "fresh" and CONFIG.HazardDebug then
             print("[DQR] Turned up beside us: " .. o:GetFullName())
@@ -999,7 +1006,7 @@ function LooksActive(o, fresh, trusted)
     -- faded in from INVISIBLE. Scenery does none of these. Any change
     -- of transparency used to count, and that flagged every glowing
     -- inlay in the map that pulses between bright and dim.
-    local size, tr = PartSize(o), o.Transparency
+    local size, tr, col = PartSize(o), o.Transparency, o.Color
     local why = nil
     if (o.Position - rec.pos).Magnitude > 1 then
         why = "moved"
@@ -1007,9 +1014,18 @@ function LooksActive(o, fresh, trusted)
         why = "faded"
     elseif (size - rec.size).Magnitude > 1 then
         why = "grew"
+    -- Armed. A floor panel does not move, fade or grow when it turns
+    -- lethal - it just lights up. Aquatic Temple's whole second-boss
+    -- walkway works that way, and with no test for it the panels were
+    -- either invisible to the scanner or (when named as hazards)
+    -- permanently lethal, with nothing in between.
+    elseif rec.col and (math.abs(col.R - rec.col.R)
+                      + math.abs(col.G - rec.col.G)
+                      + math.abs(col.B - rec.col.B)) > 0.2 then
+        why = "lit"
     end
     if why then rec.moved, rec.why = now, why end
-    rec.pos, rec.tr, rec.size = o.Position, tr, size
+    rec.pos, rec.tr, rec.size, rec.col = o.Position, tr, size, col
     if new then return true, "new" end
     if (now - rec.moved) < CONFIG.RecentWindow then return true, rec.why end
     return false, nil
@@ -3875,7 +3891,11 @@ local function IsTelegraph(o, pos, radius)
     -- for eight seconds every plank of the dojo was a freshly spawned
     -- orange hazard and the bot stood on it waiting for an exit.
     if o.CanCollide then
-        if why == "moved" or why == "faded" or why == "grew" then return true end
+        -- "lit" belongs here as much as the rest: a floor panel that
+        -- has just changed colour under our feet is arming, and that
+        -- is the only warning Aquatic Temple gives.
+        if why == "moved" or why == "faded"
+        or why == "grew"  or why == "lit" then return true end
         return WarnReject(o, warn, "solid and never moved - scenery")
     end
 
@@ -7135,7 +7155,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.54 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.55 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
