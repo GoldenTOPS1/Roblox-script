@@ -15,8 +15,8 @@ local CONFIG = {
     -- set Class to "" if you want to tune the numbers yourself.
     Class          = "Mage",
 
-    TargetDungeon  = "Aquatic Temple",
-    Difficulty     = "Insane",
+    TargetDungeon  = "Volcanic Chambers",
+    Difficulty     = "Nightmare",
     Hardcore       = true,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
 
@@ -32,7 +32,7 @@ local CONFIG = {
     -- CarryWait is how many seconds to wait before starting anyway;
     -- 0 waits indefinitely, which is usually what you want, since
     -- starting without the people you are carrying defeats the point.
-    CarryMode      = false,
+    CarryMode      = true,
     CarryFor       = {"RateFire"},
     CarryWait      = 0,
 
