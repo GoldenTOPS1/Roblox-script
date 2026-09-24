@@ -15,7 +15,7 @@ local CONFIG = {
     -- set Class to "" if you want to tune the numbers yourself.
     Class          = "Warrior",
 
-    TargetDungeon  = "Orbital Outpost",
+    TargetDungeon  = "Volcanic Chambers",
     Difficulty     = "Nightmare",
     Hardcore       = true,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
@@ -148,7 +148,7 @@ local CONFIG = {
 
     -- Walk speed: SetWalkSpeed=false leaves whatever the game gives you
     SetWalkSpeed   = true,
-    WalkSpeed      = 20,
+    WalkSpeed      = 19,
 
     -- Beams / lasers (the blue line the Frost Wizards fire)
     DodgeBeams     = true,
