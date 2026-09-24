@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.57
+--  DQR AUTO FARM v10.58
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -226,6 +226,11 @@ local CONFIG = {
                              -- first clear ring can be outside it, and
                              -- capping walked the bot back into the fan
     HoldSlack      = 2,      -- within CircleRadius + this = at fighting distance
+    CloseGiveUp    = 4,      -- seconds of failing to close the distance
+                             -- before settling for the range we have,
+                             -- provided the target is reachable by a
+                             -- spell from there. A boss on a plinth or
+                             -- across a moat is never walked up to.
     EscapeMaxDist  = 40,     -- furthest one hazard escape will plan: from
                              -- the middle of a 70-stud ring to its edge
     EscapeClearWant= 4,      -- clearance from a hazard's pad that counts
@@ -5883,8 +5888,34 @@ local function MainLoop()
         --
         -- Hazard escapes have already run above and outrank this, so
         -- standing still only ever lasts until something is incoming.
+        -- Can we actually get any closer? Some bosses stand on ground
+        -- the bot cannot walk onto - the Ancient Enchanted Tree is on
+        -- an island in a moat - and the ring point the approach aims
+        -- at is inside geometry, so it grinds at the water's edge for
+        -- the whole fight. Meanwhile the boss is sitting well inside
+        -- spell range and nothing is being cast, because the approach
+        -- outranks everything below it.
+        --
+        -- So: if the distance has not come down for a few seconds and
+        -- the target IS in range from here, this is as close as we get.
+        -- Stand and fight. Tracked per target, on hazardCache rather
+        -- than in a local - the main chunk is at Luau's limit.
+        local cl = hazardCache.close
+        if not cl or cl.model ~= target.Model or flat < cl.best - 2 then
+            cl = {model = target.Model, best = flat, since = now, said = false}
+            hazardCache.close = cl
+        end
+        local blocked = (now - cl.since) > CONFIG.CloseGiveUp
+                        and flat <= spellR
+        if blocked and not cl.said then
+            cl.said = true
+            print(("[DQR] Cannot get closer to %s than %d studs - it is in "
+                .. "range from here, so fighting from the spot.")
+                :format(target.Model.Name, flat))
+        end
+
         if still or target.Boss then
-            if flat > ringR + CONFIG.HoldSlack then
+            if flat > ringR + CONFIG.HoldSlack and not blocked then
                 -- Walk in to the nearest point on the ring - or to the
                 -- nearest one the walk to which crosses no hazard. If
                 -- there is none, stand here: after a hop had put a
@@ -6051,10 +6082,13 @@ local function MainLoop()
         end
 
         currentDest = GetOrbitPos(mobPos, radius)
+        -- Orbiting a target we cannot reach walks the same unreachable
+        -- circle as the approach did. See `blocked` above.
+        if blocked then currentDest = nil end
         -- Every angle penalised for crossing a hazard still leaves one
         -- as the "best": if that one crosses too, stand instead.
         if CONFIG.AvoidHazardPaths and not Rushing()
-        and HazardOnPath(root.Position, currentDest) then
+        and currentDest and HazardOnPath(root.Position, currentDest) then
             currentDest = nil
         end
         ShowRangeBar(root, mobPos, dist)
@@ -7210,7 +7244,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.57 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.58 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
