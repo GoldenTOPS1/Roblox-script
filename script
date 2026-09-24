@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.55
+--  DQR AUTO FARM v10.56
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -296,7 +296,13 @@ local CONFIG = {
     -- the bot fleeing its own spell several times a minute. Match
     -- is on the part's name or its parent's, lowercased: add any
     -- other your class casts, as F9 or HazardDebug names them.
-    IgnoreNames    = {"geyser"},
+    -- "groundaura" is here on the same evidence as geyser: every mob
+    -- attack in this game is built as <name>.precast / <name>.hitBox,
+    -- and groundAura is a bare MeshPart at the Workspace root that
+    -- pulses between r=7 and r=10 under our own feet, every sweep,
+    -- for as long as we are fighting. If the bot ever starts eating
+    -- damage while standing still, take it out of this list first.
+    IgnoreNames    = {"geyser", "groundaura"},
     HazardMaxAge   = 20,
     HazardBanTime  = 120,    -- once something has been judged scenery,
                              -- ignore it for this long. A one-sweep ban
@@ -1319,6 +1325,7 @@ end
 -- ComputePath itself is a global for the same reason (one caller).
 do
 local pathFails, nextDetour = 0, 0
+local detourTo, detourAt    = nil, 0
 
 -- One ComputeAsync per agent shape in `tries`; first success wins.
 local function Route(from, to, tries)
@@ -1369,10 +1376,14 @@ function ComputePath(from, to)
     -- mountainsides, so it still gets first refusal; the looser ones
     -- run only once it has already given up, where a rough route is
     -- worth far more than none.
+    -- The loosest attempt used to allow 89 degrees, which is a wall.
+    -- Roblox happily returns a "route" straight up one, the humanoid
+    -- walks into it at three studs a second and the stuck watchdog
+    -- backs it out - over and over. 70 still takes a staircase.
     local direct = Route(from, to,
-        {{3, CONFIG.AgentMaxSlope}, {2, 60}, {1.5, 89}})
+        {{3, CONFIG.AgentMaxSlope}, {2, 60}, {1.5, 70}})
     if direct then
-        pathFails = 0
+        pathFails, detourTo = 0, nil
         return direct
     end
 
@@ -1390,11 +1401,27 @@ function ComputePath(from, to)
     -- straight-line probe ever will.
     pathFails = pathFails + 1
     local now = tick()
-    if pathFails < 2 or now < nextDetour then return nil end
+    if pathFails < 2 then return nil end
+
+    -- Already on a detour and not there yet? Re-aim at the SAME spot
+    -- rather than searching for a new one. The search runs off the
+    -- bot's current position, so re-running it every 1.2 seconds while
+    -- the bot inched forward picked a different "best" each time -
+    -- 103, then 50, then 60, then 46, then 53 studs from the target -
+    -- and it never walked any of them far enough to get anywhere.
+    -- Commit, and only look again once we arrive or it goes stale.
+    if detourTo and now - detourAt < 8
+    and Vector3.new(detourTo.X - from.X, 0,
+                    detourTo.Z - from.Z).Magnitude > 12 then
+        local r = Route(from, detourTo, {{1.5, 70}})
+        if r then return r end
+        detourTo = nil        -- cannot get there any more; look afresh
+    end
+    if now < nextDetour then return nil end
     nextDetour = now + 1.2  -- fifteen ComputeAsyncs is not a thing
                             -- to do at 2.5Hz, however stuck
     local mid  = {{2, 60}}
-    local soft = {{1.5, 89}}
+    local soft = {{1.5, 70}}
     local flat = Vector3.new(to.X - from.X, 0, to.Z - from.Z).Magnitude
 
     -- 1. The endpoint may simply be off the navmesh: a mob standing on
@@ -1406,7 +1433,7 @@ function ComputePath(from, to)
     -- worth spending a second call on.
     local base = GroundAt(to)
     if base then
-        local r = Route(from, base, {{2, 60}, {1.5, 89}})
+        local r = Route(from, base, {{2, 60}, {1.5, 70}})
         if r then return r end
     end
     local near = {}
@@ -1469,6 +1496,8 @@ function ComputePath(from, to)
     for i = 1, math.min(#cands, 8) do
         local r = Route(from, cands[i].p, soft)
         if r then
+            -- Remember it, and stick to it: see the commit check above.
+            detourTo, detourAt = cands[i].p, now
             print(("[DQR] No route to the target - detouring via ground "
                 .. "%d studs from it."):format(cands[i].d))
             return r
@@ -7155,7 +7184,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.55 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.56 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
