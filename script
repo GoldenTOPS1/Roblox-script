@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.53
+--  DQR AUTO FARM v10.54
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -347,6 +347,16 @@ local CONFIG = {
                              -- routing around anything. Then it looks
                              -- for an exit again, and charges again if
                              -- there still is not one.
+    -- --------------------------------------------------------
+    -- EXPLORE: what to do when there is nothing left to fight.
+    -- Dungeon Quest is a corridor and the next wave is further along
+    -- it, so standing where the last mob died is how a run ends with
+    -- the bot alive, idle and out of time. See the EXPLORE section.
+    AutoExplore    = true,
+    ExploreWait    = 2,      -- stand this long first: waves often spawn
+                             -- right where the last one died
+    ExploreEvery   = 6,      -- seconds before re-picking somewhere to go
+    ExploreCell    = 24,     -- grid size for "we have already been here"
     -- --------------------------------------------------------
     -- Route around beams instead of only escaping once standing in one.
     -- Costs two maths lookups per orbit candidate and a couple more on
@@ -1317,10 +1327,14 @@ end
 -- point that is actually ON the navmesh, and a probe starting at our
 -- own height only ever finds the floor we are already standing on -
 -- which is precisely the floor a staircase leads away from.
-local function Floor(p)
+function GroundAt(p)
     local rp = RaycastParams.new()
     rp.FilterType = EXCLUDE
     rp.FilterDescendantsInstances = {GetChar(), RangeBarPart}
+    -- Terrain water is not ground. Without this the sea under an
+    -- Aquatic Temple bridge answers every probe, and both the detour
+    -- search and the explorer happily pick a spot out at sea.
+    rp.IgnoreWater = true
     -- Tall enough to clear a whole flight: a probe that starts
     -- below the staircase it is looking for finds the floor
     -- underneath it instead, which is where we already are.
@@ -1374,7 +1388,7 @@ function ComputePath(from, to)
     -- if the only way up to it is a flight of steps, the middle
     -- agent will refuse that too, and this is the one endpoint
     -- worth spending a second call on.
-    local base = Floor(to)
+    local base = GroundAt(to)
     if base then
         local r = Route(from, base, {{2, 60}, {1.5, 89}})
         if r then return r end
@@ -1382,7 +1396,7 @@ function ComputePath(from, to)
     local near = {}
     for _, deg in ipairs({0, 90, 180, 270}) do
         local a = math.rad(deg)
-        near[#near + 1] = Floor(to + Vector3.new(math.cos(a), 0,
+        near[#near + 1] = GroundAt(to + Vector3.new(math.cos(a), 0,
                                                  math.sin(a)) * 7)
     end
     for _, p in ipairs(near) do
@@ -1394,7 +1408,7 @@ function ComputePath(from, to)
     --    while the ground halfway there is perfectly fine.
     if flat > 60 then
         for _, f in ipairs({0.66, 0.4}) do
-            local p = Floor(from:Lerp(to, f))
+            local p = GroundAt(from:Lerp(to, f))
             if p then
                 local r = Route(from, p, mid)
                 if r then return r end
@@ -1415,7 +1429,7 @@ function ComputePath(from, to)
     for deg = 0, 345, 15 do
         local a = math.rad(deg)
         for _, dist in ipairs({20, 35, 55, 80}) do
-            local p = Floor(from + Vector3.new(math.cos(a), 0,
+            local p = GroundAt(from + Vector3.new(math.cos(a), 0,
                                                math.sin(a)) * dist)
             if p then
                 local d = Vector3.new(p.X - to.X, 0, p.Z - to.Z).Magnitude
@@ -1445,6 +1459,103 @@ function ComputePath(from, to)
         end
     end
     return nil
+end
+end
+
+-- ============================================================
+--  EXPLORE
+--  Nothing to fight does not mean nothing to do. Dungeon Quest is a
+--  corridor: clear a wave and the next one is further along it. The
+--  bot used to stand exactly where the last mob died - the no-target
+--  branch was `currentDest = nil` and nothing else - so any run that
+--  got ahead of its spawns ended with the bot alive, idle and out of
+--  time. In Aquatic Temple it stood on a bridge for a full minute
+--  while the floor burned around it.
+--
+--  There is no map to read, so the heading is LEARNED: the way the
+--  bot has been travelling while it fought is the way the dungeon
+--  goes. Add to that a coarse memory of where it has already stood,
+--  and "forward, somewhere new" is enough to find the next room.
+--
+--  Block-scoped, reached through three globals: the main chunk has no
+--  registers to spare.
+-- ============================================================
+do
+local dir, dirFrom = nil, nil
+local visited      = {}
+local pick, pickAt, idleSince = nil, 0, 0
+
+local function Cell(p)
+    local c = CONFIG.ExploreCell
+    return math.floor(p.X / c) * 8192 + math.floor(p.Z / c)
+end
+
+-- Called every tick, fighting or not. Walking toward mobs IS the
+-- dungeon's direction, so the heading costs nothing to learn.
+function ExploreSeen(pos)
+    visited[Cell(pos)] = true
+    if not dirFrom then dirFrom = pos return end
+    local d = Vector3.new(pos.X - dirFrom.X, 0, pos.Z - dirFrom.Z)
+    if d.Magnitude > CONFIG.ExploreCell then
+        dir, dirFrom = d.Unit, pos
+    end
+end
+
+-- A wave died or one appeared: drop the pick and start the wait over.
+function ExploreReset()
+    pick, pickAt, idleSince = nil, 0, 0
+end
+
+-- Somewhere to walk when there is nothing to kill, or nil to stand.
+function Explore(pos)
+    if not CONFIG.AutoExplore then return nil end
+    local now = tick()
+
+    -- Stand a moment first. Waves often spawn on top of where the
+    -- last one died, and walking off the instant it does would leave
+    -- them behind us.
+    if idleSince == 0 then idleSince = now end
+    if now - idleSince < CONFIG.ExploreWait then return nil end
+
+    -- See the current pick through rather than re-deciding at 20Hz.
+    if pick then
+        local left = Vector3.new(pick.X - pos.X, 0, pick.Z - pos.Z).Magnitude
+        if left > CONFIG.WaypointReach * 2
+        and now - pickAt < CONFIG.ExploreEvery then
+            return pick
+        end
+    end
+    -- A floor under the re-pick rate whatever the test above decided.
+    -- The fan below is 48 raycasts and this is called at 20Hz, so a
+    -- sweep that finds nothing - or one that arrives - must not turn
+    -- into a thousand casts a second.
+    if now - pickAt < 1.5 then return pick end
+    pickAt = now
+
+    local best, bestScore = nil, -1e9
+    for deg = 0, 345, 15 do
+        local a = math.rad(deg)
+        local u = Vector3.new(math.cos(a), 0, math.sin(a))
+        for _, d in ipairs({35, 70}) do
+            local p = GroundAt(pos + u * d)
+            -- Not down a shaft and not a sheer climb. GroundAt already
+            -- refuses open water, which on a bridge map is most of
+            -- what is out there.
+            if p and math.abs(p.Y - pos.Y) < 40 then
+                local score = d * 0.3
+                if dir then score = score + u:Dot(dir) * 45 end
+                if not visited[Cell(p)] then score = score + 40 end
+                if score > bestScore then best, bestScore = p, score end
+            end
+        end
+    end
+    pick = best
+    if best then
+        print(("[DQR] Nothing to fight - walking on, %d studs %s.")
+            :format((best - pos).Magnitude,
+                    dir and "ahead" or "to open ground"))
+    end
+    return pick
 end
 end
 
@@ -4877,17 +4988,16 @@ function ScanHazards()
     -- measuring anything meaningful while we are deliberately
     -- standing in one. See RushWhenSwamped.
     if Rushing() then
-        -- Nothing left to charge: standing in fire with dodging
-        -- switched off is the worst of both. Call it off.
-        if not (cachedTarget and cachedTarget.Root
-                and cachedTarget.Root.Parent) then
-            hazardCache.rushUntil = 0
-        else
-            hazardCache.escape,  hazardCache.holdP     = nil, nil
-            hazardCache.resting, hazardCache.restUntil = false, 0
-            hazardCache.inSince = 0
-            return nil
-        end
+        -- Having no target is not a reason to stop. With nothing left
+        -- alive the bot is TRAVELLING, and a floor that burns whether
+        -- or not anything is standing on it still has to be crossed -
+        -- which is the Aquatic Temple bridge exactly. The charge ends
+        -- when RushTime does, and only restarts if the ground is
+        -- still covered end to end.
+        hazardCache.escape,  hazardCache.holdP     = nil, nil
+        hazardCache.resting, hazardCache.restUntil = false, 0
+        hazardCache.inSince = 0
+        return nil
     end
 
     -- Continuously standing in a hazard for longer than any real
@@ -4989,11 +5099,21 @@ function ScanHazards()
         -- spot, or the bot shuffles between equally tight gaps.
         if #hazardShapes > 0 then
             local room = HazardClearance(pos, true)
-            if room < CONFIG.SafeMargin then
+            -- ...and not more often than once every few seconds, for
+            -- somewhere that is actually somewhere ELSE. On a bridge
+            -- with strips sweeping across it, every candidate is two
+            -- studs away and three studs roomier - so this fired over
+            -- and over and the bot shuffled on the spot for a minute
+            -- without ever leaving. The green destination marker sat
+            -- at its own feet the whole time.
+            if room < CONFIG.SafeMargin
+            and now - (hazardCache.repositionAt or 0) > 2.5 then
                 local better = FindEscape(pos, mobPos, keep, outward, true)
                 if better
+                and (better - pos).Magnitude > 4
                 and HazardClearance(better, true) > room + CONFIG.RepositionGain then
                     esc = better
+                    hazardCache.repositionAt = now
                     hazardCache.holdP     = better
                     hazardCache.holdUntil = now + 1.0
                     hazardCache.commitUntil = now + 2.0
@@ -5044,7 +5164,9 @@ function ScanHazards()
     -- races damage, and killing the thing is what ends the
     -- hazards.
     local swamped = false
-    if CONFIG.RushWhenSwamped and tgt and #hazardShapes > 0
+    -- No `tgt` requirement: being swamped with nothing to kill is the
+    -- bridge case, where the answer is to cross rather than to dodge.
+    if CONFIG.RushWhenSwamped and #hazardShapes > 0
     and not hazardCache.resting and not hazardCache.sheltering then
         if inHazard and (esc == nil
                          or HazardClearance(esc, true) <= 0) then
@@ -5062,11 +5184,12 @@ function ScanHazards()
             hazardCache.holdP, hazardCache.restUntil = nil, 0
             esc = nil
             print(("[DQR] Nowhere to dodge to (%d%% of the ground "
-                .. "is covered) - charging %s and burning it down "
-                .. "for %ds."):format(
+                .. "is covered) - pressing on past it for %ds%s.")
+                :format(
                 math.floor(hazardCache.Coverage(pos) * 100),
-                tgt.Model and tgt.Model.Name or "the target",
-                CONFIG.RushTime))
+                CONFIG.RushTime,
+                tgt and tgt.Model
+                    and (", burning down " .. tgt.Model.Name) or ""))
         end
     else
         hazardCache.noExitSince = 0
@@ -5434,18 +5557,33 @@ local function MainLoop()
             continue
         end
 
+        -- The way the dungeon goes, learned from the way we have been
+        -- walking. Costs a table write and a subtraction.
+        ExploreSeen(root.Position)
+
         local target = GetNearestMob()
+        if target then ExploreReset() end
 
         if not target then
-            currentDest = nil
             ClearRangeBar()
             StopFacing()
             seeded = false
+            pathTargetModel = nil    -- nothing out here to blacklist
             if now - lastNoTarget > 5 then
                 lastNoTarget = now
                 print(("[DQR] No target. %d mob(s) in the scan, radius %d.")
                     :format(#GetMobs(), CONFIG.MobScanRadius))
             end
+            -- Dodging still comes first - the floor of an Aquatic
+            -- Temple bridge burns whether or not anything is alive on
+            -- it - but once clear, walk on and find the next wave.
+            -- This branch used to be `currentDest = nil`, which is
+            -- why the bot stood where the last mob died until the run
+            -- ran out of time.
+            local esc = ScanHazards()
+            currentDest = esc
+                and Vector3.new(esc.X, root.Position.Y, esc.Z)
+                or Explore(root.Position)
             S(CONFIG.ScanRate)
             continue
         end
@@ -6997,7 +7135,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.53 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.54 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
