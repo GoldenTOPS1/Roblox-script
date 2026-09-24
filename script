@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.56
+--  DQR AUTO FARM v10.57
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -17,7 +17,7 @@ local CONFIG = {
 
     TargetDungeon  = "Enchanted Forest",
     Difficulty     = "Insane",
-    Hardcore       = true,  -- true = also press HARDCORE MODE
+    Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
 
     -- CARRY MODE. false = start the run the moment the lobby is made,
@@ -159,7 +159,7 @@ local CONFIG = {
                              -- foot level, else it is floor decoration
     FootOffset     = 3,      -- studs from HumanoidRootPart down to feet
     RecentWindow   = 8,      -- a part this new counts as an attack
-    HazardDebug    = true,  -- log what the hazard scanner reacts to AND
+    HazardDebug    = false,  -- log what the hazard scanner reacts to AND
                              -- draw every footprint it sees as a red
                              -- slab on the floor (F9 dumps the details)
 
@@ -270,6 +270,9 @@ local CONFIG = {
     -- which pinned the bot in the sci-fi dungeon, are both
     -- Workspace.Map.Models.*. Attacks live at the top of Workspace
     -- (laserBeam, preCast) or under the mob that cast them.
+    -- Containers whose contents are built scenery, never an attack.
+    -- Matched case-insensitively (see IsMapPart): Enchanted Forest
+    -- calls its container `map`, everything else calls it `Map`.
     MapFolders     = {Map = true, Terrain = true, Camera = true,
                       Lighting = true, borders = true},
     -- Dungeon Quest names its attack volumes, and the naming is
@@ -3824,20 +3827,43 @@ end
 -- WallDetailStripe and FloorPlate - both Workspace.Map.Models.* - are
 -- what had the bot standing still in empty corridors.
 local function IsMapPart(o)
-    local n, depth = o.Parent, 0
+    -- Matched case-INSENSITIVELY. Enchanted Forest keeps its geometry
+    -- under `Workspace.map`; every other dungeon uses `Map`. An exact
+    -- table lookup matched none of the forest, so every tree, leaf,
+    -- crystal, stalk and barricade in it went through the shape and
+    -- colour tests as a candidate attack - and a fair few passed.
+    -- That one capital letter was the whole reason the bot could not
+    -- cross that dungeon.
+    --
+    -- The lowered key set and the per-part answer are both cached on
+    -- CONFIG: this runs for every candidate part of every sweep, and
+    -- the main chunk has no registers to spare for either.
+    local memo = CONFIG._mapMemo
+    if not memo then
+        memo = setmetatable({}, {__mode = "k"})
+        local low = {}
+        for k in pairs(CONFIG.MapFolders) do low[k:lower()] = true end
+        CONFIG._mapMemo, CONFIG._mapLower = memo, low
+    end
+    local known = memo[o]
+    if known ~= nil then return known end
+
+    local low = CONFIG._mapLower
+    local n, depth, found = o.Parent, 0, false
     while n and n ~= workspace and depth < 10 do
-        if CONFIG.MapFolders[n.Name] then return true end
+        if low[n.Name:lower()] then found = true break end
         -- A creature's own body and equipment are not attacks either.
         -- Lord Varosh's Molten Greatsword is a long thin glowing mesh
         -- and was being registered as a laser to dodge - so the bot
         -- ran from the boss's sword while trying to hit the boss.
         if n:IsA("Model") and n:FindFirstChildOfClass("Humanoid") then
-            return true
+            found = true break
         end
         n = n.Parent
         depth = depth + 1
     end
-    return false
+    memo[o] = found
+    return found
 end
 
 -- Named as an attack volume by the game itself. See HazardNames.
@@ -7184,7 +7210,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.56 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.57 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
