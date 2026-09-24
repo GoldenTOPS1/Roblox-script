@@ -15,9 +15,9 @@ local CONFIG = {
     -- set Class to "" if you want to tune the numbers yourself.
     Class          = "Mage",
 
-    TargetDungeon  = "Enchanted Forest",
-    Difficulty     = "Insane",
-    Hardcore       = false,  -- true = also press HARDCORE MODE
+    TargetDungeon  = "Volcanic Chambers",
+    Difficulty     = "Nightmare",
+    Hardcore       = true,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
 
     -- CARRY MODE. false = start the run the moment the lobby is made,
