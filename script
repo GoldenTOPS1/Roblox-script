@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.49
+--  DQR AUTO FARM v10.50
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -13,7 +13,7 @@ local CONFIG = {
     -- Picks the engagement distances below. Anything you set by hand in
     -- the ENGAGEMENT DISTANCE block is overwritten by this at boot, so
     -- set Class to "" if you want to tune the numbers yourself.
-    Class          = "Warrior",
+    Class          = "Mage",
 
     TargetDungeon  = "Volcanic Chambers",
     Difficulty     = "Nightmare",
@@ -32,7 +32,7 @@ local CONFIG = {
     -- CarryWait is how many seconds to wait before starting anyway;
     -- 0 waits indefinitely, which is usually what you want, since
     -- starting without the people you are carrying defeats the point.
-    CarryMode      = false,
+    CarryMode      = true,
     CarryFor       = {"RateFire"},
     CarryWait      = 0,
 
@@ -327,6 +327,9 @@ local CONFIG = {
     RushWhenSwamped = true,
     SwampedTime    = 1.5,    -- seconds with no exit at all before the
                              -- charge starts (one bad sweep is noise)
+    SwampedFrac    = 0.7,    -- ...or this share of the ground all
+                             -- round us is hazard, whether or not
+                             -- we happen to be standing in one
     RushTime       = 8,      -- seconds committed to it. Hazards are
                              -- ignored entirely for this long: no
                              -- escapes, no backing off a beam fan, no
@@ -452,8 +455,8 @@ local CLASS_RANGES = {
         MaxRange     = 19, AttackRange = 30,
     },
     Mage = {
-        CircleRadius = 24, MeleeRange = 10, MinRange = 18,
-        MaxRange     = 34, AttackRange = 45,
+        CircleRadius = 15, MeleeRange = 10, MinRange = 12,
+        MaxRange     = 25, AttackRange = 35,
     },
     Healer = {
         CircleRadius = 26, MeleeRange = 10, MinRange = 20,
@@ -4587,6 +4590,34 @@ function Rushing()
     return tick() < (hazardCache.rushUntil or 0)
 end
 
+-- How much of the ground around us is covered? FindEscape never
+-- returns nothing when it is boxed in: its last resort is the
+-- least-bad point, which is still INSIDE a hazard, just deeper
+-- into a gap than where we stand. So "no exit found" never
+-- happens, and waiting for it meant the bot shuffled between bad
+-- gaps forever while the whole arena burned. Measure the ground
+-- directly instead: sixteen headings, four distances. Cached -
+-- this is asked at 16Hz and every sample walks the footprints.
+hazardCache.covered, hazardCache.coverAt = 0, 0
+hazardCache.Coverage = function(pos)
+    local now = tick()
+    if now - hazardCache.coverAt < 0.35 then
+        return hazardCache.covered
+    end
+    hazardCache.coverAt = now
+    local hit, total = 0, 0
+    for _, dir in ipairs(ESCAPE_DIRS) do
+        for _, d in ipairs({6, 12, 20, 30}) do
+            total = total + 1
+            if HazardClearance(pos + dir * d, true) <= 0 then
+                hit = hit + 1
+            end
+        end
+    end
+    hazardCache.covered = total > 0 and hit / total or 0
+    return hazardCache.covered
+end
+
 -- A sidestep out of a projectile's way, shared by the main loop and
 -- the dodge watcher: to whichever side the thing is NOT drifting
 -- toward (`fallback` decides when it is coming dead straight), by
@@ -4728,10 +4759,17 @@ function ScanHazards()
     -- measuring anything meaningful while we are deliberately
     -- standing in one. See RushWhenSwamped.
     if Rushing() then
-        hazardCache.escape,  hazardCache.holdP     = nil, nil
-        hazardCache.resting, hazardCache.restUntil = false, 0
-        hazardCache.inSince = 0
-        return nil
+        -- Nothing left to charge: standing in fire with dodging
+        -- switched off is the worst of both. Call it off.
+        if not (cachedTarget and cachedTarget.Root
+                and cachedTarget.Root.Parent) then
+            hazardCache.rushUntil = 0
+        else
+            hazardCache.escape,  hazardCache.holdP     = nil, nil
+            hazardCache.resting, hazardCache.restUntil = false, 0
+            hazardCache.inSince = 0
+            return nil
+        end
     end
 
     -- Continuously standing in a hazard for longer than any real
@@ -4878,21 +4916,39 @@ function ScanHazards()
             end
         end
     end
-    -- Standing in it with nowhere at all to go: every heading,
-    -- at every distance, covered. Waiting in the open for a gap
-    -- that is not coming just means taking the whole barrage on
-    -- the spot - so stop dodging, walk into the target and burn
-    -- it down. Damage races damage, and killing the thing is
-    -- what ends the hazards.
-    if inHazard and not esc and CONFIG.RushWhenSwamped then
+    -- Surrounded. Judged by what the exit is actually WORTH, not
+    -- by whether one was found: the last-resort exit is still
+    -- inside a hazard, so the old "no escape" test never fired
+    -- and the bot went on hunting for a way out of a room that
+    -- did not have one. If the best place to go is no better
+    -- than here, or the ground all round is covered, stop
+    -- dodging - walk into the target and burn it down. Damage
+    -- races damage, and killing the thing is what ends the
+    -- hazards.
+    local swamped = false
+    if CONFIG.RushWhenSwamped and tgt and #hazardShapes > 0
+    and not hazardCache.resting and not hazardCache.sheltering then
+        if inHazard and (esc == nil
+                         or HazardClearance(esc, true) <= 0) then
+            swamped = true
+        elseif hazardCache.Coverage(pos) >= CONFIG.SwampedFrac then
+            swamped = true
+        end
+    end
+    if swamped then
         if (hazardCache.noExitSince or 0) == 0 then
             hazardCache.noExitSince = now
         elseif now - hazardCache.noExitSince > CONFIG.SwampedTime then
             hazardCache.noExitSince = 0
             hazardCache.rushUntil   = now + CONFIG.RushTime
-            print(("[DQR] Nowhere to dodge to - the area is covered "
-                .. "end to end. Charging the target and burning it "
-                .. "down for %ds."):format(CONFIG.RushTime))
+            hazardCache.holdP, hazardCache.restUntil = nil, 0
+            esc = nil
+            print(("[DQR] Nowhere to dodge to (%d%% of the ground "
+                .. "is covered) - charging %s and burning it down "
+                .. "for %ds."):format(
+                math.floor(hazardCache.Coverage(pos) * 100),
+                tgt.Model and tgt.Model.Name or "the target",
+                CONFIG.RushTime))
         end
     else
         hazardCache.noExitSince = 0
@@ -4917,6 +4973,11 @@ function HazardDiag()
         print(("[DQR] CHARGING - nowhere to dodge to, ignoring hazards "
             .. "for another %.1fs. (RushWhenSwamped)")
             :format(hazardCache.rushUntil - tick()))
+    end
+    if #hazardShapes > 0 then
+        print(("[DQR] Ground around us: %d%% covered - charges at %d%%.")
+            :format(math.floor(hazardCache.Coverage(pos) * 100),
+                    math.floor(CONFIG.SwampedFrac * 100)))
     end
 
     -- What the last sweep is treating as dangerous right now, and
@@ -6818,7 +6879,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.49 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.50 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
