@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.50
+--  DQR AUTO FARM v10.51
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -32,7 +32,7 @@ local CONFIG = {
     -- CarryWait is how many seconds to wait before starting anyway;
     -- 0 waits indefinitely, which is usually what you want, since
     -- starting without the people you are carrying defeats the point.
-    CarryMode      = true,
+    CarryMode      = false,
     CarryFor       = {"RateFire"},
     CarryWait      = 0,
 
@@ -455,8 +455,8 @@ local CLASS_RANGES = {
         MaxRange     = 19, AttackRange = 30,
     },
     Mage = {
-        CircleRadius = 15, MeleeRange = 10, MinRange = 12,
-        MaxRange     = 25, AttackRange = 35,
+        CircleRadius = 20, MeleeRange = 10, MinRange = 15,
+        MaxRange     = 25, AttackRange = 40,
     },
     Healer = {
         CircleRadius = 26, MeleeRange = 10, MinRange = 20,
@@ -1343,8 +1343,8 @@ function ComputePath(from, to)
     pathFails = pathFails + 1
     local now = tick()
     if pathFails < 2 or now < nextDetour then return nil end
-    nextDetour = now + 2    -- fifteen ComputeAsyncs is not a thing to
-                            -- do at 2.5Hz, however stuck we are
+    nextDetour = now + 1.2  -- fifteen ComputeAsyncs is not a thing
+                            -- to do at 2.5Hz, however stuck
     local mid  = {{2, 60}}
     local soft = {{1.5, 89}}
     local flat = Vector3.new(to.X - from.X, 0, to.Z - from.Z).Magnitude
@@ -1378,6 +1378,12 @@ function ComputePath(from, to)
     -- 3. The way on may not point at the target at all. Fan out, keep
     --    only the probes that end up meaningfully closer to it, and
     --    take the best one that routes.
+    -- Height gained toward a target above us is worth more than a
+    -- few studs of horizontal progress: that is what a staircase
+    -- looks like from down here. Going up one barely closes the
+    -- distance on the map, so scoring on distance alone kept
+    -- picking flat ground that led nowhere.
+    local up = to.Y - from.Y
     local cands = {}
     for deg = 0, 345, 15 do
         local a = math.rad(deg)
@@ -1386,13 +1392,18 @@ function ComputePath(from, to)
                                                math.sin(a)) * dist)
             if p then
                 local d = Vector3.new(p.X - to.X, 0, p.Z - to.Z).Magnitude
-                if d < flat - 10 then
-                    cands[#cands + 1] = {p = p, d = d}
+                local gain = 0
+                if math.abs(up) > 6 then
+                    gain = math.clamp(
+                        (p.Y - from.Y) * (up > 0 and 1 or -1), -20, 20)
+                end
+                if d < flat - 4 or gain > 4 then
+                    cands[#cands + 1] = {p = p, d = d, score = d - gain * 2}
                 end
             end
         end
     end
-    table.sort(cands, function(x, y) return x.d < y.d end)
+    table.sort(cands, function(x, y) return x.score < y.score end)
     for i = 1, math.min(#cands, 8) do
         local r = Route(from, cands[i].p, soft)
         if r then
@@ -1423,8 +1434,20 @@ local function PathWorker(getDestFn)
             if root and dest then
                 local flat = (Vector3.new(dest.X, 0, dest.Z)
                             - Vector3.new(root.Position.X, 0, root.Position.Z)).Magnitude
+                -- A clear straight line means nothing when the
+                -- target is well above us. On a staircase the line
+                -- to the top clears the moment we are a few steps
+                -- up - there is open air over the steps for it to
+                -- clear THROUGH - and dropping the route then means
+                -- walking into the side of the flight and sliding
+                -- back down. Which is exactly the quarter-way-up,
+                -- back-down, half-way-up the bot was doing. Nothing
+                -- walks up seven studs of air.
+                local rise = dest.Y - root.Position.Y
                 local needPath = forceRepath
-                    or (flat > CONFIG.PathMinDist and not LineClear(root.Position, dest))
+                    or (flat > CONFIG.PathMinDist
+                        and (rise > CONFIG.JumpMax
+                             or not LineClear(root.Position, dest)))
 
                 if needPath then
                     local moved = pathGoal and (dest - pathGoal).Magnitude or 1e9
@@ -1435,6 +1458,19 @@ local function PathWorker(getDestFn)
                             pathQueue = wps
                             pathGoal  = dest
                             pathFail  = 0
+                        elseif #pathQueue > 0 then
+                            -- A recompute that came back empty is
+                            -- no reason to throw away the route we
+                            -- are already walking. Mobs shuffle,
+                            -- and every shuffle past RepathDist
+                            -- triggers one of these - which deleted
+                            -- the detour halfway along it, every
+                            -- 0.4 seconds, and turned "no path"
+                            -- into pacing on the spot. Keep going;
+                            -- re-aim the old route at where the
+                            -- target is now and ask again when the
+                            -- queue runs out.
+                            pathGoal = dest
                         else
                             pathFail = pathFail + 1
                             ClearPath()
@@ -1506,7 +1542,18 @@ local function PathWorker(getDestFn)
                     -- Don't throw a working path away on one clear
                     -- reading. Near a corner that flickers, and dropping
                     -- the path means walking straight back into the wall.
-                    if #pathQueue > 0 then
+                    -- ...and never drop one that is still climbing,
+                    -- however clear the line looks: see the note on
+                    -- `rise` above.
+                    local climbing = false
+                    for i = 1, math.min(#pathQueue, 4) do
+                        if pathQueue[i].Position.Y
+                           - root.Position.Y > 3 then
+                            climbing = true
+                            break
+                        end
+                    end
+                    if #pathQueue > 0 and not climbing then
                         clearStreak = clearStreak + 1
                         if clearStreak >= CONFIG.PathHoldClear then
                             ClearPath()
@@ -6879,7 +6926,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.50 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.51 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
