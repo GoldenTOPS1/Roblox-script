@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v10.58
+--  DQR AUTO FARM v10.59
 --  Change version number every time you update the script.
 --  Humanoid:Move walking + PathfindingService, melee + spells,
 --  exact-path lobby queue, on-screen log, Discord loot webhook
@@ -15,9 +15,9 @@ local CONFIG = {
     -- set Class to "" if you want to tune the numbers yourself.
     Class          = "Mage",
 
-    TargetDungeon  = "Volcanic Chambers",
-    Difficulty     = "Nightmare",
-    Hardcore       = true,  -- true = also press HARDCORE MODE
+    TargetDungeon  = "Enchanted Forest",
+    Difficulty     = "Insane",
+    Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,
 
     -- CARRY MODE. false = start the run the moment the lobby is made,
@@ -159,6 +159,10 @@ local CONFIG = {
                              -- foot level, else it is floor decoration
     FootOffset     = 3,      -- studs from HumanoidRootPart down to feet
     RecentWindow   = 8,      -- a part this new counts as an attack
+    ActiveLinger   = 3.5,    -- ...and one that HAS acted stays a hazard
+                             -- this long after it last changed. Longer
+                             -- than the attack, and the footprint
+                             -- outlives the thing that made it.
     HazardDebug    = false,  -- log what the hazard scanner reacts to AND
                              -- draw every footprint it sees as a red
                              -- slab on the floor (F9 dumps the details)
@@ -196,6 +200,9 @@ local CONFIG = {
     -- spell hits several of them. GroupWeight is how many studs of
     -- extra walking one extra neighbour is worth; turn it down to stay
     -- lazier, up to range further for a bigger pile.
+    -- Fight the boss, not the endless adds it keeps summoning. Set
+    -- false to always take whatever is nearest / in the biggest pack.
+    PreferBoss     = true,
     PreferGroups   = true,
     GroupRadius    = 14,
     GroupWeight    = 12,
@@ -425,6 +432,10 @@ local CONFIG = {
     PaceGiveUp     = 2,      -- pacing bouts before abandoning the target
     LoopStallTime  = 6,      -- secs without a farm tick = dead thread
     AgentMaxSlope  = 45,     -- steeper than this = route around, not up
+    AimMaxDrop     = 25,     -- a target's root further above or below
+                             -- us than this is a model-origin quirk,
+                             -- not a real height: aim at our own level
+                             -- instead. See the Ancient Enchanted Tree.
     DescendDrop    = 8,      -- when the target is at least this far
                              -- BELOW us and no route exists, walk off
                              -- the edge toward it. Roblox's pathfinder
@@ -1041,7 +1052,14 @@ function LooksActive(o, fresh, trusted)
     if why then rec.moved, rec.why = now, why end
     rec.pos, rec.tr, rec.size, rec.col = o.Position, tr, size, col
     if new then return true, "new" end
-    if (now - rec.moved) < CONFIG.RecentWindow then return true, rec.why end
+    -- How long a part stays "doing something" after it last did. This
+    -- used to be RecentWindow (8s), which is why a footprint sat on
+    -- the floor for the better part of ten seconds after the attack
+    -- that made it had visibly finished. A real telegraph keeps
+    -- changing while it is live, so a short linger loses nothing -
+    -- and the two cases that genuinely sit still, a named hazard and
+    -- a red marker, never reach this test at all.
+    if (now - rec.moved) < CONFIG.ActiveLinger then return true, rec.why end
     return false, nil
 end
 
@@ -3376,6 +3394,23 @@ local function GetNearestMob()
         best = pick
     end
 
+    -- A boss outranks its adds. The Ancient Enchanted Tree spawns
+    -- Ancient Spirits faster than they can be cleared, so picking by
+    -- distance meant the bot fought spirits for the whole fight and
+    -- never touched the boss - and the boss is what ends the wave.
+    -- Blacklisted bosses are skipped, so an unreachable one still
+    -- falls back to whatever else is around.
+    if CONFIG.PreferBoss and best and not best.Boss and #mobList > 1 then
+        local boss = nil
+        for _, rec in ipairs(mobList) do
+            if rec.Boss and not unreachable[rec.Model]
+            and (not boss or rec.Distance < boss.Distance) then
+                boss = rec
+            end
+        end
+        if boss then best = boss end
+    end
+
     cachedMobs  = mobList
     cachedTarget = best
     return best
@@ -3902,13 +3937,22 @@ end
 -- well inside the radius appeared there.
 local function IsTelegraph(o, pos, radius)
     if not o:IsA("BasePart") then return false end
-    if IsOurs(o) or IsMapPart(o) then return false end
+    if IsOurs(o) then return false end
     -- The game says it is an attack. Believe it, and skip the shape
     -- and colour guesswork entirely - those exist only to infer what
     -- this states outright. thirdBossRandomLine.hitBox is 39 studs
     -- tall and was being thrown out as "too thick" while it was
     -- actively killing us.
+    --
+    -- Asked BEFORE the map test on purpose: a part the game named as
+    -- an attack is one wherever it happens to be parented, and some
+    -- dungeons hang them inside the map container.
     if NamedHazard(o) then return true end
+    -- Built geometry - unless it was added mid-run. The map is there
+    -- when we arrive; an attack the game parents INTO the map
+    -- container is not, and a blanket rejection would hand the whole
+    -- of Enchanted Forest's beam work back to the floor.
+    if IsMapPart(o) and not recentParts[o] then return false end
     -- Warning colours are trusted past the size caps; nothing else is.
     -- Giving every non-solid part the relaxed caps was too generous -
     -- a dungeon full of moving holograms and light panels then had
@@ -4214,10 +4258,16 @@ local function CollectTelegraphs(pos)
                 shelterBest, shelterAt = d, o.Position
             end
         elseif IsBlob(o) and not PlayerOwned(o)
-        and math.abs(o.Position.Y - pos.Y) < 20 then
+        -- A big sphere reaches us from further up than a small one, so
+        -- the height gate scales with it rather than being a flat 20.
+        and math.abs(o.Position.Y - pos.Y) < 20 + PartSize(o).Y / 2 then
             local s = PartSize(o)
+            -- The WHOLE ball, not its widest horizontal slice: a
+            -- sphere's danger is its radius in every direction, and
+            -- taking max(X,Z) alone under-read anything taller than
+            -- it is wide.
             NoteDisc(o.Position.X, o.Position.Y, o.Position.Z,
-                     math.max(s.X, s.Z) / 2 + CONFIG.TelegraphPad, o)
+                     math.max(s.X, s.Y, s.Z) / 2 + CONFIG.TelegraphPad, o)
         elseif IsTelegraph(o, pos, radius) and not PlayerOwned(o) then
             local _, a, b, va = Footprint(o)
             -- A ring AoE is as wide as it is long. Treating it as a box
@@ -5669,7 +5719,19 @@ local function MainLoop()
         end
 
         local mobPos = target.Root.Position
-        local dist   = target.Distance
+        -- A model's root is not always inside its body. The Ancient
+        -- Enchanted Tree's sits 116 studs under the arena floor, and
+        -- everything downstream took that literally: the 3D distance
+        -- was permanently over spell range so not one spell was ever
+        -- cast at it, the approach aimed at a ring point underground
+        -- so no route existed, and the descend rule read "target is
+        -- 116 studs below and unroutable" and walked the bot off the
+        -- edge. The horizontal position is the part that is real -
+        -- when the root is nowhere near our level, use our own.
+        if math.abs(mobPos.Y - root.Position.Y) > CONFIG.AimMaxDrop then
+            mobPos = Vector3.new(mobPos.X, root.Position.Y, mobPos.Z)
+        end
+        local dist   = (mobPos - root.Position).Magnitude
         pathTargetModel = target.Model   -- so the path worker can blacklist it
 
         -- Combat-stall watchdog. A live target whose health has not
@@ -7244,7 +7306,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v10.58 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v10.59 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed starts HERE, not at the end of boot. It is how
     -- you check on the bot, so it has to be running before the bot is:
