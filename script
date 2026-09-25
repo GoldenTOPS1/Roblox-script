@@ -23,7 +23,7 @@ local CONFIG = {
     -- until everyone in CarryFor has joined, then start. CarryWait is
     -- how long to wait before starting anyway (0 = forever). Lobby
     -- only - the in-dungeon START button is always pressed.
-    CarryMode      = true,
+    CarryMode      = false,
     CarryFor       = {"24MINZ"},
     CarryWait      = 0,
 
