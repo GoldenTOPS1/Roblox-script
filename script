@@ -14,8 +14,8 @@ local CONFIG = {
     -- Class to "" to tune those by hand instead.
     Class          = "Mage",
 
-    TargetDungeon  = "Volcanic Chambers",
-    Difficulty     = "Nightmare",
+    TargetDungeon  = "Northern Lands",
+    Difficulty     = "Insane",
     Hardcore       = true,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
