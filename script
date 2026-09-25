@@ -14,9 +14,9 @@ local CONFIG = {
     -- Class to "" to tune those by hand instead.
     Class          = "Mage",
 
-    TargetDungeon  = "Volcanic Chambers",
-    Difficulty     = "Nightmare",
-    Hardcore       = true,  -- true = also press HARDCORE MODE
+    TargetDungeon  = "Enchanted Forest",
+    Difficulty     = "Insane",
+    Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
     -- CARRY MODE: after creating the lobby, wait on the party screen
