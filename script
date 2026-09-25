@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v11.7
+--  DQR AUTO FARM v11.6
 --  Change version number every time you update the script.
 --  Rewrite: one brain decides where to stand, spells never wait on
 --  movement. Lobby queue, Carry Mode, Discord loot + live status.
@@ -81,7 +81,7 @@ local CONFIG = {
     CameraHeight   = 12,
     CameraBack     = 17,
     SetWalkSpeed   = true,
-    WalkSpeed      = 19,
+    WalkSpeed      = 20,
 
     -- ---- TARGETING ---------------------------------------------
     PreferBoss     = true,   -- a boss outranks the adds it summons
@@ -109,9 +109,6 @@ local CONFIG = {
     StrandedMaxRange = 100,  -- ...but only a boss this close; further off
                              -- it is skipped like anything else
     LatchTime      = 15,     -- either verdict is re-tested after this long
-    ReturnTime     = 180,    -- after losing every target (a death), walk
-                             -- back to where the fight was if it was
-                             -- this recent, before exploring
 
     -- ---- DODGING: fight first ---------------------------------
     -- Spells never stop for a dodge. The bot steps out of a hazard
@@ -1313,7 +1310,7 @@ do
 Mobs.list, Mobs.at, Mobs.current = {}, 0, nil
 local banned = {}                                   -- model -> until
 local knownBoss = setmetatable({}, {__mode = "k"})  -- bosses seen this run
-local discoverAt, fullWalkAt = 0, 0
+local discoverAt = 0
 local shape  = setmetatable({}, {__mode = "k"})     -- model -> {ok, bb}
 local radius = setmetatable({}, {__mode = "k"})     -- model -> studs
 
@@ -1420,10 +1417,9 @@ function Mobs.Scan(force)
         end
         if #list > 0 then break end
     end
-    -- Nothing at any radius: walk the models directly. Slow, so at most
-    -- every two seconds - an empty map used to trigger it on every scan.
-    if #list == 0 and now - fullWalkAt > 2 then
-        fullWalkAt = now
+    -- Nothing at any radius: walk the models directly. Slow, but only
+    -- when the map looks empty, and missing a live boss is far worse.
+    if #list == 0 then
         seen = {}
         for _, obj in ipairs(workspace:GetDescendants()) do
             if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") then
@@ -2813,7 +2809,7 @@ end
 --  has already stood - "forward, somewhere new".
 -- ============================================================
 do
-local dir, dirFrom, lastSeen = nil, nil, nil
+local dir, dirFrom = nil, nil
 local visited = {}
 local pick, pickAt, idleSince = nil, 0, 0
 
@@ -2824,12 +2820,6 @@ end
 
 function Nav.ExploreSeen(pos)
     visited[Cell(pos)] = true
-    -- A respawn is a jump straight back to the start. Read as walking,
-    -- it taught the explorer that "forward" was the way back to spawn,
-    -- and after every death it set off in the wrong direction. Start a
-    -- new leg from here and keep the heading we had.
-    if dirFrom and lastSeen and (pos - lastSeen).Magnitude > 50 then dirFrom = pos end
-    lastSeen = pos
     if not dirFrom then dirFrom = pos return end
     local d = Flat(pos - dirFrom)
     if d.Magnitude > CONFIG.ExploreCell then dir, dirFrom = d.Unit, pos end
@@ -2964,10 +2954,6 @@ local prog = nil                       -- per-target progress, see below
 local said, saidAt = "", 0
 local lastNoTarget = 0
 local lastPos, lastTarget = nil, nil
--- Where we last stood fighting, and since when we have been walking
--- back to it. Survives Brain.Reset on purpose: a death is exactly when
--- it is needed.
-local lastFight, backSince = nil, 0
 
 -- Forget everything decided about the last position: after a death, a
 -- respawn or any teleport. A "can't get closer" verdict reached beside
@@ -3180,9 +3166,6 @@ function Brain.Tick(root)
         if dist <= CONFIG.MeleeRange + reach then DoMelee(aim) end
         DoSpell(dist, stranded and math.max(spellR, dist + 5) or spellR, aim)
         Nav.face = aim
-        -- Our own spot while engaged: known walkable ground in the arena.
-        if dist <= spellR + 15 then lastFight = {pos = pos, t = now} end
-        backSince = 0
     else
         Nav.face = nil
         prog = nil
@@ -3274,37 +3257,11 @@ function Brain.Tick(root)
         end
     end
 
-    -- 4. Nothing to fight.
+    -- 4. Nothing to fight: walk on.
     if not tgt then
         if now - lastNoTarget > 5 then
             lastNoTarget = now
             print(("[DQR] No target. %d mob(s) in the scan."):format(#Mobs.list))
-        end
-        -- Lost the fight altogether - usually a death. The game only
-        -- loads the world near us, so from the respawn point the boss
-        -- we were fighting is not just out of range, it does not exist
-        -- on our side at all, and exploring for it walked the bot all
-        -- over the map. Go back to where we last fought first.
-        if not goal and lastFight and now - lastFight.t < CONFIG.ReturnTime then
-            local far = FlatDist(lastFight.pos, pos)
-            if far <= 30 then
-                lastFight, backSince = nil, 0       -- back, and it is empty
-            elseif backSince > 0 and now - backSince > 90 then
-                print("[DQR] Could not get back to the fight - exploring instead.")
-                lastFight, backSince = nil, 0
-            else
-                if backSince == 0 then
-                    backSince = now
-                    print(("[DQR] Lost the fight - heading back to it (%d studs).")
-                        :format(far))
-                    local at = lastFight.pos
-                    task.spawn(function()
-                        pcall(function() LP:RequestStreamAroundAsync(at) end)
-                    end)
-                end
-                goal = lastFight.pos
-                state = ("Heading back to the fight (%d studs)"):format(math.floor(far / 5) * 5)
-            end
         end
         if not goal then
             goal = Nav.Explore(pos)
@@ -4283,7 +4240,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v11.7 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v11.6 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
