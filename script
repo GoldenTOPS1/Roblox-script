@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v11.0
+--  DQR AUTO FARM v11.1
 --  Change version number every time you update the script.
 --  Rewrite: one brain decides where to stand, spells never wait on
 --  movement. Lobby queue, Carry Mode, Discord loot + live status.
@@ -93,6 +93,7 @@ local CONFIG = {
     MobScanRadius  = 600,
     MobRadiusMax   = 25,     -- no mob is wider than this
     BossHealthHint = 5000,   -- above this with no bar overhead = boss
+    BossReach      = 20,     -- extra spell range against a boss
     AimMaxDrop     = 25,     -- a root further above/below us than this is
                              -- a model quirk (the Ancient Enchanted Tree's
                              -- is 116 studs underground): aim at our level
@@ -144,7 +145,7 @@ local CONFIG = {
     ActiveLinger   = 3.5,    -- stays a hazard this long after it last changed
     HazardMaxAge   = 20,     -- a source live longer than this is decor...
     HazardBanTime  = 120,    -- ...and is ignored for this long
-    HazardStuckTime= 12,     -- "in a hazard" this long = misreading...
+    HazardStuckTime= 25,     -- "in a hazard" this long = misreading...
     HazardMute     = 15,     -- ...so ignore hazards for this long
     FreshSightRule = false,
 
@@ -1382,8 +1383,56 @@ function Mobs.Scan(force)
             end
         end
     end
+
+    -- Bosses the overhead-bar test misses. The Ancient Enchanted Tree
+    -- has a small bar over its head AND the big one at the top of the
+    -- screen, so "big health, no overhead bar" called it an ordinary
+    -- mob - no PreferBoss, no casting from range, and adds picked over
+    -- it. Two more signals, either one enough:
+    --   * its name is on screen - the top-of-screen boss bar is a
+    --     ScreenGui label, while mob bars live in BillboardGuis
+    --   * it has 20x the health of a typical mob in the fight
+    if #list > 0 then
+        local names = Mobs.ScreenNames()
+        local hp = {}
+        for _, rec in ipairs(list) do hp[#hp + 1] = rec.Humanoid.MaxHealth end
+        table.sort(hp)
+        local median = hp[math.ceil(#hp / 2)]
+        for _, rec in ipairs(list) do
+            local h = rec.Humanoid
+            local shown = names[Norm(rec.Model.Name)]
+                or (h.DisplayName ~= "" and names[Norm(h.DisplayName)])
+            if not rec.Boss and ((shown and h.MaxHealth >= CONFIG.BossHealthHint)
+                or (#list >= 3 and h.MaxHealth >= median * 20)) then
+                rec.Boss = true
+            end
+        end
+    end
     Mobs.list = list
     return list
+end
+
+-- Every text showing in a ScreenGui right now, normalised. Refreshed
+-- at most once a second: PlayerGui is large.
+do
+local cache, at = {}, 0
+function Mobs.ScreenNames()
+    local now = tick()
+    if now - at < 1 then return cache end
+    at, cache = now, {}
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    if not pg then return cache end
+    for _, sg in ipairs(pg:GetChildren()) do
+        if sg:IsA("ScreenGui") and sg.Enabled and sg ~= LogGui then
+            for _, o in ipairs(sg:GetDescendants()) do
+                if o:IsA("TextLabel") and o.Visible and o.Text ~= "" then
+                    cache[Norm(o.Text)] = true
+                end
+            end
+        end
+    end
+    return cache
+end
 end
 
 -- The mob to fight. Sticky: the current target is kept unless it dies,
@@ -1465,11 +1514,16 @@ function Mobs.Diag()
             if hum and d >= 0 and d < 400 then
                 n = n + 1
                 local sh = shape[obj]
-                print(("%s | d=%d hp=%d/%d root=%s anchored=%s ok=%s boss=%s banned=%s")
+                -- The verdict the targeting actually used, from the last scan.
+                local boss = nil
+                for _, rec in ipairs(Mobs.list) do
+                    if rec.Model == obj then boss = rec.Boss break end
+                end
+                print(("%s | d=%d hp=%d/%d root=%s rootdY=%d anchored=%s ok=%s boss=%s banned=%s")
                     :format(obj:GetFullName(), d, hum.Health, hum.MaxHealth,
-                            mr.Name, tostring(mr.Anchored), tostring(sh and sh.ok),
-                            tostring(hum.MaxHealth >= CONFIG.BossHealthHint
-                                     and not (sh and sh.bb)),
+                            mr.Name, mr.Position.Y - root.Position.Y,
+                            tostring(mr.Anchored), tostring(sh and sh.ok),
+                            boss == nil and "not in scan" or tostring(boss),
                             tostring(Mobs.Banned(obj))))
             end
         end
@@ -2760,9 +2814,16 @@ local function Say(s)
     end
 end
 
+-- Where to aim and measure range from. A boss is always taken at our
+-- own height: they are huge, and where the rig keeps its root says
+-- nothing about where the body is - the Tree's is under the floor, and
+-- aiming at it sent the bot walking off the edge "toward" it. Anything
+-- else keeps its real height unless that is absurd (see AimMaxDrop).
 local function AimOf(rec, me)
     local a = rec.Root.Position
-    if math.abs(a.Y - me.Y) > CONFIG.AimMaxDrop then a = Vector3.new(a.X, me.Y, a.Z) end
+    if rec.Boss or math.abs(a.Y - me.Y) > CONFIG.AimMaxDrop then
+        a = Vector3.new(a.X, me.Y, a.Z)
+    end
     return a
 end
 
@@ -2780,7 +2841,7 @@ local function PickExit(pos, aim, keepR, heading)
             local p = pos + u * d
             if Haz.Clear(p, true) >= CONFIG.EvadeClear then
                 local score = d
-                if heading then score = score - u:Dot(heading) * 6 end
+                if heading then score = score - u:Dot(heading) * 10 end
                 if aim and keepR then
                     local f = FlatDist(p, aim)
                     if f > keepR then score = score + (f - keepR) * 2 end
@@ -2841,7 +2902,10 @@ function Brain.Tick(root)
         aim  = AimOf(tgt, pos)
         flat = FlatDist(aim, pos)
         dist = (aim - pos).Magnitude
-        spellR = CONFIG.AttackRange + tgt.Radius
+        -- A boss's radius is clamped at MobRadiusMax, and a big one
+        -- (the Tree's canopy) is far wider than that, so its surface
+        -- is further out than the numbers say: cast from further off.
+        spellR = CONFIG.AttackRange + tgt.Radius + (tgt.Boss and CONFIG.BossReach or 0)
         ring   = CONFIG.CircleRadius + tgt.Radius
         name   = tgt.Model.Name
 
@@ -2958,7 +3022,6 @@ function Brain.Tick(root)
             goal, state = p, "Stepping out of a hazard"
         end
     end
-    if goal and prog then prog.best, prog.since = flat, now end   -- dodging is not failing
 
     -- 3. Positioning against the target.
     if not goal and tgt then
@@ -3969,7 +4032,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v11.0 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v11.1 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
