@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v11.3
+--  DQR AUTO FARM v11.4
 --  Change version number every time you update the script.
 --  Rewrite: one brain decides where to stand, spells never wait on
 --  movement. Lobby queue, Carry Mode, Discord loot + live status.
@@ -1268,6 +1268,8 @@ end
 do
 Mobs.list, Mobs.at, Mobs.current = {}, 0, nil
 local banned = {}                                   -- model -> until
+local knownBoss = setmetatable({}, {__mode = "k"})  -- bosses seen this run
+local discoverAt = 0
 local shape  = setmetatable({}, {__mode = "k"})     -- model -> {ok, bb}
 local radius = setmetatable({}, {__mode = "k"})     -- model -> studs
 
@@ -1408,6 +1410,55 @@ function Mobs.Scan(force)
             if not rec.Boss and ((shown and h.MaxHealth >= CONFIG.BossHealthHint)
                 or (#list >= 3 and h.MaxHealth >= median * 20)) then
                 rec.Boss = true
+            end
+            if rec.Boss then knownBoss[rec.Model] = true end
+        end
+    end
+
+    -- The ring search above stops at the first ring with anything in
+    -- it, and finds mobs by their root. The Ancient Enchanted Tree's
+    -- root is ~116 studs under the floor, so with a single spirit within
+    -- 140 studs the search ended before ever reaching the Tree - which
+    -- is why the bot fought spirits all fight and never once targeted
+    -- the boss. Bosses are found separately, by a full sweep every few
+    -- seconds, and once known are added to every scan wherever their
+    -- root happens to be.
+    if now - discoverAt > 5 then
+        discoverAt = now
+        local hums = {}
+        for _, h in ipairs(workspace:GetDescendants()) do
+            if h:IsA("Humanoid") and h.Health > 0
+            and h.MaxHealth >= CONFIG.BossHealthHint
+            and h.Parent and h.Parent:IsA("Model") and not IsPlayerChar(h.Parent) then
+                hums[#hums + 1] = h
+            end
+        end
+        local hp = {}
+        for _, h in ipairs(hums) do hp[#hp + 1] = h.MaxHealth end
+        table.sort(hp)
+        local median = hp[math.ceil(#hp / 2)] or 0
+        local names = Mobs.ScreenNames()
+        for _, h in ipairs(hums) do
+            local m = h.Parent
+            local shown = names[Norm(m.Name)]
+                or (h.DisplayName ~= "" and names[Norm(h.DisplayName)])
+            if not knownBoss[m] and (shown or (#hp >= 3 and h.MaxHealth >= median * 20)) then
+                knownBoss[m] = true
+                print(("[DQR] Boss found: %s (%s health)."):format(m.Name, Hud.Short(h.MaxHealth)))
+            end
+        end
+    end
+    local inList = {}
+    for _, rec in ipairs(list) do inList[rec.Model] = true end
+    for m in pairs(knownBoss) do
+        if not inList[m] and m.Parent then
+            local mr = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
+                    or m:FindFirstChildWhichIsA("BasePart")
+            local rec = mr and (mr.Position - me).Magnitude < CONFIG.MobScanRadius * 1.5
+                        and Record(m, mr, me)
+            if rec then
+                rec.Boss = true
+                list[#list + 1] = rec
             end
         end
     end
@@ -4144,7 +4195,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v11.3 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v11.4 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
