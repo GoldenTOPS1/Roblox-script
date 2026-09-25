@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v11.5
+--  DQR AUTO FARM v11.6
 --  Change version number every time you update the script.
 --  Rewrite: one brain decides where to stand, spells never wait on
 --  movement. Lobby queue, Carry Mode, Discord loot + live status.
@@ -1078,7 +1078,38 @@ local LOBBY_MARKERS = {"LobbyPlay", "IntroPlay", "SelectPanel", "ChoosePanel",
                        "LobbyInfo", "Replay", "ShowFriends", "ShowPlayers"}
 local lobbySeenAt = tick()
 
+-- The in-dungeon START button, when it is up. Never the lobby party
+-- screen's own start button, which lives under queueGui. Cached for a
+-- second: it walks the whole PlayerGui.
+local DungeonStartButton
+do
+local at, btn = 0, nil
+function DungeonStartButton()
+    local now = tick()
+    if now - at < 1 then
+        if btn and not (btn.Parent and VisibleOnScreen(btn)) then btn = nil end
+        return btn
+    end
+    at, btn = now, nil
+    local q = Path({"queueGui"})
+    for _, b in ipairs(FindButtons({{text = "start"}, {text = "startdungeon"},
+                                    {name = "startbutton"}})) do
+        if VisibleOnScreen(b) and not (q and b:IsDescendantOf(q)) then
+            btn = b
+            break
+        end
+    end
+    return btn
+end
+end
+
+-- Which lobby-only thing is on screen, or nil. The in-dungeon START
+-- button overrides everything: the dungeon's GUI briefly shows the
+-- lobby's Play button while it loads, and in Enchanted Forest that was
+-- enough to make the bot queue a run from inside the dungeon, never
+-- press START, and sit there.
 local function LobbyMarker()
+    if DungeonStartButton() then return nil end
     for _, k in ipairs(LOBBY_MARKERS) do
         if PathVisible(UI[k]) then
             lobbySeenAt = tick()
@@ -1120,6 +1151,12 @@ local function RunLobbyFlow()
         print(("[DQR] Step %d: %s"):format(n, label))
         local w, o = 0, PathVisible(parts)
         while not o and w < (wait or 8) do
+            -- A dungeon START button means this was never the lobby.
+            if DungeonStartButton() then
+                print("[DQR]   The dungeon START button is up - this is not the "
+                    .. "lobby. Dropping the queue flow.")
+                return false
+            end
             S(0.4) w = w + 0.4
             o = PathVisible(parts)
         end
@@ -3271,7 +3308,7 @@ function Brain.Loop()
         -- frozen, so walking only trips the stuck detector.
         if now - lastStart > 1 then
             lastStart = now
-            startVisible = AnyVisible({{text = "start"}}) ~= nil
+            startVisible = DungeonStartButton() ~= nil
         end
         if startVisible then
             Nav.goal, Nav.face = nil, nil
@@ -4114,14 +4151,12 @@ end)
 local function StartWatcher()
     while true do
         S(1.5)
-        if not InLobby() then
-            local b = AnyVisible({{text = "start"}, {text = "startdungeon"},
-                                  {name = "startbutton"}})
-            if b then
-                print("[DQR] In-dungeon START visible - clicking.")
-                ClickButton(b)
-                S(2)
-            end
+        -- Never the lobby party screen's start: see DungeonStartButton.
+        local b = DungeonStartButton()
+        if b then
+            print("[DQR] In-dungeon START visible - clicking.")
+            ClickButton(b)
+            S(2)
         end
     end
 end
@@ -4205,7 +4240,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v11.5 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v11.6 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -4213,6 +4248,14 @@ task.spawn(function()
     ApplyClass()
     NukeGraphics()
     S(2.5)
+
+    -- Watchers first. They used to start only after the lobby decision
+    -- below had finished - which could be two minutes of waiting - so a
+    -- wrong call there left nothing pressing START at all.
+    task.spawn(DungeonWatcher)
+    task.spawn(StartWatcher)
+    task.spawn(VanityWatcher)
+    task.spawn(LootWatcher)
 
     -- PlayerGui is still filling in right after injection: sample for
     -- a few seconds before deciding there is no lobby.
@@ -4222,27 +4265,26 @@ task.spawn(function()
         if marker then break end
         S(0.5)
     end
+    -- ...and a lobby marker has to still be there a moment later. A
+    -- dungeon's GUI flashes the lobby's Play button while it loads.
+    if marker then
+        S(1.5)
+        if not LobbyMarker() then
+            print("[DQR] Lobby UI vanished again - that was a dungeon loading.")
+            marker = nil
+        end
+    end
     print("[DQR] Lobby marker: " .. tostring(marker or "none"))
 
     if not marker then
-        print("[DQR] No lobby UI after 4s - assuming already in a dungeon.")
+        print("[DQR] No lobby UI - assuming we are in a dungeon.")
         Farm.Start()
-    elseif CONFIG.AutoRunDungeon then
-        RunLobbyFlow()
-        local w = 0
-        repeat S(2) w = w + 2 until IsInDungeon() or w > 120
-        if IsInDungeon() then Farm.Start() else
-            print("[DQR] Timed out. Press F5 when inside the dungeon.")
-        end
-    else
-        print("[DQR] Waiting for a dungeon...")
+    elseif not CONFIG.AutoRunDungeon then
+        print("[DQR] In the lobby - AutoRunDungeon is off, waiting for a dungeon.")
     end
-
-    task.spawn(DungeonWatcher)
+    -- Queueing from the lobby, restarting the farm, replaying: all the
+    -- supervisor's job from here, and it never blocks the watchers.
     task.spawn(Supervisor)
-    task.spawn(StartWatcher)
-    task.spawn(VanityWatcher)
-    task.spawn(LootWatcher)
 end)
 
 -- ============================================================
