@@ -81,7 +81,7 @@ local CONFIG = {
     CameraHeight   = 12,
     CameraBack     = 17,
     SetWalkSpeed   = true,
-    WalkSpeed      = 20,
+    WalkSpeed      = 19,
 
     -- ---- TARGETING ---------------------------------------------
     PreferBoss     = true,   -- a boss outranks the adds it summons
