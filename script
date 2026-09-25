@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v11.1
+--  DQR AUTO FARM v11.2
 --  Change version number every time you update the script.
 --  Rewrite: one brain decides where to stand, spells never wait on
 --  movement. Lobby queue, Carry Mode, Discord loot + live status.
@@ -14,9 +14,9 @@ local CONFIG = {
     -- Class to "" to tune those by hand instead.
     Class          = "Mage",
 
-    TargetDungeon  = "Enchanted Forest",
+    TargetDungeon  = "Volcanic Chmabers",
     Difficulty     = "Nightmare",
-    Hardcore       = false,  -- true = also press HARDCORE MODE
+    Hardcore       = true,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
     -- CARRY MODE: after creating the lobby, wait on the party screen
@@ -102,6 +102,9 @@ local CONFIG = {
                              -- boss gets cast at from here, anything else
                              -- is skipped for UnreachableFor seconds
     UnreachableFor = 12,
+    StrandedMaxRange = 100,  -- ...but only a boss this close; further off
+                             -- it is skipped like anything else
+    LatchTime      = 15,     -- either verdict is re-tested after this long
 
     -- ---- DODGING: fight first ---------------------------------
     -- Spells never stop for a dodge. The bot steps out of a hazard
@@ -2803,6 +2806,17 @@ local lastDodge, lastPick, settleUntil = 0, 0, 0
 local prog = nil                       -- per-target progress, see below
 local said, saidAt = "", 0
 local lastNoTarget = 0
+local lastPos = nil
+
+-- Forget everything decided about the last position: after a death, a
+-- respawn or any teleport. A "can't get closer" verdict reached beside
+-- the Crystal Golem, read again at the spawn point 176 studs away, had
+-- the bot standing at spawn casting at a boss it could not possibly
+-- hit - forever, since standing still never changes the distance.
+function Brain.Reset()
+    prog, evade, dodge, lastPos = nil, nil, nil, nil
+    settleUntil, lastPick = 0, 0
+end
 
 -- State changes go to the log, at most one every 1.5s so a busy fight
 -- stays readable. Decisions that matter use print directly.
@@ -2889,6 +2903,13 @@ end
 
 function Brain.Tick(root)
     local now, pos = tick(), root.Position
+    -- Moved further in one tick than anyone can walk: respawned or
+    -- teleported. Nothing decided at the old spot applies here.
+    if lastPos and (pos - lastPos).Magnitude > 50 then
+        print("[DQR] Position jumped - respawn or teleport. Starting fresh.")
+        Brain.Reset()
+    end
+    lastPos = pos
     Nav.ExploreSeen(pos)
     Haz.Scan(pos)
 
@@ -2919,7 +2940,10 @@ function Brain.Tick(root)
         if not prog or prog.model ~= tgt.Model then
             prog = {model = tgt.Model, best = flat, since = now}
         end
-        if prog.latch and math.abs(flat - prog.latchAt) > 8 then
+        -- A verdict lasts until the distance changes by itself, and never
+        -- longer than LatchTime: then it tries to walk in again. No bad
+        -- call gets to stand for the rest of the run.
+        if prog.latch and (math.abs(flat - prog.latchAt) > 8 or now > prog.latchUntil) then
             prog.latch, prog.best, prog.since = nil, flat, now
         end
         local wantClose = flat > ring + CONFIG.HoldSlack
@@ -2937,11 +2961,17 @@ function Brain.Tick(root)
             local held = now - prog.since
             if held > CONFIG.CloseGiveUp and dist <= spellR then
                 prog.latch, prog.latchAt = "blocked", flat
+                prog.latchUntil = now + CONFIG.LatchTime
                 print(("[DQR] Cannot get closer to %s than %d studs - fighting from here.")
                     :format(name, flat))
             elseif held > CONFIG.StrandedTime then
-                if tgt.Boss then
+                -- Casting from where we are only makes sense when a
+                -- spell could plausibly land. Further off than that, a
+                -- boss is skipped like anything else: the bot goes and
+                -- does something else, and comes back to it later.
+                if tgt.Boss and flat <= CONFIG.StrandedMaxRange then
                     prog.latch, prog.latchAt = "stranded", flat
+                    prog.latchUntil = now + CONFIG.LatchTime
                     print(("[DQR] Cannot reach %s (%d studs) - casting at it from here.")
                         :format(name, flat))
                 else
@@ -3073,6 +3103,7 @@ end
 --  FARM LOOP
 -- ============================================================
 function Brain.Loop()
+    Brain.Reset()
     Nav.Start()
     local lastLobby, lastStart, startVisible = 0, 0, false
     while Farm.Running do
@@ -4032,7 +4063,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v11.1 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v11.2 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
