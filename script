@@ -14,7 +14,7 @@ local CONFIG = {
     -- Class to "" to tune those by hand instead.
     Class          = "Mage",
 
-    TargetDungeon  = "Northern Lands",
+    TargetDungeon  = "Enchanted Forest",
     Difficulty     = "Insane",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
