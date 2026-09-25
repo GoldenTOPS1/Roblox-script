@@ -15,7 +15,7 @@ local CONFIG = {
     Class          = "Mage",
 
     TargetDungeon  = "Enchanted Forest",
-    Difficulty     = "Insane",
+    Difficulty     = "Nightmare",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
@@ -24,7 +24,7 @@ local CONFIG = {
     -- how long to wait before starting anyway (0 = forever). Lobby
     -- only - the in-dungeon START button is always pressed.
     CarryMode      = true,
-    CarryFor       = {"RateFire"},
+    CarryFor       = {"24MINZ"},
     CarryWait      = 0,
 
     -- ---- DISCORD -----------------------------------------------
@@ -81,7 +81,7 @@ local CONFIG = {
     CameraHeight   = 12,
     CameraBack     = 17,
     SetWalkSpeed   = true,
-    WalkSpeed      = 19,
+    WalkSpeed      = 20,
 
     -- ---- TARGETING ---------------------------------------------
     PreferBoss     = true,   -- a boss outranks the adds it summons
