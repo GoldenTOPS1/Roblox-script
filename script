@@ -38,8 +38,8 @@ local CONFIG = {
     LootRarities   = {
         Common    = false,
         Uncommon  = false,
-        Rare      = true,
-        Epic      = true,
+        Rare      = false,
+        Epic      = false,
         Legendary = true,
         Ultimate  = true,
     },
