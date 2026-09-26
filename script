@@ -1,8 +1,11 @@
 -- ============================================================
---  DQR AUTO FARM v11.6
+--  DQR AUTO FARM v12.1
 --  Change version number every time you update the script.
---  Rewrite: one brain decides where to stand, spells never wait on
---  movement. Lobby queue, Carry Mode, Discord loot + live status.
+--  One brain decides where to stand, spells never wait on movement.
+--  v12: per-dungeon profiles, boss detection from the on-screen boss
+--  bar, hitbox box for hazards, flat "baseplate" map, spell
+--  animations hidden, Q+E cast together at the middle of the pack.
+--  Lobby queue, Carry Mode, Discord loot + live status.
 --  (F5 farm / F6 gui dump / F7 log / F8 mob diag / F9 hazard diag /
 --   F10 loot panel)
 -- ============================================================
@@ -14,9 +17,12 @@ local CONFIG = {
     -- Class to "" to tune those by hand instead.
     Class          = "Mage",
 
-    TargetDungeon  = "Enchanted Forest",
-    Difficulty     = "Insane",
-    Hardcore       = false,  -- true = also press HARDCORE MODE
+    -- The dungeon to run. This also picks the settings: whatever that
+    -- dungeon's entry in MAP_PROFILES (further down) says is used for
+    -- the run, on top of the defaults in this CONFIG block.
+    TargetDungeon  = "Volcanic Chambers",
+    Difficulty     = "Nightmare",
+    Hardcore       = true,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
     -- CARRY MODE: after creating the lobby, wait on the party screen
@@ -61,15 +67,37 @@ local CONFIG = {
     LowerGraphics  = true,
     ShowLog        = false,  -- log window starts hidden; F7 shows it
     ShowDest       = true,   -- green ball where the bot is heading
+    -- The map itself, on your screen only:
+    --   "flat" - walls, pillars, props and decor vanish and stop
+    --            blocking you; floors stay solid, repainted as a grey
+    --            baseplate. Mobs stay where they are. With nothing in
+    --            the way the bot walks straight at things.
+    --   "hide" - the same look, but everything keeps its collision.
+    --   "off"  - leave the map alone.
+    MapMode        = "flat",
+    FloorColor     = Color3.fromRGB(96, 104, 116), -- nil = keep each floor's colour
+    FloorStuds     = true,   -- baseplate stud texture on the floors
+    -- Spell and attack animations, hidden. "weight" plays them at
+    -- zero weight, so anything the game hangs off their keyframes
+    -- still fires; "stop" cuts them off (try it only if "weight"
+    -- still shows them).
+    NoSpellAnims   = true,
+    SpellAnimMode  = "weight",
 
     -- ---- ENGAGEMENT (Class overwrites these at boot) -----------
     CircleRadius   = 10,     -- preferred fighting distance
-    HoldSlack      = 2,      -- within CircleRadius + this = arrived
+    HoldSlack      = 4,      -- within CircleRadius + this = arrived
     MeleeRange     = 9,      -- swing when closer than this
     MinRange       = 4,      -- back off when closer than this
     AttackRange    = 25,     -- cast when closer than this
     AttackRate     = 0.3,    -- seconds between spell key presses
     MeleeRate      = 0.2,
+    -- "both" presses Q and E in the same instant - right when the two
+    -- slots hold the same spell. "alternate" = Q, E, Q, E...
+    SpellMode      = "both",
+    -- Face the middle of the pack instead of the one mob targeted, so
+    -- a fan or cone spell lands on all of them.
+    AimAtPack      = true,
     -- "click" = real left click at the aim point. "tool" =
     -- Tool:Activate(), no cursor at all. "both" = try both.
     MeleeMode      = "click",
@@ -93,7 +121,15 @@ local CONFIG = {
     MobScanRadius  = 600,
     MobRadiusMax   = 25,     -- no mob is wider than this
     BossHealthHint = 5000,   -- above this with no bar overhead = boss
-    BossHealthRatio= 10,     -- ...or this many times a typical mob's health
+    -- ...or this many times a typical mob's health. Was 10, which no
+    -- Dungeon Quest boss ever reaches: the Temple Core Generator has
+    -- 156T against its adds' 40T - under 4x.
+    BossHealthRatio= 2.5,
+    -- Names that are always a boss (any dungeon; profiles add their
+    -- own). Matched ignoring case and spaces. The boss bar at the top
+    -- of the screen is read too, so this is only a backstop.
+    BossNames      = {"Temple Core Generator", "Ancient Enchanted Tree",
+                      "Crystal Golem", "Lord Varosh"},
     BossRange      = 200,    -- a boss found by the sweep is only fought once
                              -- its body is this close (a final boss in a
                              -- later room must not pull the bot there)
@@ -109,6 +145,9 @@ local CONFIG = {
     StrandedMaxRange = 100,  -- ...but only a boss this close; further off
                              -- it is skipped like anything else
     LatchTime      = 15,     -- either verdict is re-tested after this long
+    ReturnTime     = 180,    -- after losing every target (a death), walk
+                             -- back to where the fight was if it was
+                             -- this recent, before exploring
 
     -- ---- DODGING: fight first ---------------------------------
     -- Spells never stop for a dodge. The bot steps out of a hazard
@@ -116,11 +155,28 @@ local CONFIG = {
     -- the target and trades hits - your HP pool can take it.
     DodgeHazards   = true,
     DodgeProjectiles = true,
-    EvadeMax       = 24,     -- furthest a hazard exit may be
-    EvadeClear     = 3,      -- an exit must sit this far outside the pad
+    EvadeMax       = 26,     -- furthest a hazard exit may be
+    EvadeFar       = 45,     -- no exit that close: look this far before
+                             -- giving up and trading hits
+    EvadeClear     = 1.5,    -- an exit's hitbox must sit this far clear
     DodgeStep      = 8,      -- sidestep from a projectile
     DodgeCooldown  = 0.8,
     HazardDebug    = false,  -- log each hazard's source and draw it red
+
+    -- HITBOX: a box around your character, drawn grey (red while a
+    -- hazard touches it). A hazard counts the moment its footprint
+    -- reaches the box - not when it reaches the middle of you - so the
+    -- bot is already moving when the edge of a telegraph arrives.
+    ShowHitbox     = true,
+    HitboxSize     = Vector3.new(4, 6, 4),
+    HitboxPad      = 1.5,    -- invisible margin around the drawn box
+    HitboxAlpha    = 0.35,   -- drawn box transparency (1 = invisible)
+    -- How to get out of a hazard: "walk", or "blink" - one short
+    -- teleport straight to the safe spot. Blink is much faster, but a
+    -- CFrame jump is exactly what an anti-cheat watches for: only use
+    -- it while you are watching.
+    DodgeMove      = "walk",
+    BlinkMax       = 18,     -- longest blink
 
     -- Detection. Dungeon Quest names its attack volumes
     -- "<attack>.precast" / "<attack>.hitBox" in every dungeon, so a
@@ -136,7 +192,8 @@ local CONFIG = {
     MapFolders     = {Map = true, Terrain = true, Camera = true,
                       Lighting = true, borders = true},
     DodgeRange     = 40,     -- how far out to look for hazards
-    TelegraphPad   = 4,      -- danger extends this far past the paint
+    TelegraphPad   = 1,      -- danger extends this far past the paint
+                             -- (the hitbox supplies the rest of the margin)
     TelegraphMinLen= 6,
     TelegraphMaxY  = 2,      -- unknown colour: must be this flat...
     TelegraphMaxWide = 30,   -- ...and this narrow
@@ -144,7 +201,7 @@ local CONFIG = {
     RedMaxWide     = 200,    -- ...and this wide
     BeamMinLen     = 12,
     BeamMaxThick   = 6,
-    BeamPad        = 4,
+    BeamPad        = 2,
     BeamMinHeight  = 1.5,
     FootOffset     = 3,
     ThreatMaxSize  = 40,     -- biggest thing still treated as a projectile
@@ -191,12 +248,178 @@ local CONFIG = {
 }
 
 -- Melee classes sit at the edge of their own reach; casters stand
--- back and lean on Q/E.
+-- back and lean on Q/E. Casters now hold further out, the way the
+-- reference bot does: the pack stays in spell range, its melee never
+-- reaches, and there is room on every side to step out of a telegraph.
 local CLASS_RANGES = {
     Warrior = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
     Tank    = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
-    Mage    = {CircleRadius = 20, MeleeRange = 10, MinRange = 12, AttackRange = 40},
-    Healer  = {CircleRadius = 26, MeleeRange = 10, MinRange = 18, AttackRange = 45},
+    Mage    = {CircleRadius = 30, MeleeRange = 10, MinRange = 18, AttackRange = 45},
+    Healer  = {CircleRadius = 30, MeleeRange = 10, MinRange = 20, AttackRange = 48},
+}
+
+-- ============================================================
+--  MAP PROFILES
+--  Each dungeon's own settings. When TargetDungeon is "Desert
+--  Temple" the bot uses the "Desert Temple" block; set it to "Winter
+--  Outpost" and it uses that one instead. Changing one block never
+--  touches another dungeon.
+--
+--  How a run's settings are built: the CONFIG block above, then the
+--  class distances (Mage = {...} etc. in the dungeon's block, else
+--  CLASS_RANGES), then everything else in the dungeon's block. Any
+--  CONFIG key can go in a block - these are just the ones most worth
+--  tuning per map. BossNames here are added to CONFIG.BossNames.
+--  A dungeon with no block runs on the CONFIG defaults.
+--  Names are matched ignoring case, spaces, punctuation and a
+--  leading "The", so "Kings Castle" finds "King's Castle".
+-- ============================================================
+local MAP_PROFILES = {
+    ["Desert Temple"] = {
+        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        DodgeMove = "walk",   -- "walk" / "blink"
+        EvadeMax  = 26,       -- furthest a hazard exit may be
+        HitboxPad = 1.5,      -- bigger = dodges earlier and wider
+        BossNames = {},
+        Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
+        Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
+        Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
+        Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
+    },
+    ["Winter Outpost"] = {
+        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        DodgeMove = "walk",   -- "walk" / "blink"
+        EvadeMax  = 26,       -- furthest a hazard exit may be
+        HitboxPad = 1.5,      -- bigger = dodges earlier and wider
+        BossNames = {},
+        Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
+        Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
+        Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
+        Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
+    },
+    ["Pirate Island"] = {
+        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        DodgeMove = "walk",   -- "walk" / "blink"
+        EvadeMax  = 26,       -- furthest a hazard exit may be
+        HitboxPad = 1.5,      -- bigger = dodges earlier and wider
+        BossNames = {},
+        Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
+        Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
+        Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
+        Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
+    },
+    ["King's Castle"] = {
+        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        DodgeMove = "walk",   -- "walk" / "blink"
+        EvadeMax  = 26,       -- furthest a hazard exit may be
+        HitboxPad = 1.5,      -- bigger = dodges earlier and wider
+        BossNames = {},
+        Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
+        Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
+        Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
+        Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
+    },
+    ["The Underworld"] = {
+        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        DodgeMove = "walk",   -- "walk" / "blink"
+        EvadeMax  = 26,       -- furthest a hazard exit may be
+        HitboxPad = 1.5,      -- bigger = dodges earlier and wider
+        BossNames = {},
+        Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
+        Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
+        Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
+        Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
+    },
+    ["Samurai Palace"] = {
+        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        DodgeMove = "walk",   -- "walk" / "blink"
+        EvadeMax  = 26,       -- furthest a hazard exit may be
+        HitboxPad = 1.5,      -- bigger = dodges earlier and wider
+        BossNames = {},
+        Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
+        Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
+        Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
+        Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
+    },
+    ["The Canals"] = {
+        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        DodgeMove = "walk",   -- "walk" / "blink"
+        EvadeMax  = 26,       -- furthest a hazard exit may be
+        HitboxPad = 1.5,      -- bigger = dodges earlier and wider
+        BossNames = {},
+        Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
+        Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
+        Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
+        Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
+    },
+    ["Ghastly Harbor"] = {
+        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        DodgeMove = "walk",   -- "walk" / "blink"
+        EvadeMax  = 26,       -- furthest a hazard exit may be
+        HitboxPad = 1.5,      -- bigger = dodges earlier and wider
+        BossNames = {},
+        Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
+        Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
+        Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
+        Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
+    },
+    ["Steampunk Sewers"] = {
+        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        DodgeMove = "walk",   -- "walk" / "blink"
+        EvadeMax  = 26,       -- furthest a hazard exit may be
+        HitboxPad = 1.5,      -- bigger = dodges earlier and wider
+        BossNames = {},
+        Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
+        Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
+        Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
+        Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
+    },
+    ["Orbital Outpost"] = {
+        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        DodgeMove = "walk",   -- "walk" / "blink"
+        EvadeMax  = 26,       -- furthest a hazard exit may be
+        HitboxPad = 1.5,      -- bigger = dodges earlier and wider
+        BossNames = {},
+        Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
+        Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
+        Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
+        Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
+    },
+    ["Volcanic Chambers"] = {
+        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        DodgeMove = "walk",   -- "walk" / "blink"
+        EvadeMax  = 26,       -- furthest a hazard exit may be
+        HitboxPad = 1.5,      -- bigger = dodges earlier and wider
+        BossNames = {},
+        Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
+        Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
+        Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
+        Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
+    },
+    ["Aquatic Temple"] = {
+        -- Tuned from the reference video: the caster holds ~30-35 studs
+        -- back and throws the ice fan into each pack of three.
+        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        DodgeMove = "walk",   -- "walk" / "blink"
+        EvadeMax  = 26,       -- furthest a hazard exit may be
+        HitboxPad = 1.5,      -- bigger = dodges earlier and wider
+        BossNames = {"Temple Core Generator"},
+        Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
+        Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
+        Mage      = {CircleRadius = 32, MinRange = 20, AttackRange = 48},
+        Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
+    },
+    ["Enchanted Forest"] = {
+        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        DodgeMove = "walk",   -- "walk" / "blink"
+        EvadeMax  = 26,       -- furthest a hazard exit may be
+        HitboxPad = 1.5,      -- bigger = dodges earlier and wider
+        BossNames = {"Ancient Enchanted Tree"},
+        Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
+        Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
+        Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
+        Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
+    },
 }
 
 local Players            = game:GetService("Players")
@@ -218,6 +441,8 @@ local Haz   = {}
 local Brain = {}
 local Hud   = {}
 local UI    = {}
+local Prof  = {}   -- map profiles
+local Look  = {}   -- hitbox box, flat map, hidden animations
 
 -- ============================================================
 --  EXECUTOR GLOBALS
@@ -1300,19 +1525,29 @@ end
 -- ============================================================
 --  MOBS
 --  One scan, cached briefly, shared by everything. Each record:
---    Model, Root, Humanoid, Boss, Radius, Aim, Dist, Flat
+--    Model, Root, Humanoid, Boss, Why, Radius, Aim, Dist, Flat
+--  (the chosen target also gets Pack/PackN: the middle of its group)
 --  Aim is where to point attacks and measure range from: the root,
 --  except that a root far above or below us is a model quirk (the
 --  Ancient Enchanted Tree's sits 116 studs underground) - then it is
 --  the root's horizontal position at our own height.
+--
+--  v12: candidates come from a registry of every model with a
+--  Humanoid, kept current by events, not from a spatial search. The
+--  search is why bosses went unseen: it was capped at MaxQueryParts,
+--  it only found a model through a part literally named
+--  HumanoidRootPart (boss rigs often have none), and it stopped at the
+--  first ring with anything in it - so a boss behind its adds was
+--  never even looked at.
 -- ============================================================
 do
 Mobs.list, Mobs.at, Mobs.current = {}, 0, nil
 local banned = {}                                   -- model -> until
-local knownBoss = setmetatable({}, {__mode = "k"})  -- bosses seen this run
-local discoverAt = 0
-local shape  = setmetatable({}, {__mode = "k"})     -- model -> {ok, bb}
+local knownBoss = setmetatable({}, {__mode = "k"})  -- model -> why (sticky)
+local models = setmetatable({}, {__mode = "k"})     -- model -> Humanoid
+local shape  = setmetatable({}, {__mode = "k"})     -- model -> {ok, bb, t}
 local radius = setmetatable({}, {__mode = "k"})     -- model -> studs
+local rootOf = setmetatable({}, {__mode = "k"})     -- model -> part
 
 function Mobs.Ban(model, secs)
     if model then banned[model] = tick() + (secs or CONFIG.UnreachableFor) end
@@ -1330,32 +1565,190 @@ local function IsPlayerChar(obj)
     return false
 end
 
-local function Record(obj, prt, me)
-    local hum = obj:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 or hum.MaxHealth <= 0 then return nil end
-    local mr = obj:FindFirstChild("HumanoidRootPart") or obj.PrimaryPart or prt
-    -- Anchored skips decorative NPCs, but big boss rigs are often
-    -- anchored too - waive it for boss-sized health.
-    local bossy = hum.MaxHealth >= CONFIG.BossHealthHint
-    if mr.Anchored and not bossy then return nil end
-    if IsPlayerChar(obj) then return nil end
+-- The registry.
+local function Watch(o)
+    if o:IsA("Humanoid") then
+        local m = o.Parent
+        if m and m:IsA("Model") then models[m] = o end
+    end
+end
+workspace.DescendantAdded:Connect(Watch)
+task.spawn(function()
+    for _, o in ipairs(workspace:GetDescendants()) do Watch(o) end
+end)
 
+-- The part a model is measured from. Big boss rigs rarely have a
+-- HumanoidRootPart and keep their parts in sub-models, so fall back
+-- through PrimaryPart and a torso to any part at all.
+local function RootOf(obj)
+    local r = rootOf[obj]
+    if r and r.Parent and r:IsDescendantOf(obj) then return r end
+    r = obj:FindFirstChild("HumanoidRootPart") or obj.PrimaryPart
+        or obj:FindFirstChild("Torso") or obj:FindFirstChild("UpperTorso")
+        or obj:FindFirstChildWhichIsA("BasePart", true)
+    rootOf[obj] = r
+    return r
+end
+
+-- "156T" -> 1.56e14, the way the HUD writes big numbers.
+local SUFFIX = {k = 1e3, m = 1e6, b = 1e9, t = 1e12, qd = 1e15, qa = 1e15,
+                qn = 1e18, qi = 1e18, sx = 1e21, sp = 1e24}
+local function ParseShort(s)
+    local num, suf = tostring(s or ""):gsub(",", ""):match("^%s*([%d%.]+)%s*(%a*)%s*$")
+    local n = tonumber(num)
+    if not n then return nil end
+    if suf == "" then return n end
+    local mul = SUFFIX[suf:lower()]
+    return mul and n * mul or nil
+end
+
+-- A model's two names, normalised: the model's own and its Humanoid's
+-- display name. Cached - they are asked for every scan.
+local nameOf = setmetatable({}, {__mode = "k"})
+local function NamesOf(obj, hum)
+    local c = nameOf[obj]
+    if c and c.raw == obj.Name then return c.a, c.b end
+    local a = Norm(obj.Name)
+    local b = (hum.DisplayName ~= "" and Norm(hum.DisplayName)) or a
+    nameOf[obj] = {raw = obj.Name, a = a, b = b}
+    return a, b
+end
+
+-- Same name, or one inside the other when the shorter is most of the
+-- longer: "coregenerator" is the Temple Core Generator, "temple" (a
+-- Temple Guard's folder) is not.
+local function Like(x, y)
+    if x == y then return true end
+    local s, l = x, y
+    if #s > #l then s, l = l, s end
+    return #s >= 6 and #s >= #l * 0.6 and l:find(s, 1, true) ~= nil
+end
+local function NameHit(want, a, b)
+    if not want or #want < 4 then return false end
+    return Like(want, a) or Like(want, b)
+end
+
+-- On the always-a-boss list (CONFIG.BossNames plus the profile's), or
+-- called a boss outright.
+local bossKeys, bossKeysOf = {}, nil
+local function Listed(a, b)
+    if bossKeysOf ~= CONFIG.BossNames then
+        bossKeysOf, bossKeys = CONFIG.BossNames, {}
+        for _, n in ipairs(CONFIG.BossNames or {}) do bossKeys[#bossKeys + 1] = Norm(n) end
+    end
+    for _, k in ipairs(bossKeys) do
+        if NameHit(k, a, b) then return true end
+    end
+    return a:find("boss", 1, true) ~= nil
+end
+
+-- THE BOSS BAR. When a boss fight starts the game puts its name and a
+-- big health bar at the top of the screen ("Temple Core Generator -
+-- HP 156T/156T"). Mob bars are BillboardGuis over their heads, so a
+-- boss-sized health reading in a ScreenGui that is not our own HUD is
+-- the boss's. Returns {name (normalised), text, max, cur} or nil.
+-- Walks only what is visible, at most twice a second.
+local barAt, bar = 0, nil
+local HP_READING = "^%s*[%d%.,]+%s*%a*%s*/%s*[%d%.,]+%s*%a*%s*$"
+local OWN_HUD = {playerStatus = true, DQR_LOG = true}
+
+-- The name beside a health reading: up to three frames up, the
+-- wordiest visible text that is not "HP", a number or a player.
+local function NameNear(o, people)
+    local box, name, best = o.Parent, nil, 0
+    for _ = 1, 3 do
+        if not box or box:IsA("ScreenGui") then break end
+        for _, l in ipairs(box:GetDescendants()) do
+            if l ~= o and (l:IsA("TextLabel") or l:IsA("TextButton")) and l.Visible then
+                local t = l.Text:gsub("^%s+", ""):gsub("%s+$", "")
+                local n = Norm(t)
+                local letters = #n:gsub("[^%a]", "")
+                if letters >= 4 and letters > best and not t:match(HP_READING)
+                and n ~= "hp" and n ~= "health" and not people[n] then
+                    name, best = t, letters
+                end
+            end
+        end
+        if name then return name end
+        box = box.Parent
+    end
+    return nil
+end
+
+function Mobs.BossBar()
+    local now = tick()
+    if now - barAt < 0.5 then return bar end
+    barAt, bar = now, nil
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    if not pg then return nil end
+    local people = {}
+    for _, pl in ipairs(Players:GetPlayers()) do
+        people[Norm(pl.Name)], people[Norm(pl.DisplayName)] = true, true
+    end
+    local function Walk(node)
+        for _, c in ipairs(node:GetChildren()) do
+            -- A BillboardGui kept in PlayerGui is a mob's overhead bar,
+            -- not the boss bar: never look inside one.
+            local isGui = c:IsA("GuiObject")
+            if not c:IsA("LayerCollector") and (not isGui or c.Visible) then
+                if c:IsA("TextLabel") and c.AbsoluteSize.X >= 1
+                and c.Text:find("/", 1, true) and c.Text:match(HP_READING) then
+                    local cur, mx = c.Text:match("^%s*([^/]-)%s*/%s*(.-)%s*$")
+                    local maxHp = ParseShort(mx)
+                    -- Boss-sized, so a "3/10" quest counter or a "1/4"
+                    -- party count can never pass for it.
+                    if maxHp and maxHp >= CONFIG.BossHealthHint then
+                        local name = NameNear(c, people)
+                        if name then
+                            bar = {name = Norm(name), text = name, max = maxHp,
+                                   cur = ParseShort(cur)}
+                            return true
+                        end
+                    end
+                end
+                if Walk(c) then return true end
+            end
+        end
+        return false
+    end
+    for _, sg in ipairs(pg:GetChildren()) do
+        if sg:IsA("ScreenGui") and sg.Enabled and not OWN_HUD[sg.Name] and sg ~= LogGui then
+            if Walk(sg) then return bar end
+        end
+    end
+    return nil
+end
+
+local function Record(obj, hum, me, barHit)
+    if hum.Health <= 0 or hum.MaxHealth <= 0 then return nil end
+    local mr = RootOf(obj)
+    if not mr then return nil end
+    -- Anchored skips decorative NPCs, but big boss rigs are often
+    -- anchored too - waive it for boss-sized health or a boss's name.
+    local bossy = hum.MaxHealth >= CONFIG.BossHealthHint
+    local a, b = NamesOf(obj, hum)
+    local named = barHit == obj or Listed(a, b)
+    if mr.Anchored and not (bossy or named) then return nil end
+
+    local now = tick()
     local sh = shape[obj]
-    if sh == nil then
-        local hasBB = false
+    -- A "no" is looked at again after a couple of seconds: health bars
+    -- are often added a moment after the mob spawns.
+    if sh == nil or (not sh.ok and now - sh.t > 2) then
+        local hasBB, pc = false, 0
         for _, c in ipairs(obj:GetDescendants()) do
-            if c:IsA("BillboardGui") or c:IsA("Highlight") then hasBB = true break end
+            if c:IsA("BillboardGui") or c:IsA("Highlight") then hasBB = true
+            elseif c:IsA("BasePart") then pc = pc + 1 end
+            if hasBB and pc >= 2 then break end
         end
-        local pc = 0
-        for _, c in ipairs(obj:GetChildren()) do
-            if c:IsA("BasePart") then pc = pc + 1 end
-        end
-        -- Mobs carry a health bar overhead; a boss's bar is at the top
-        -- of the screen instead, so it is known by its health pool.
-        sh = {ok = (hasBB and pc >= 2) or (bossy and pc >= 1), bb = hasBB}
+        -- Mobs carry a health bar overhead; a boss's is at the top of
+        -- the screen. Parts are counted at any depth: counting only the
+        -- model's direct children threw out every boss that keeps its
+        -- parts in sub-models - it never even reached the list.
+        sh = {ok = (hasBB and pc >= 2) or (bossy and pc >= 1), bb = hasBB, t = now}
         shape[obj] = sh
     end
-    if not sh.ok then return nil end
+    if not (sh.ok or named) then return nil end
 
     local rad = radius[obj]
     if rad == nil then
@@ -1371,147 +1764,93 @@ local function Record(obj, prt, me)
     if math.abs(aim.Y - me.Y) > CONFIG.AimMaxDrop then
         aim = Vector3.new(aim.X, me.Y, aim.Z)
     end
-    return {Model = obj, Root = mr, Humanoid = hum, Boss = bossy and not sh.bb,
-            Radius = rad, Aim = aim, Dist = (aim - me).Magnitude,
-            Flat = FlatDist(aim, me)}
+    -- Why it is a boss, if it is one. The old rule ("boss-sized health
+    -- and NO bar overhead") stays as one signal, but on its own it
+    -- missed every boss that also has a small bar over its head - the
+    -- Temple Core Generator and the Ancient Enchanted Tree both do.
+    local why = knownBoss[obj]
+    if not why then
+        if barHit == obj then why = "boss bar"
+        elseif named then why = "name"
+        elseif bossy and not sh.bb then why = "no overhead bar"
+        end
+    end
+    return {Model = obj, Root = mr, Humanoid = hum, Boss = why ~= nil, Why = why,
+            Radius = rad, Aim = aim, Dist = (aim - me).Magnitude, Flat = FlatDist(aim, me)}
 end
 
--- Rebuilds Mobs.list. Searches outward in rings and stops at the first
--- that finds a mob: one big query gets truncated arbitrarily past
--- MaxQueryParts, and the mob next to us could be the one dropped.
 function Mobs.Scan(force)
     local now = tick()
     if not force and now - Mobs.at < 0.15 then return Mobs.list end
     Mobs.at = now
     local root = GetRoot()
     if not root then Mobs.list = {} return Mobs.list end
-    local me, list, seen = root.Position, {}, {}
+    local me, list = root.Position, {}
 
-    local function Consider(prt, deep)
-        local obj = nil
-        if prt.Name == "HumanoidRootPart" then
-            obj = prt.Parent
-        elseif deep then
-            local n = prt
-            for _ = 1, 3 do
-                if not n or n == workspace then break end
-                if n:IsA("Model") and n:FindFirstChildOfClass("Humanoid") then
-                    obj = n break
+    -- Who the boss bar means: by name first, and failing that by
+    -- health - the bar's maximum against each Humanoid's.
+    local bb = Mobs.BossBar()
+    local barHit = nil
+    if bb then
+        local byHp, hpErr = nil, 0.03
+        for obj, hum in pairs(models) do
+            if obj.Parent and hum.Parent == obj and hum.Health > 0 and not IsPlayerChar(obj) then
+                local a, b = NamesOf(obj, hum)
+                if NameHit(bb.name, a, b) then barHit = obj break end
+                if bb.max and bb.max > 0 then
+                    local e = math.abs(hum.MaxHealth - bb.max) / bb.max
+                    if e < hpErr then byHp, hpErr = obj, e end
                 end
-                n = n.Parent
             end
         end
-        if obj and obj:IsA("Model") and not seen[obj] then
-            seen[obj] = true
-            local rec = Record(obj, prt, me)
-            if rec then list[#list + 1] = rec end
+        barHit = barHit or byHp
+        if barHit and knownBoss[barHit] ~= "boss bar" then
+            knownBoss[barHit] = "boss bar"
+            print(("[DQR] Boss bar: '%s' -> %s."):format(bb.text, barHit:GetFullName()))
+        elseif not barHit and Mobs.barMissed ~= bb.name then
+            Mobs.barMissed = bb.name
+            print(("[DQR] Boss bar says '%s' but no mob matches it by name or "
+                .. "health - F8 lists what is there."):format(bb.text))
         end
     end
 
-    for _, r in ipairs({60, 140, CONFIG.MobScanRadius}) do
-        local parts = NearbyParts(me, r)
-        for _, prt in ipairs(parts) do Consider(prt, false) end
-        if #list == 0 then
-            seen = {}
-            for _, prt in ipairs(parts) do Consider(prt, true) end
-        end
-        if #list > 0 then break end
-    end
-    -- Nothing at any radius: walk the models directly. Slow, but only
-    -- when the map looks empty, and missing a live boss is far worse.
-    if #list == 0 then
-        seen = {}
-        for _, obj in ipairs(workspace:GetDescendants()) do
-            if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") then
-                local a = obj:FindFirstChild("HumanoidRootPart") or obj.PrimaryPart
-                       or obj:FindFirstChildWhichIsA("BasePart")
-                if a then Consider(a, true) end
-            end
+    for obj, hum in pairs(models) do
+        if not obj.Parent or hum.Parent ~= obj then
+            models[obj] = nil
+        elseif not IsPlayerChar(obj) then
+            local rec = Record(obj, hum, me, barHit)
+            if rec and rec.Dist <= CONFIG.MobScanRadius then list[#list + 1] = rec end
         end
     end
 
-    -- Bosses the overhead-bar test misses. The Ancient Enchanted Tree
-    -- has a small bar over its head AND the big one at the top of the
-    -- screen, so "big health, no overhead bar" called it an ordinary
-    -- mob - no PreferBoss, no casting from range, and adds picked over
-    -- it. Two more signals, either one enough:
-    --   * its name is on screen - the top-of-screen boss bar is a
-    --     ScreenGui label, while mob bars live in BillboardGuis
-    --   * it has 20x the health of a typical mob in the fight
-    -- Bosses the overhead-bar test misses (the Tree has a bar over its
-    -- head as well as the one at the top of the screen): anything with
-    -- BossHealthRatio times the health of a typical mob around it.
+    -- Anything with BossHealthRatio times the health of a typical mob
+    -- around it.
     if #list >= 3 then
         local hp = {}
         for _, rec in ipairs(list) do hp[#hp + 1] = rec.Humanoid.MaxHealth end
         table.sort(hp)
         local median = hp[math.ceil(#hp / 2)]
         for _, rec in ipairs(list) do
-            if rec.Humanoid.MaxHealth >= median * CONFIG.BossHealthRatio then
-                rec.Boss = true
+            if not rec.Boss and rec.Humanoid.MaxHealth >= median * CONFIG.BossHealthRatio then
+                rec.Boss, rec.Why = true, "health"
             end
         end
-    end
-    for _, rec in ipairs(list) do
-        if rec.Boss then knownBoss[rec.Model] = rec.Humanoid end
     end
 
-    -- The ring search above stops at the first ring with anything in
-    -- it, and finds mobs by their root. The Ancient Enchanted Tree's
-    -- root is ~116 studs under the floor, so with a single spirit within
-    -- 140 studs the search ended before ever reaching the Tree - which
-    -- is why the bot fought spirits all fight and never once targeted
-    -- the boss. Bosses are found separately, by a full sweep every few
-    -- seconds, and once known are added to every scan wherever their
-    -- root happens to be.
-    if now - discoverAt > 5 then
-        discoverAt = now
-        local hums = {}
-        for _, h in ipairs(workspace:GetDescendants()) do
-            if h:IsA("Humanoid") and h.Health > 0
-            and h.MaxHealth >= CONFIG.BossHealthHint
-            and h.Parent and h.Parent:IsA("Model") and not IsPlayerChar(h.Parent) then
-                hums[#hums + 1] = h
+    -- A boss only jumps the queue once the fight with it is on: its bar
+    -- is up, or its BODY is within BossRange. Until then a final boss
+    -- parked in a later room is just a far-away mob, or it would drag
+    -- the bot across the map at the start of the run.
+    for _, rec in ipairs(list) do
+        if rec.Boss then
+            if not knownBoss[rec.Model] then
+                print(("[DQR] Boss found: %s (%s health, by %s).")
+                    :format(rec.Model.Name, Hud.Short(rec.Humanoid.MaxHealth), tostring(rec.Why)))
             end
-        end
-        local hp = {}
-        for _, h in ipairs(hums) do hp[#hp + 1] = h.MaxHealth end
-        table.sort(hp)
-        local median = hp[math.ceil(#hp / 2)] or 0
-        for _, h in ipairs(hums) do
-            local m = h.Parent
-            if not knownBoss[m] and #hp >= 3
-            and h.MaxHealth >= median * CONFIG.BossHealthRatio then
-                knownBoss[m] = h
-                print(("[DQR] Boss found: %s (%s health)."):format(m.Name, Hud.Short(h.MaxHealth)))
-            end
-        end
-    end
-    -- Known bosses join the list when their BODY is within BossRange -
-    -- not before, or a final boss parked in a later room would drag the
-    -- bot across the map at the start of the run. Built without the
-    -- ordinary checks, which assume parts sitting directly in the model;
-    -- a big boss's parts are usually nested, and that alone kept the
-    -- Tree out of the list after it had been found.
-    local inList = {}
-    for _, rec in ipairs(list) do inList[rec.Model] = true end
-    for m, h in pairs(knownBoss) do
-        if not inList[m] and m.Parent and h.Parent == m and h.Health > 0 then
-            local mr = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
-                    or m:FindFirstChildWhichIsA("BasePart", true)
-            if mr then
-                local rad = radius[m]
-                if rad == nil then
-                    local ok, sz = pcall(function() return m:GetExtentsSize() end)
-                    rad = (ok and sz) and math.max(0, math.max(sz.X, sz.Z) / 2 - 2) or 0
-                    rad = math.min(rad, CONFIG.MobRadiusMax)
-                    radius[m] = rad
-                end
-                local aim = Vector3.new(mr.Position.X, me.Y, mr.Position.Z)
-                local rec = {Model = m, Root = mr, Humanoid = h, Boss = true, Radius = rad,
-                             Aim = aim, Dist = (aim - me).Magnitude, Flat = FlatDist(aim, me)}
+            knownBoss[rec.Model] = rec.Why
+            if rec.Model ~= barHit then
                 local _, d = Mobs.Body(rec, me)
-                if d <= CONFIG.BossRange then list[#list + 1] = rec end
+                if d > CONFIG.BossRange then rec.Boss, rec.Far = false, true end
             end
         end
     end
@@ -1589,6 +1928,13 @@ function Mobs.Target()
         end
     end
     if #open == 0 then Mobs.current = nil return nil end
+    -- The registry sees the whole dungeon. Weigh up what is reasonably
+    -- close; anything further is only for when nothing is.
+    local near = {}
+    for _, rec in ipairs(open) do
+        if rec.Flat <= 250 or rec.Boss or rec.Model == Mobs.current then near[#near + 1] = rec end
+    end
+    if #near > 0 then open = near end
 
     -- Best by rule: boss first, then the middle of a pack, then nearest.
     local best = nil
@@ -1629,6 +1975,16 @@ function Mobs.Target()
             best = keep
         end
     end
+    -- The middle of the target's group, to throw at (AimAtPack): a fan
+    -- aimed at one end of a pack of three misses the far one.
+    local sx, sz, n = 0, 0, 0
+    for _, rec in ipairs(open) do
+        if FlatDist(rec.Root.Position, best.Root.Position) < CONFIG.GroupRadius then
+            sx, sz, n = sx + rec.Aim.X, sz + rec.Aim.Z, n + 1
+        end
+    end
+    best.PackN = n
+    best.Pack = n > 0 and Vector3.new(sx / n, best.Aim.Y, sz / n) or best.Aim
     Mobs.current = best.Model
     return best
 end
@@ -1636,49 +1992,50 @@ end
 function Mobs.Diag()
     local root = GetRoot()
     if not root then print("[DQR] No character.") return end
+    Mobs.Scan(true)
     print("[DQR] === MOB DIAG ===")
+    local bb = Mobs.BossBar()
+    if bb then
+        print(("[DQR] Boss bar on screen: '%s' (max health %s)")
+            :format(bb.text, bb.max and Hud.Short(bb.max) or "unreadable"))
+    else
+        print("[DQR] No boss bar on screen.")
+    end
     local n = 0
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("Model") then
-            local hum = obj:FindFirstChildOfClass("Humanoid")
-            local mr  = obj:FindFirstChild("HumanoidRootPart") or obj.PrimaryPart
-                     or obj:FindFirstChildWhichIsA("BasePart")
-            local d = mr and (mr.Position - root.Position).Magnitude or -1
-            if hum and d >= 0 and d < 400 then
-                n = n + 1
-                local sh = shape[obj]
-                -- The verdict the targeting actually used, from the last scan.
-                local boss = nil
-                for _, rec in ipairs(Mobs.list) do
-                    if rec.Model == obj then boss = rec.Boss break end
-                end
-                print(("%s | d=%d hp=%d/%d root=%s rootdY=%d anchored=%s ok=%s boss=%s banned=%s")
-                    :format(obj:GetFullName(), d, hum.Health, hum.MaxHealth,
-                            mr.Name, mr.Position.Y - root.Position.Y,
-                            tostring(mr.Anchored), tostring(sh and sh.ok),
-                            boss == nil and "not in scan" or tostring(boss),
-                            tostring(Mobs.Banned(obj))))
+    for obj, hum in pairs(models) do
+        local mr = obj.Parent and RootOf(obj)
+        local d = mr and (mr.Position - root.Position).Magnitude or -1
+        if mr and d >= 0 and d < 400 and not IsPlayerChar(obj) then
+            n = n + 1
+            local sh = shape[obj]
+            -- The verdict the targeting actually used, from this scan.
+            local rec = nil
+            for _, r in ipairs(Mobs.list) do
+                if r.Model == obj then rec = r break end
             end
+            local verdict = "not in scan"
+            if rec then
+                verdict = rec.Boss and ("BOSS (" .. tostring(rec.Why) .. ")")
+                          or (rec.Far and "boss, body too far for now" or "mob")
+            end
+            print(("%s | d=%d hp=%s/%s root=%s rootdY=%d anchored=%s ok=%s %s banned=%s")
+                :format(obj:GetFullName(), d, Hud.Short(hum.Health), Hud.Short(hum.MaxHealth),
+                        mr.Name, mr.Position.Y - root.Position.Y, tostring(mr.Anchored),
+                        tostring(sh and sh.ok), verdict, tostring(Mobs.Banned(obj))))
         end
     end
-    -- Every boss the sweep has found, wherever its root is.
-    for m, h in pairs(knownBoss) do
-        local listed = false
-        for _, rec in ipairs(Mobs.list) do
-            if rec.Model == m then listed = true break end
-        end
-        local mr = m.Parent and (m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
-                                 or m:FindFirstChildWhichIsA("BasePart", true))
-        local body = "no parts"
+    -- Every boss seen this run, wherever it is.
+    for m, why in pairs(knownBoss) do
+        local mr = m.Parent and RootOf(m)
+        local body = "gone"
         if mr then
             local _, d = Mobs.Body({Model = m, Root = mr}, root.Position)
-            body = ("%d studs (root %d away)"):format(d, (mr.Position - root.Position).Magnitude)
+            body = ("body %d studs (root %d away)"):format(d, (mr.Position - root.Position).Magnitude)
         end
-        print(("[Boss] %s | hp=%s/%s | body %s | in list=%s banned=%s")
-            :format(m.Name, Hud.Short(h.Health), Hud.Short(h.MaxHealth), body,
-                    tostring(listed), tostring(Mobs.Banned(m))))
+        print(("[Boss] %s | found by %s | %s | banned=%s")
+            :format(m.Name, tostring(why), body, tostring(Mobs.Banned(m))))
     end
-    print(("[DQR] === END (%d humanoid models) ==="):format(n))
+    print(("[DQR] === END (%d humanoid models within 400) ==="):format(n))
 end
 end
 
@@ -2102,6 +2459,8 @@ function Haz.Track(o)
 end
 
 Haz.IsOurs = IsOurs
+Haz.WarnColor = WarnColor
+Haz.NameHas = NameHas
 
 -- Rebuild the shape list around `pos`. Cheap to call every tick.
 function Haz.Scan(pos)
@@ -2185,8 +2544,29 @@ function Haz.Clear(p, ignoreHuge)
     return best
 end
 
--- Inside something we could actually step out of?
-function Haz.At(p) return Haz.Clear(p, true) < 0 end
+-- How far the HITBOX at `p` is from the nearest hazard edge; negative
+-- = a hazard touches it. The box is CONFIG.HitboxSize plus HitboxPad,
+-- world-aligned like the one drawn; sampled at its corners, edge
+-- middles and centre, which are closer together than the thinnest
+-- footprint (a laser is BeamPad * 2 wide at least), so nothing slips
+-- between them.
+local SIGNS = {-1, 0, 1}
+function Haz.BoxClear(p, ignoreHuge)
+    if #Haz.shapes == 0 then return math.huge end
+    local s, pad = CONFIG.HitboxSize, CONFIG.HitboxPad
+    local hx, hz = s.X / 2 + pad, s.Z / 2 + pad
+    local best = math.huge
+    for _, sx in ipairs(SIGNS) do
+        for _, sz in ipairs(SIGNS) do
+            local c = Haz.Clear(Vector3.new(p.X + sx * hx, p.Y, p.Z + sz * hz), ignoreHuge)
+            if c < best then best = c end
+        end
+    end
+    return best
+end
+
+-- Does a hazard we could actually step out of touch the hitbox?
+function Haz.At(p) return Haz.BoxClear(p, true) < 0 end
 
 -- Does walking a -> b enter a hazard (or end in one)? Samples every
 -- 3 studs. Leaving the one we start in does not count.
@@ -2267,9 +2647,11 @@ function Haz.Diag()
     Haz.t = 0
     Haz.Scan(pos)
     print("[DQR] === HAZARD DIAG ===")
-    print(("[DQR] Brain: %s. %d footprint(s); ground %d%% covered; standing in one: %s.")
+    local bc = Haz.BoxClear(pos, true)
+    print(("[DQR] Brain: %s. %d footprint(s); ground %d%% covered; hitbox touched: %s (%s).")
         :format(tostring(Brain.state), #Haz.shapes,
-                math.floor(Haz.Coverage(pos) * 100), tostring(Haz.At(pos))))
+                math.floor(Haz.Coverage(pos) * 100), tostring(Haz.At(pos)),
+                bc == math.huge and "nothing near" or ("%.1f studs clear"):format(bc)))
     if tick() < Haz.muteUntil then
         print(("[DQR] Hazards MUTED for another %ds."):format(Haz.muteUntil - tick()))
     end
@@ -2336,6 +2718,393 @@ function Haz.Threat()
             true, best.Position, bestT, bestV, bestR
     end
     return tcache.hit, tcache.pos, tcache.tti, tcache.vel, tcache.rad
+end
+end
+
+-- ============================================================
+--  LOOK  (your screen only)
+--  The hitbox box, the flat "baseplate" map, and hidden spell
+--  animations - the three things the reference bot's screen shows.
+--  None of it is sent anywhere: with a wall non-solid on our side, the
+--  character simply walks where the wall was.
+-- ============================================================
+do
+-- ---- hitbox box ---------------------------------------------
+-- Drawn exactly where Haz.BoxClear measures: world-aligned, feet on
+-- the floor. Grey, red while a hazard touches it.
+local box = nil
+local GREY, RED = Color3.fromRGB(120, 128, 138), Color3.fromRGB(235, 70, 70)
+function Look.Hitbox(show)
+    if not (show and CONFIG.ShowHitbox) then
+        if box and box.Parent then box:Destroy() end
+        box = nil
+        return
+    end
+    local root, hum = GetRoot(), GetHuman()
+    if not root or not hum or hum.Health <= 0 then return end
+    if not box or not box.Parent then
+        box = Instance.new("Part")
+        box.Name = "DQR_Hitbox"
+        box.Anchored, box.CanCollide, box.CanQuery, box.CanTouch = true, false, false, false
+        box.CastShadow, box.Material = false, Enum.Material.SmoothPlastic
+        box.Parent = workspace
+    end
+    local s = CONFIG.HitboxSize
+    if box.Size ~= s then box.Size = s end
+    if box.Transparency ~= CONFIG.HitboxAlpha then box.Transparency = CONFIG.HitboxAlpha end
+    local hip = hum.RigType == Enum.HumanoidRigType.R6 and 3
+                or (hum.HipHeight + root.Size.Y / 2)
+    local p = root.Position
+    box.CFrame = CFrame.new(p.X, p.Y - hip + s.Y / 2, p.Z)
+    box.Color = Haz.At(p) and RED or GREY
+end
+RunService.Heartbeat:Connect(function() pcall(Look.Hitbox, Farm.Running) end)
+
+-- ---- spell animations ---------------------------------------
+-- A track is left alone if it is one of the Animate script's moves
+-- (idle, walk, run, jump...), is named like one, or plays below
+-- Action priority - walking and idling never play at Action, spells
+-- and attacks always do. Everything else is hidden: at zero weight by
+-- default, so the track still runs to the end and any keyframe the
+-- game fires the spell from still arrives.
+local CORE_WORDS = {"idle", "walk", "run", "jump", "fall", "climb", "swim",
+                    "sit", "toolnone", "land"}
+local animator, animConn, core = nil, nil, {}
+
+local function CoreSet(char)
+    local set = {}
+    local animate = char and char:FindFirstChild("Animate")
+    if animate then
+        for _, v in ipairs(animate:GetDescendants()) do
+            if v:IsA("Animation") and v.AnimationId ~= "" then set[v.AnimationId] = true end
+        end
+    end
+    return set
+end
+
+local function IsCore(track)
+    local anim = track.Animation
+    if anim and core[anim.AnimationId] then return true end
+    local name = ((anim and anim.Name or "") .. " " .. track.Name):lower()
+    for _, w in ipairs(CORE_WORDS) do
+        if name:find(w, 1, true) then return true end
+    end
+    local pr = track.Priority
+    return pr == Enum.AnimationPriority.Core
+        or pr.Value < Enum.AnimationPriority.Action.Value
+end
+
+local function Hide(track)
+    if CONFIG.SpellAnimMode == "stop" then
+        pcall(function() track:Stop(0) end)
+    elseif track.WeightTarget > 0.01 then
+        pcall(function() track:AdjustWeight(0.001, 0) end)
+    end
+end
+
+function Look.Anims()
+    if not CONFIG.NoSpellAnims then return end
+    local hum = GetHuman()
+    local a = hum and hum:FindFirstChildOfClass("Animator")
+    if not a then return end
+    if a ~= animator then
+        animator = a
+        if animConn then animConn:Disconnect() end
+        animConn = a.AnimationPlayed:Connect(function(track)
+            if CONFIG.NoSpellAnims and not IsCore(track) then Hide(track) end
+        end)
+        core = CoreSet(GetChar())
+    elseif next(core) == nil then
+        core = CoreSet(GetChar())      -- Animate loads a moment after the rig
+    end
+    -- Tracks started before we were watching, or re-weighted since.
+    for _, track in ipairs(a:GetPlayingAnimationTracks()) do
+        if not IsCore(track) then Hide(track) end
+    end
+end
+task.spawn(function()
+    while true do S(0.25) pcall(Look.Anims) end
+end)
+
+-- ---- flat map -------------------------------------------------
+-- Floors stay solid and are repainted as a grey baseplate; everything
+-- else under the map folders - walls, pillars, props, decor - turns
+-- invisible and, in "flat", non-solid and invisible to raycasts. Walls
+-- that are ALREADY invisible are the map's edges and are kept, or the
+-- bot could walk off the world. Doors count as walls: if a dungeon
+-- needs its doors, set MapMode = "hide" in that dungeon's profile.
+local STUDS = "rbxassetid://6372755229"      -- the Baseplate's own stud texture
+local SKIP = {camera = true, lighting = true, terrain = true}
+local done = setmetatable({}, {__mode = "k"})   -- part -> "floor" / "gone" / "edge"
+local orig = setmetatable({}, {__mode = "k"})   -- part -> saved properties
+Look.mapMode = nil
+
+local function FolderSet()
+    local want = {}
+    for k in pairs(CONFIG.MapFolders) do
+        local l = k:lower()
+        if not SKIP[l] then want[l] = true end
+    end
+    return want
+end
+
+-- Under a map folder, and not part of a creature.
+local function IsScenery(o, want)
+    local n, depth = o.Parent, 0
+    while n and n ~= workspace and depth < 14 do
+        if n:IsA("Model") and n:FindFirstChildOfClass("Humanoid") then return false end
+        if want[n.Name:lower()] then return true end
+        n, depth = n.Parent, depth + 1
+    end
+    return false
+end
+
+-- Height, and the short and long horizontal extents, of a part as it
+-- sits in the world (a floor ring is often a cylinder on its side).
+local function Extents(o)
+    local cf, s = o.CFrame, PartSize(o)
+    local rx, uy, lz = math.abs(cf.RightVector.Y), math.abs(cf.UpVector.Y), math.abs(cf.LookVector.Y)
+    local height = rx * s.X + uy * s.Y + lz * s.Z
+    local a, b
+    if rx >= uy and rx >= lz then a, b = s.Y, s.Z
+    elseif uy >= lz then a, b = s.X, s.Z
+    else a, b = s.X, s.Y end
+    return height, math.min(a, b), math.max(a, b)
+end
+
+-- Something you stand on: a slab, a step, a ramp, a big block.
+local function FloorLike(o)
+    if o:IsA("WedgePart") or o:IsA("CornerWedgePart") or o:IsA("TrussPart") then return true end
+    if o:IsA("Part") and (o.Shape == Enum.PartType.Wedge
+                          or o.Shape == Enum.PartType.CornerWedge) then
+        return true
+    end
+    local height, lo, hi = Extents(o)
+    if height <= 3 and hi >= 4 then return true end
+    return lo >= 8 and height <= lo * 1.5
+end
+
+-- Which face of a block points up, for the stud texture.
+local function UpFace(cf)
+    local best, face = 0.7, nil
+    for _, f in ipairs({{cf.UpVector.Y, Enum.NormalId.Top}, {-cf.UpVector.Y, Enum.NormalId.Bottom},
+                        {cf.RightVector.Y, Enum.NormalId.Right}, {-cf.RightVector.Y, Enum.NormalId.Left},
+                        {cf.LookVector.Y, Enum.NormalId.Front}, {-cf.LookVector.Y, Enum.NormalId.Back}}) do
+        if f[1] > best then best, face = f[1], f[2] end
+    end
+    return face
+end
+
+local function Strip(o, mode)
+    if done[o] or o.Name:sub(1, 4) == "DQR_" then return end
+    if o.CanCollide and o.Transparency >= 0.99 then done[o] = "edge" return end
+    orig[o] = {cc = o.CanCollide, cq = o.CanQuery, ltm = o.LocalTransparencyModifier,
+               mat = o.Material, col = o.Color}
+    if o.CanCollide and FloorLike(o) then
+        done[o] = "floor"
+        if CONFIG.FloorColor then o.Color = CONFIG.FloorColor end
+        o.Material = Enum.Material.SmoothPlastic
+        for _, d in ipairs(o:GetChildren()) do
+            if d:IsA("Decal") or d:IsA("Texture") then pcall(function() d.Transparency = 1 end) end
+        end
+        if CONFIG.FloorStuds and o.ClassName == "Part" and o.Shape == Enum.PartType.Block then
+            local face = UpFace(o.CFrame)
+            if face then
+                local tx = Instance.new("Texture")
+                tx.Name, tx.Texture, tx.Face = "DQR_Studs", STUDS, face
+                tx.StudsPerTileU, tx.StudsPerTileV = 8, 8
+                tx.Color3, tx.Transparency = Color3.new(0, 0, 0), 0.8
+                tx.Parent = o
+            end
+        end
+    else
+        done[o] = "gone"
+        o.LocalTransparencyModifier = 1
+        for _, d in ipairs(o:GetChildren()) do pcall(function()
+            if d:IsA("Decal") or d:IsA("Texture") then d.Transparency = 1
+            elseif d:IsA("SurfaceGui") or d:IsA("BillboardGui") or d:IsA("Light")
+                or d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail") then
+                d.Enabled = false
+            end
+        end) end
+        if mode == "flat" and o.CanCollide then
+            o.CanCollide = false
+            o.CanQuery = false       -- rays and overlaps skip it too
+        end
+    end
+end
+
+-- The map folders themselves: any child of the workspace (or one level
+-- down) named like one of CONFIG.MapFolders.
+local function MapRoots(want)
+    local out = {}
+    local function Walk(parent, depth)
+        for _, c in ipairs(parent:GetChildren()) do
+            if want[c.Name:lower()] then
+                out[#out + 1] = c
+            elseif depth > 0 and (c:IsA("Folder") or c:IsA("Model"))
+            and not c:FindFirstChildOfClass("Humanoid") then
+                Walk(c, depth - 1)
+            end
+        end
+    end
+    Walk(workspace, 1)
+    return out
+end
+
+-- Attacks get added under the map folders too. A part that arrived
+-- recently is only stripped if it looks like scenery: anchored, not
+-- named as an attack, and either solid or opaque and not in a warning
+-- colour.
+local function LooksBuilt(o)
+    if not o.Anchored or Haz.NameHas(o, CONFIG.HazardNames) then return false end
+    if not o.CanCollide and (o.Transparency > 0.3 or Haz.WarnColor(o.Color)) then return false end
+    return true
+end
+
+function Look.ApplyMap()
+    local mode = CONFIG.MapMode
+    if mode ~= "flat" and mode ~= "hide" then return end
+    Look.mapMode = mode
+    task.spawn(function()
+        local want, n = FolderSet(), 0
+        local roots = MapRoots(want)
+        for _, r in ipairs(roots) do
+            for _, o in ipairs(r:GetDescendants()) do
+                if o:IsA("BasePart") and not done[o] and IsScenery(o, want)
+                and not Haz.NameHas(o, CONFIG.HazardNames)
+                and (not recentParts[o] or LooksBuilt(o)) then
+                    pcall(Strip, o, mode)
+                    n = n + 1
+                    if n % 400 == 0 then task.wait() end
+                end
+            end
+        end
+        local floors, gone = 0, 0
+        for _, v in pairs(done) do
+            if v == "floor" then floors = floors + 1 elseif v == "gone" then gone = gone + 1 end
+        end
+        if #roots == 0 then
+            print("[DQR] Map look: no map folder found (looked for "
+                .. "CONFIG.MapFolders under the workspace) - leaving it alone.")
+        else
+            print(("[DQR] Map look '%s': %d floor part(s) repainted, %d part(s) hidden.")
+                :format(mode, floors, gone))
+        end
+    end)
+end
+
+-- Map parts that stream in later: stripped after a moment (an attack
+-- has usually moved or gone by then), if they still look built.
+workspace.DescendantAdded:Connect(function(o)
+    if not Look.mapMode or not o:IsA("BasePart") then return end
+    if not IsScenery(o, FolderSet()) then return end
+    local at = o.Position
+    task.delay(1.5, function()
+        if not o.Parent or done[o] or not Look.mapMode then return end
+        if (o.Position - at).Magnitude > 0.5 or not LooksBuilt(o) then return end
+        pcall(Strip, o, Look.mapMode)
+    end)
+end)
+
+-- Put the map back the way it was (DQR_Map("off") in the console).
+function Look.RestoreMap()
+    Look.mapMode = nil
+    for o, v in pairs(orig) do
+        if o.Parent then pcall(function()
+            o.CanCollide = v.cc
+            o.CanQuery = v.cq
+            o.LocalTransparencyModifier = v.ltm
+            o.Material, o.Color = v.mat, v.col
+            local tx = o:FindFirstChild("DQR_Studs")
+            if tx then tx:Destroy() end
+        end) end
+    end
+    table.clear(orig)
+    table.clear(done)
+    print("[DQR] Map restored (decals stay stripped).")
+end
+end
+
+-- ============================================================
+--  PROFILES
+--  Prof.Apply puts CONFIG back to the values written in the file,
+--  then lays the class distances and TargetDungeon's MAP_PROFILES
+--  block on top. Runs at boot and at every farm start, so a run only
+--  ever has its own dungeon's settings - nothing from another block,
+--  nothing left over from the last run.
+-- ============================================================
+do
+local base = nil                -- CONFIG as written, captured once
+-- "The King's Castle" -> "kingscastle": case, spaces, punctuation and
+-- a leading "the" do not matter.
+local function Key(s)
+    local k = tostring(s or ""):lower():gsub("[^%w]", "")
+    return (k:gsub("^the", ""))
+end
+
+function Prof.Apply()
+    if not base then
+        base = {}
+        for k, v in pairs(CONFIG) do base[k] = v end
+    end
+    for k in pairs(CONFIG) do
+        if base[k] == nil then CONFIG[k] = nil end
+    end
+    for k, v in pairs(base) do CONFIG[k] = v end
+
+    local name = tostring(base.TargetDungeon or "")
+    local prof, pname = nil, nil
+    for k, v in pairs(MAP_PROFILES) do
+        if Key(k) == Key(name) then prof, pname = v, k break end
+    end
+
+    -- Class distances: this dungeon's block for this class, over the
+    -- CLASS_RANGES table.
+    local want = tostring(base.Class or "")
+    if want == "" then
+        print("[DQR] Class unset - using the hand-tuned distances.")
+    else
+        local cname, cls
+        for k, v in pairs(CLASS_RANGES) do
+            if k:lower() == want:lower() then cname, cls = k, v break end
+        end
+        if not cls then
+            cname, cls = "Warrior", CLASS_RANGES.Warrior
+            print("[DQR] Unknown Class '" .. want .. "' - falling back to Warrior.")
+        end
+        for k, v in pairs(cls) do CONFIG[k] = v end
+        if prof and type(prof[cname]) == "table" then
+            for k, v in pairs(prof[cname]) do CONFIG[k] = v end
+        end
+        print(("[DQR] Class %s: fights from %d studs, melee under %d, spells under %d.")
+            :format(cname, CONFIG.CircleRadius, CONFIG.MeleeRange, CONFIG.AttackRange))
+    end
+
+    -- Everything else in the block. Class blocks were used above;
+    -- BossNames adds to the global list rather than replacing it.
+    if prof then
+        for k, v in pairs(prof) do
+            if k == "BossNames" then
+                local names = {}
+                for _, n in ipairs(base.BossNames or {}) do names[#names + 1] = n end
+                for _, n in ipairs(v) do names[#names + 1] = n end
+                CONFIG.BossNames = names
+            elseif not CLASS_RANGES[k] then
+                CONFIG[k] = v
+            end
+        end
+        print(("[DQR] Using the %s settings (MapMode %s, dodge by %s)."):format(
+            pname, tostring(CONFIG.MapMode), tostring(CONFIG.DodgeMove)))
+    else
+        print(("[DQR] No MAP_PROFILES block for '%s' - using the CONFIG defaults. "
+            .. "Add one to give this dungeon its own settings."):format(name))
+    end
+    Prof.name = pname
+    if CONFIG.MinRange >= CONFIG.CircleRadius then
+        print(("[DQR] WARNING: MinRange (%d) >= CircleRadius (%d) - it will back off "
+            .. "the moment it arrives."):format(CONFIG.MinRange, CONFIG.CircleRadius))
+    end
 end
 end
 
@@ -2809,7 +3578,7 @@ end
 --  has already stood - "forward, somewhere new".
 -- ============================================================
 do
-local dir, dirFrom = nil, nil
+local dir, dirFrom, lastSeen = nil, nil, nil
 local visited = {}
 local pick, pickAt, idleSince = nil, 0, 0
 
@@ -2820,6 +3589,12 @@ end
 
 function Nav.ExploreSeen(pos)
     visited[Cell(pos)] = true
+    -- A respawn is a jump straight back to the start. Read as walking,
+    -- it taught the explorer that "forward" was the way back to spawn,
+    -- and after every death it set off in the wrong direction. Start a
+    -- new leg from here and keep the heading we had.
+    if dirFrom and lastSeen and (pos - lastSeen).Magnitude > 50 then dirFrom = pos end
+    lastSeen = pos
     if not dirFrom then dirFrom = pos return end
     local d = Flat(pos - dirFrom)
     if d.Magnitude > CONFIG.ExploreCell then dir, dirFrom = d.Unit, pos end
@@ -2864,8 +3639,9 @@ end
 
 -- ============================================================
 --  COMBAT
---  Spells are Q/E key presses, alternated every AttackRate - the game
---  handles the cooldowns. Nothing here waits on movement.
+--  Spells are Q/E key presses every AttackRate - together or in turn,
+--  see SpellMode - and the game handles the cooldowns. Nothing here
+--  waits on movement.
 -- ============================================================
 local DoMelee, DoSpell
 do
@@ -2916,6 +3692,10 @@ function DoMelee(aimAt)
     end) end)
 end
 
+-- "both": Q and E go down in the same instant and come up together,
+-- the way the reference bot casts when both slots hold the same spell -
+-- two casts landing as one volley. The game ignores whichever key is
+-- still cooling down, so pressing on a timer is harmless.
 function DoSpell(dist, range, aimAt)
     if dist > range then return end
     local now = tick()
@@ -2926,7 +3706,19 @@ function DoSpell(dist, range, aimAt)
             local x, y = AimPoint(aimAt)
             if not ButtonsAtPoint(x, y)[1] then VIM:SendMouseMoveEvent(x, y, game) end
         end) end
-        FireKey(spellSlot and Enum.KeyCode.Q or Enum.KeyCode.E)
+        if CONFIG.SpellMode == "both" then
+            pcall(function()
+                VIM:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
+                VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+            end)
+            S(0.05)
+            pcall(function()
+                VIM:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
+                VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+            end)
+        else
+            FireKey(spellSlot and Enum.KeyCode.Q or Enum.KeyCode.E)
+        end
     end)
 end
 end
@@ -2954,6 +3746,10 @@ local prog = nil                       -- per-target progress, see below
 local said, saidAt = "", 0
 local lastNoTarget = 0
 local lastPos, lastTarget = nil, nil
+-- Where we last stood fighting, and since when we have been walking
+-- back to it. Survives Brain.Reset on purpose: a death is exactly when
+-- it is needed.
+local lastFight, backSince = nil, 0
 
 -- Forget everything decided about the last position: after a death, a
 -- respawn or any teleport. A "can't get closer" verdict reached beside
@@ -2992,15 +3788,18 @@ end
 -- headings, best first - short, in the direction we were already going
 -- (so a strip across our path is crossed, not backed out of), and
 -- still within casting range. The walk there must not enter a second
--- hazard, hit a wall, or go off a ledge.
-local function PickExit(pos, aim, keepR, heading)
+-- hazard, hit a wall, or go off a ledge. "Clear" means the whole
+-- HITBOX clears every footprint by EvadeClear, not just our centre.
+local function PickExit(pos, aim, keepR, heading, maxD)
     local cands = {}
+    maxD = maxD or CONFIG.EvadeMax
+    local step = maxD > CONFIG.EvadeMax and 3 or 2
     for i = 0, 15 do
         local a = i * math.pi / 8
         local u = Vector3.new(math.cos(a), 0, math.sin(a))
-        for d = 3, CONFIG.EvadeMax, 3 do
+        for d = 2, maxD, step do
             local p = pos + u * d
-            if Haz.Clear(p, true) >= CONFIG.EvadeClear then
+            if Haz.BoxClear(p, true) >= CONFIG.EvadeClear then
                 local score = d
                 if heading then score = score - u:Dot(heading) * 10 end
                 if aim and keepR then
@@ -3048,6 +3847,18 @@ local function RingPoint(pos, aim, ring)
                        aim.Z + math.sin(base) * ring), true
 end
 
+-- DodgeMove "blink": one CFrame write straight to the spot, facing
+-- kept, speed cleared. Short hops only. Returns true if it jumped.
+local function Blink(root, p)
+    if CONFIG.DodgeMove ~= "blink" then return false end
+    local pos = root.Position
+    if FlatDist(p, pos) > CONFIG.BlinkMax then return false end
+    return (pcall(function()
+        root.CFrame = CFrame.new(p.X, pos.Y + 0.1, p.Z) * (root.CFrame - pos)
+        root.AssemblyLinearVelocity = Vector3.zero
+    end))
+end
+
 function Brain.Tick(root)
     local now, pos = tick(), root.Position
     -- Moved further in one tick than anyone can walk: respawned or
@@ -3091,6 +3902,11 @@ function Brain.Tick(root)
             aim    = AimOf(tgt, pos)
             anchor = aim
             dist, flat = (aim - pos).Magnitude, FlatDist(aim, pos)
+            -- Range is still measured to the target, but we face the
+            -- middle of its pack so the fan covers all of them.
+            if CONFIG.AimAtPack and tgt.PackN and tgt.PackN > 1 then
+                aim = Vector3.new(tgt.Pack.X, aim.Y, tgt.Pack.Z)
+            end
         end
         spellR = CONFIG.AttackRange + reach + (tgt.Boss and CONFIG.BossReach or 0)
         ring   = CONFIG.CircleRadius + reach
@@ -3166,6 +3982,9 @@ function Brain.Tick(root)
         if dist <= CONFIG.MeleeRange + reach then DoMelee(aim) end
         DoSpell(dist, stranded and math.max(spellR, dist + 5) or spellR, aim)
         Nav.face = aim
+        -- Our own spot while engaged: known walkable ground in the arena.
+        if dist <= spellR + 15 then lastFight = {pos = pos, t = now} end
+        backSince = 0
     else
         Nav.face = nil
         prog = nil
@@ -3200,7 +4019,12 @@ function Brain.Tick(root)
         if hit and tti < 1.2 then
             lastDodge = now
             local p = Sidestep(pos, origin, vel, rad)
-            if p then
+            if p and Blink(root, p) then
+                -- Already there: nothing else to decide this tick.
+                Nav.goal, Brain.state = nil, "Blinked out of a projectile's way"
+                Say(Brain.state)
+                return
+            elseif p then
                 dodge = {goal = p, untilT = now + 0.7}
                 goal, state = p, "Dodging a projectile"
             end
@@ -3211,22 +4035,33 @@ function Brain.Tick(root)
     if not goal and evade then
         local reached = FlatDist(evade.goal, pos) <= 2
         if reached then settleUntil = now + 1.5 end
-        if reached or now > evade.untilT or Haz.Clear(evade.goal, true) < 0 then
+        -- A new footprint landed on the spot we were heading for:
+        -- drop it and pick again straight away.
+        if reached or now > evade.untilT or Haz.BoxClear(evade.goal, true) < 0 then
             evade = nil
+            if not reached then lastPick = 0 end
         else
             goal, state = evade.goal, "Stepping out of a hazard"
         end
     end
-    if not goal and inHaz and now - lastPick > 0.25 then
+    if not goal and inHaz and now - lastPick > 0.15 then
         lastPick = now
         local heading = nil
         if Nav.goal then
             local d = Flat(Nav.goal - pos)
             if d.Magnitude > 1 then heading = d.Unit end
         end
+        -- Close exits first; a big ring or a room-wide pattern gets a
+        -- second, wider look before giving up and trading hits.
         local p = PickExit(pos, anchor, spellR, heading)
-        if p then
-            evade = {goal = p, untilT = now + 2.5}
+                  or PickExit(pos, anchor, spellR, heading, CONFIG.EvadeFar)
+        if p and Blink(root, p) then
+            settleUntil = now + 1.5
+            Nav.goal, Brain.state = nil, "Blinked out of a hazard"
+            Say(Brain.state)
+            return
+        elseif p then
+            evade = {goal = p, untilT = now + 0.6 + FlatDist(p, pos) / math.max(8, CONFIG.WalkSpeed)}
             goal, state = p, "Stepping out of a hazard"
         end
     end
@@ -3257,11 +4092,37 @@ function Brain.Tick(root)
         end
     end
 
-    -- 4. Nothing to fight: walk on.
+    -- 4. Nothing to fight.
     if not tgt then
         if now - lastNoTarget > 5 then
             lastNoTarget = now
             print(("[DQR] No target. %d mob(s) in the scan."):format(#Mobs.list))
+        end
+        -- Lost the fight altogether - usually a death. The game only
+        -- loads the world near us, so from the respawn point the boss
+        -- we were fighting is not just out of range, it does not exist
+        -- on our side at all, and exploring for it walked the bot all
+        -- over the map. Go back to where we last fought first.
+        if not goal and lastFight and now - lastFight.t < CONFIG.ReturnTime then
+            local far = FlatDist(lastFight.pos, pos)
+            if far <= 30 then
+                lastFight, backSince = nil, 0       -- back, and it is empty
+            elseif backSince > 0 and now - backSince > 90 then
+                print("[DQR] Could not get back to the fight - exploring instead.")
+                lastFight, backSince = nil, 0
+            else
+                if backSince == 0 then
+                    backSince = now
+                    print(("[DQR] Lost the fight - heading back to it (%d studs).")
+                        :format(far))
+                    local at = lastFight.pos
+                    task.spawn(function()
+                        pcall(function() LP:RequestStreamAroundAsync(at) end)
+                    end)
+                end
+                goal = lastFight.pos
+                state = ("Heading back to the fight (%d studs)"):format(math.floor(far / 5) * 5)
+            end
         end
         if not goal then
             goal = Nav.Explore(pos)
@@ -3987,10 +4848,15 @@ function Farm.StatusWatcher()
                 F("EXP",   Hud.Text("exp"))
                 F("Gold",  Hud.Real("gold"))
                 F("Gems",  Hud.Real("gem") or Hud.Real("diamond"))
-                F("Mobs near", #Mobs.list)
+                local near = 0
+                for _, rec in ipairs(Mobs.list) do
+                    if rec.Flat <= 150 then near = near + 1 end
+                end
+                F("Mobs near", near)
                 if tgt then
                     local h = tgt.Humanoid
-                    F("Target", ("%s\n%d%% at %d studs"):format(tgt.Model.Name,
+                    F("Target", ("%s%s\n%d%% at %d studs"):format(tgt.Model.Name,
+                        tgt.Boss and " [boss]" or "",
                         h.MaxHealth > 0 and h.Health / h.MaxHealth * 100 or 0,
                         tgt.Dist))
                 end
@@ -4008,8 +4874,9 @@ function Farm.StatusWatcher()
                     embeds = {{
                         title = ("%s%s"):format(LP.DisplayName,
                             lvl and ("   -   Level " .. lvl) or ""),
-                        description = ("**%s**\n%s (%s)"):format(doing,
-                            CONFIG.TargetDungeon, CONFIG.Difficulty),
+                        description = ("**%s**\n%s (%s)%s"):format(doing,
+                            CONFIG.TargetDungeon, CONFIG.Difficulty,
+                            Prof.name and ("  -  profile: " .. Prof.name) or ""),
                         color = col,
                         fields = fields,
                         footer = {text = "updated " .. os.date("%H:%M:%S")},
@@ -4122,6 +4989,9 @@ function Farm.Start()
         print("[DQR] Not farming - still queueing a dungeon.")
         return
     end
+    -- This dungeon's settings, fresh: nothing left over from the last.
+    Prof.Apply()
+    Look.ApplyMap()
     Farm.Running, Farm.beat = true, tick()
     task.spawn(Guarded("Farm loop", Brain.Loop))
     print("[DQR] Farm started.")
@@ -4213,39 +5083,17 @@ local function Supervisor()
     end
 end
 
-local function ApplyClass()
-    local want = tostring(CONFIG.Class or "")
-    if want == "" then
-        print("[DQR] Class unset - using the hand-tuned distances.")
-        return
-    end
-    local name, prof
-    for k, v in pairs(CLASS_RANGES) do
-        if k:lower() == want:lower() then name, prof = k, v break end
-    end
-    if not prof then
-        name, prof = "Warrior", CLASS_RANGES.Warrior
-        print("[DQR] Unknown Class '" .. want .. "' - falling back to Warrior.")
-    end
-    for k, v in pairs(prof) do CONFIG[k] = v end
-    print(("[DQR] Class %s: fights from %d studs, melee under %d, spells under %d.")
-        :format(name, prof.CircleRadius, prof.MeleeRange, prof.AttackRange))
-    if CONFIG.MinRange >= CONFIG.CircleRadius then
-        print(("[DQR] WARNING: MinRange (%d) >= CircleRadius (%d) - it will back off "
-            .. "the moment it arrives."):format(CONFIG.MinRange, CONFIG.CircleRadius))
-    end
-end
-
 -- ============================================================
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v11.6 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.1 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
     task.spawn(Farm.StatusWatcher)
-    ApplyClass()
+    -- Captures CONFIG as written; every farm start re-applies from it.
+    Prof.Apply()
     NukeGraphics()
     S(2.5)
 
@@ -4343,3 +5191,11 @@ getgenv().DQR_LootDump   = LootDump
 getgenv().DQR_LootTest   = function() return ReportLoot(nil) end
 getgenv().DQR_StatusDump = Farm.StatusDump
 getgenv().DQR_State      = function() return Brain.state end
+getgenv().DQR_BossBar    = function() return Mobs.BossBar() end
+getgenv().DQR_Profile    = function() Prof.Apply() return Prof.name end
+-- DQR_Map("off") puts the map back; DQR_Map("flat") / ("hide") applies it.
+getgenv().DQR_Map        = function(mode)
+    if mode == "off" then Look.RestoreMap() return end
+    CONFIG.MapMode = mode or "flat"
+    Look.ApplyMap()
+end
