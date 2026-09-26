@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.2
+--  DQR AUTO FARM v12.3
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -214,6 +214,25 @@ local CONFIG = {
     HazardMute     = 15,     -- ...so ignore hazards for this long
     FreshSightRule = false,
 
+    -- LEFTOVERS: a telegraph outlives the mob that cast it by a couple
+    -- of seconds. A hazard that appeared while mobs were about stops
+    -- counting once nothing alive is within HazardOwnerRange of it
+    -- (twice that for a boss), and a boss's hazards are dropped the
+    -- moment it dies. Traps that appear with no mob around (so were not
+    -- cast by anything) are never dropped this way.
+    IgnoreOrphans    = true,
+    HazardOwnerRange = 100,
+
+    -- SAFE ZONES: some bosses put down a zone you must stand in while a
+    -- ring closes on you or the floor turns lethal - the Lava King's
+    -- green circle. A flat marker in this colour is then a place to
+    -- stand, not a hazard, and getting into it outranks every dodge.
+    -- "green" / "cyan" / "purple" / "orange" / "red", or "" for none.
+    -- Set it per dungeon in MAP_PROFILES: in another dungeon green can
+    -- be poison.
+    SafeZone       = "",
+    SafeZoneMin    = 6,      -- narrowest marker that counts as a zone
+
     -- ---- MOVEMENT ----------------------------------------------
     PathMinDist    = 12,
     RepathDist     = 8,
@@ -391,7 +410,9 @@ local MAP_PROFILES = {
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
-        BossNames = {},
+        BossNames = {"Lava King"},
+        -- The Lava King's closing red ring: stand in the green circle.
+        SafeZone  = "green",
         Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
         Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
         Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
@@ -1549,6 +1570,8 @@ local models = setmetatable({}, {__mode = "k"})     -- model -> Humanoid
 local shape  = setmetatable({}, {__mode = "k"})     -- model -> {ok, bb, t}
 local radius = setmetatable({}, {__mode = "k"})     -- model -> studs
 local rootOf = setmetatable({}, {__mode = "k"})     -- model -> part
+local bossHum = setmetatable({}, {__mode = "k"})    -- boss being fought -> Humanoid
+Mobs.bossDiedAt = nil                               -- read by Haz: leftovers
 
 function Mobs.Ban(model, secs)
     if model then banned[model] = tick() + (secs or CONFIG.UnreachableFor) end
@@ -1788,6 +1811,16 @@ function Mobs.Scan(force)
     if not root then Mobs.list = {} return Mobs.list end
     local me, list = root.Position, {}
 
+    -- A boss we were fighting has died (or its model is gone): every
+    -- hazard it left on the floor is a leftover from here on.
+    for m, h in pairs(bossHum) do
+        if not m.Parent or h.Parent ~= m or h.Health <= 0 then
+            bossHum[m] = nil
+            Mobs.bossDiedAt = now
+            print(("[DQR] Boss down: %s - ignoring the hazards it left behind."):format(m.Name))
+        end
+    end
+
     -- Who the boss bar means: by name first, and failing that by
     -- health - the bar's maximum against each Humanoid's.
     local bb = Mobs.BossBar()
@@ -1853,6 +1886,7 @@ function Mobs.Scan(force)
                 local _, d = Mobs.Body(rec, me)
                 if d > CONFIG.BossRange then rec.Boss, rec.Far = false, true end
             end
+            if rec.Boss then bossHum[rec.Model] = rec.Humanoid end
         end
     end
     Mobs.list = list
@@ -2078,6 +2112,23 @@ local mapLower = nil
 local warnAt, censusAt = setmetatable({}, {__mode = "k"}), setmetatable({}, {__mode = "k"})
 local srcFirst, srcLast, srcBan = setmetatable({}, {__mode = "k"}),
     setmetatable({}, {__mode = "k"}), setmetatable({}, {__mode = "k"})
+Haz.safe, Haz.orphans = {}, 0       -- safe zones / leftovers dropped, per sweep
+local firstSeen = setmetatable({}, {__mode = "k"})  -- source -> first footprint
+local castBy    = setmetatable({}, {__mode = "k"})  -- source -> a mob was near then
+local owners    = {}                                -- living mobs about: {p, r}
+
+-- Inside a creature that is dead: whatever it was casting is over.
+local function DeadOwner(o)
+    local n, depth = o.Parent, 0
+    while n and n ~= workspace and depth < 8 do
+        if n:IsA("Model") then
+            local h = n:FindFirstChildOfClass("Humanoid")
+            if h then return h.Health <= 0 end
+        end
+        n, depth = n.Parent, depth + 1
+    end
+    return false
+end
 
 local function IsMapPart(o)
     local known = mapMemo[o]
@@ -2218,8 +2269,45 @@ local function Describe(h)
     return ("line len=%d r=%d"):format((h.b - h.a).Magnitude, h.r)
 end
 
+-- How far point `p` is from a footprint's edge, flat.
+local function EdgeDist(h, p)
+    if h.kind == "line" then return math.max(0, SegDistFlat(p, h.a, h.b) - h.r) end
+    if h.kind == "box" then
+        local rel = h.cf:PointToObjectSpace(p)
+        local dx = math.max(0, math.abs(rel.X) - h.hx)
+        local dz = math.max(0, math.abs(rel.Z) - h.hz)
+        return math.sqrt(dx * dx + dz * dz)
+    end
+    local dx, dz = p.X - h.x, p.Z - h.z
+    return math.max(0, math.sqrt(dx * dx + dz * dz) - h.r)
+end
+
+-- A leftover: cast while mobs were about, and now either its boss is
+-- dead or nothing alive is near enough to have cast it. Telegraphs
+-- outlive their casters by a couple of seconds; dodging them after the
+-- fight is over only wastes time.
+local function Orphan(h)
+    local src = h.src
+    local now = tick()
+    local near = false
+    for _, m in ipairs(owners) do
+        if EdgeDist(h, m.p) <= m.r then near = true break end
+    end
+    if firstSeen[src] == nil then
+        firstSeen[src], castBy[src] = now, near
+    end
+    if not castBy[src] then return false end      -- a trap, not a cast
+    local died = Mobs.bossDiedAt
+    if died and now - died < 12 and firstSeen[src] <= died + 0.2 then return true end
+    return not near
+end
+
 local function Add(h)
     if TooOld(h.src) then return end
+    if h.src and CONFIG.IgnoreOrphans and Orphan(h) then
+        Haz.orphans = Haz.orphans + 1
+        return
+    end
     Haz.shapes[#Haz.shapes + 1] = h
     if CONFIG.HazardDebug and h.src then
         local now = tick()
@@ -2324,11 +2412,40 @@ local function AtBodyHeight(o, pos)
     return o.Position.Y + height / 2 > pos.Y - CONFIG.FootOffset + CONFIG.BeamMinHeight
 end
 
+-- A safe zone (CONFIG.SafeZone): a flat, visible marker in that colour,
+-- wide enough to stand in. Returns {c, r, src} or nil. `r` is the
+-- inscribed radius, so a square zone is never over-trusted at its
+-- corners.
+local function SafeZoneOf(o)
+    local want = CONFIG.SafeZone
+    if not want or want == "" or o.Transparency > 0.95 or WarnColor(o.Color) ~= want then
+        return nil
+    end
+    local height, a, b = Footprint(o)
+    local lo = math.min(a, b)
+    -- Flat: a green ball of poison is not somewhere to stand.
+    if lo < CONFIG.SafeZoneMin or height > math.max(6, lo * 0.5) then return nil end
+    -- Built map only counts once it lights up or appears.
+    if IsMapPart(o) and not recentParts[o] and not LooksActive(o) then return nil end
+    return {c = o.Position, r = lo / 2, src = o}
+end
+
 local function Classify(o, pos, reach)
     if not o:IsA("BasePart") or IsOurs(o) then return end
+    -- 0. A safe zone is where to stand, never a hazard.
+    local zone = SafeZoneOf(o)
+    if zone then
+        Haz.safe[#Haz.safe + 1] = zone
+        return
+    end
     -- 1. The game says it is an attack. Believe it - wherever it is
-    -- parented, and however big or invisible (a hitBox is often both).
+    -- parented, and however big or invisible (a hitBox is often both) -
+    -- unless whatever cast it is already dead.
     if NameHas(o, CONFIG.HazardNames) then
+        if CONFIG.IgnoreOrphans and DeadOwner(o) then
+            Haz.orphans = Haz.orphans + 1
+            return
+        end
         AddFootprint(o, CONFIG.TelegraphPad)
         return
     end
@@ -2469,6 +2586,8 @@ function Haz.Scan(pos)
     if now - Haz.t < CONFIG.HazardTTL then return end
     Haz.t = now
     table.clear(Haz.shapes)
+    table.clear(Haz.safe)
+    Haz.orphans = 0
     if not CONFIG.DodgeHazards or now < Haz.muteUntil then return end
 
     table.clear(chars)
@@ -2477,6 +2596,16 @@ function Haz.Scan(pos)
     end
 
     local reach, done = CONFIG.DodgeRange, {}
+    -- Everything alive that could have cast a footprint near us, for
+    -- telling live hazards from leftovers. A boss reaches twice as far.
+    table.clear(owners)
+    local own = CONFIG.HazardOwnerRange
+    for _, rec in ipairs(Mobs.list) do
+        local reachOf = own * (rec.Boss and 2 or 1) + rec.Radius
+        if rec.Humanoid.Health > 0 and rec.Flat <= reach + reachOf then
+            owners[#owners + 1] = {p = rec.Root.Position, r = reachOf}
+        end
+    end
     local function Try(o)
         if done[o] then return end
         done[o] = true
@@ -2655,6 +2784,14 @@ function Haz.Diag()
                 bc == math.huge and "nothing near" or ("%.1f studs clear"):format(bc)))
     if tick() < Haz.muteUntil then
         print(("[DQR] Hazards MUTED for another %ds."):format(Haz.muteUntil - tick()))
+    end
+    if Haz.orphans > 0 then
+        print(("[DQR] %d leftover footprint(s) ignored - their casters are dead or gone.")
+            :format(Haz.orphans))
+    end
+    for _, z in ipairs(Haz.safe) do
+        print(("[Safe zone] r=%d, %d studs away <- %s"):format(z.r,
+            FlatDist(z.c, pos), z.src:GetFullName()))
     end
     for i, h in ipairs(Haz.shapes) do
         if i > 40 then break end
@@ -3981,6 +4118,9 @@ function Brain.Tick(root)
     end
     lastPos = pos
     Nav.ExploreSeen(pos)
+    -- Mobs first: the hazard scan tells live footprints from leftovers
+    -- by what is still alive around them.
+    Mobs.Scan()
     Haz.Scan(pos)
 
     -- ---- target and attack ----------------------------------
@@ -4120,6 +4260,35 @@ function Brain.Tick(root)
         end
     else
         Haz.inSince = 0
+    end
+
+    -- 0. A safe zone is up (the Lava King's green circle): get into it
+    -- and stay there. It outranks every dodge - the attack it answers is
+    -- usually a ring closing in on us, which no step can get out of.
+    -- Spells were already cast above; standing in the zone does not
+    -- stop them.
+    if #Haz.safe > 0 then
+        local zone, best = nil, math.huge
+        for _, z in ipairs(Haz.safe) do
+            local d = FlatDist(z.c, pos)
+            if d < best then zone, best = z, d end
+        end
+        evade, dodge, Haz.inSince = nil, nil, 0
+        local s = CONFIG.HitboxSize
+        -- Far enough in that the whole hitbox is inside.
+        local fit = zone.r - math.max(s.X, s.Z) / 2 - 0.5
+        local centre = Vector3.new(zone.c.X, pos.Y, zone.c.Z)
+        if best <= math.max(0.5, fit) then
+            Nav.goal, Brain.state = nil, "Standing in the safe zone"
+        elseif Blink(root, centre) then
+            Nav.goal, Brain.state = nil, "Blinked into the safe zone"
+        else
+            Nav.goal = centre
+            Brain.state = ("Moving into the safe zone (%d studs)"):format(best)
+        end
+        settleUntil = now + 1.5
+        Say(Brain.state)
+        return
     end
 
     -- 1. A projectile about to land.
@@ -5199,7 +5368,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.2 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.3 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
