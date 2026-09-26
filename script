@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.3
+--  DQR AUTO FARM v12.4
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -110,7 +110,7 @@ local CONFIG = {
     CameraHeight   = 12,
     CameraBack     = 17,
     SetWalkSpeed   = true,
-    WalkSpeed      = 19.5,
+    WalkSpeed      = 19,
 
     -- ---- TARGETING ---------------------------------------------
     PreferBoss     = true,   -- a boss outranks the adds it summons
@@ -233,6 +233,12 @@ local CONFIG = {
     SafeZone       = "",
     SafeZoneMin    = 6,      -- narrowest marker that counts as a zone
 
+    -- Per-boss distances: a boss named here is fought at these instead
+    -- of the class's. Set per dungeon in MAP_PROFILES, e.g.
+    --   Bosses = {["Lava King"] = {CircleRadius = 22, MinRange = 12}}
+    -- (CircleRadius / MinRange / AttackRange, any of them).
+    Bosses         = {},
+
     -- ---- MOVEMENT ----------------------------------------------
     PathMinDist    = 12,
     RepathDist     = 8,
@@ -261,6 +267,13 @@ local CONFIG = {
     ExploreCell    = 24,
 
     LobbyGrace     = 4,      -- lobby UI gone this long = in a dungeon
+    -- The run begins after START, a five-second countdown, and the
+    -- barriers dropping. Hold still until StartCountdown seconds after
+    -- the START button was last on screen, and don't go looking for
+    -- mobs before the first one has shown up - unless StartWait seconds
+    -- pass with none at all (a dungeon that only spawns as you walk).
+    StartCountdown = 6.5,
+    StartWait      = 30,
     LoopStallTime  = 6,
     MaxQueryParts  = 2000,
     HazardTTL      = 0.08,
@@ -413,6 +426,8 @@ local MAP_PROFILES = {
         BossNames = {"Lava King"},
         -- The Lava King's closing red ring: stand in the green circle.
         SafeZone  = "green",
+        -- ...and fight him a little closer than the class distance.
+        Bosses    = {["Lava King"] = {CircleRadius = 22, MinRange = 12}},
         Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
         Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
         Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
@@ -1335,6 +1350,7 @@ function DungeonStartButton()
     local now = tick()
     if now - at < 1 then
         if btn and not (btn.Parent and VisibleOnScreen(btn)) then btn = nil end
+        if btn then Farm.startSeenAt = now end
         return btn
     end
     at, btn = now, nil
@@ -1346,6 +1362,8 @@ function DungeonStartButton()
             break
         end
     end
+    -- Remembered: the countdown runs for a few seconds after START goes.
+    if btn then Farm.startSeenAt = now end
     return btn
 end
 end
@@ -1816,7 +1834,7 @@ function Mobs.Scan(force)
     for m, h in pairs(bossHum) do
         if not m.Parent or h.Parent ~= m or h.Health <= 0 then
             bossHum[m] = nil
-            Mobs.bossDiedAt = now
+            Mobs.bossDiedAt, Mobs.bossDiedName = now, Norm(m.Name)
             print(("[DQR] Boss down: %s - ignoring the hazards it left behind."):format(m.Name))
         end
     end
@@ -1841,7 +1859,9 @@ function Mobs.Scan(force)
         if barHit and knownBoss[barHit] ~= "boss bar" then
             knownBoss[barHit] = "boss bar"
             print(("[DQR] Boss bar: '%s' -> %s."):format(bb.text, barHit:GetFullName()))
-        elseif not barHit and Mobs.barMissed ~= bb.name then
+        elseif not barHit and Mobs.barMissed ~= bb.name
+        -- The bar stays up a moment after its boss dies: not a miss.
+        and not (Mobs.bossDiedName and NameHit(bb.name, Mobs.bossDiedName, Mobs.bossDiedName)) then
             Mobs.barMissed = bb.name
             print(("[DQR] Boss bar says '%s' but no mob matches it by name or "
                 .. "health - F8 lists what is there."):format(bb.text))
@@ -2640,9 +2660,9 @@ end
 -- How far `p` is from the nearest hazard edge; negative = inside.
 -- Discs and boxes count within their own height plus a body; lasers
 -- within chest height; balls in true 3D against the body's height.
-function Haz.Clear(p, ignoreHuge)
+function Haz.Clear(p, ignoreHuge, list)
     local best = math.huge
-    for _, h in ipairs(Haz.shapes) do
+    for _, h in ipairs(list or Haz.shapes) do
         local c = nil
         if ignoreHuge and h.huge then
             -- too big to step out of
@@ -2681,14 +2701,14 @@ end
 -- footprint (a laser is BeamPad * 2 wide at least), so nothing slips
 -- between them.
 local SIGNS = {-1, 0, 1}
-function Haz.BoxClear(p, ignoreHuge)
-    if #Haz.shapes == 0 then return math.huge end
+function Haz.BoxClear(p, ignoreHuge, list)
+    if #(list or Haz.shapes) == 0 then return math.huge end
     local s, pad = CONFIG.HitboxSize, CONFIG.HitboxPad
     local hx, hz = s.X / 2 + pad, s.Z / 2 + pad
     local best = math.huge
     for _, sx in ipairs(SIGNS) do
         for _, sz in ipairs(SIGNS) do
-            local c = Haz.Clear(Vector3.new(p.X + sx * hx, p.Y, p.Z + sz * hz), ignoreHuge)
+            local c = Haz.Clear(Vector3.new(p.X + sx * hx, p.Y, p.Z + sz * hz), ignoreHuge, list)
             if c < best then best = c end
         end
     end
@@ -2987,6 +3007,7 @@ local WALL_THICK, WALL_MIN_H = 6, 7.5        -- a jump clears about 7
 local done  = setmetatable({}, {__mode = "k"})  -- part -> "ground"/"wall"/"decor"/"edge"
 local orig  = setmetatable({}, {__mode = "k"})  -- part -> saved properties
 local walls = setmetatable({}, {__mode = "k"})  -- parts taken out as walls
+local stairs = setmetatable({}, {__mode = "k"}) -- steps and ramps: ways up
 local newGround = {}                            -- where ground streamed in lately
 Look.mapMode = nil
 
@@ -3083,6 +3104,17 @@ local function UpFace(cf)
     return face
 end
 
+-- A way up by itself: a wedge, a truss, or any part tilted so that no
+-- face points up (a sloped plank, a ramp) and tall enough to climb.
+local function StairLike(o)
+    if o:IsA("WedgePart") or o:IsA("CornerWedgePart") or o:IsA("TrussPart") then return true end
+    if o:IsA("Part") and (o.Shape == Enum.PartType.Wedge
+                          or o.Shape == Enum.PartType.CornerWedge) then
+        return true
+    end
+    return UpFace(o.CFrame) == nil and Extents(o) >= 2
+end
+
 -- Grey baseplate look. Lava, glowing panels and anything else in a
 -- warning colour keep their looks: they may hurt, and you should still
 -- see them.
@@ -3122,10 +3154,11 @@ local function Strip(o, mode, streamed)
     if o.CanCollide and o.Transparency >= 0.99 then done[o] = "edge" return end
     orig[o] = {cc = o.CanCollide, cq = o.CanQuery, ltm = o.LocalTransparencyModifier,
                mat = o.Material, col = o.Color}
+    local wall = o.CanCollide and WallLike(o)
     if not o.CanCollide then
         done[o] = "decor"
         Vanish(o)
-    elseif WallLike(o) and not TopConnected(o) then
+    elseif wall and not TopConnected(o) then
         done[o] = "wall"
         walls[o] = true
         Vanish(o)
@@ -3136,8 +3169,95 @@ local function Strip(o, mode, streamed)
     else
         done[o] = "ground"
         Repaint(o)
+        -- A step block (a wall shape kept because it joins others at
+        -- the top) or anything sloped is a way up: remembered for
+        -- Look.StairLead.
+        if wall or StairLike(o) then stairs[o] = true end
         if streamed then newGround[#newGround + 1] = o.Position end
     end
+end
+
+-- The way up to `goal` when the pathfinder has no route: the step or
+-- ramp nearest us that starts at our floor and climbs, weighted toward
+-- the goal. Returns waypoints - the foot of it on our level, then the
+-- climb in rises of 3 studs or less (a step block: one jump onto its
+-- top) - or nil. Climbing a staircase is this, one step at a time:
+-- from the top of each step the next one qualifies.
+function Look.StairLead(pos, goal)
+    local feet = pos.Y - 3
+    local best, bestScore, bestRamp = nil, math.huge, false
+    for o in pairs(stairs) do
+        if not o.Parent then
+            stairs[o] = nil
+        else
+            local height = Extents(o)
+            local c = o.Position
+            local bottom, top = c.Y - height / 2, c.Y + height / 2
+            local ramp = StairLike(o)
+            -- A step block has to be jumpable onto; a ramp is walked up.
+            if bottom >= feet - 6 and bottom <= feet + 4 and top > feet + 1.5
+            and top <= goal.Y + 6 and (ramp or top <= feet + 6.5) then
+                local d = FlatDist(c, pos)
+                if d <= 120 then
+                    local score = d + FlatDist(c, goal) * 0.7
+                    if score < bestScore then best, bestScore, bestRamp = o, score, ramp end
+                end
+            end
+        end
+    end
+    if not best then return nil end
+
+    local cf, s = best.CFrame, PartSize(best) / 2
+    local corners, maxY, minY = {}, -math.huge, math.huge
+    for _, x in ipairs({-1, 1}) do
+        for _, y in ipairs({-1, 1}) do
+            for _, z in ipairs({-1, 1}) do
+                local w = cf:PointToWorldSpace(Vector3.new(s.X * x, s.Y * y, s.Z * z))
+                corners[#corners + 1] = w
+                if w.Y > maxY then maxY = w.Y end
+                if w.Y < minY then minY = w.Y end
+            end
+        end
+    end
+    local function Mid(keep)
+        local sum, n = Vector3.zero, 0
+        for _, w in ipairs(corners) do
+            if keep(w) then sum, n = sum + w, n + 1 end
+        end
+        return sum / math.max(n, 1)
+    end
+    local topMid = Mid(function(w) return w.Y >= maxY - 0.6 end)
+    local centre = best.Position
+    local inward = Flat(centre - topMid)
+    if inward.Magnitude > 1.5 then topMid = topMid + inward.Unit * 1.5 end
+    local top = Vector3.new(topMid.X, maxY + 3, topMid.Z)
+
+    local foot
+    if bestRamp then
+        -- The low end, a stud and a half out from it.
+        local low = Mid(function(w) return w.Y <= minY + 0.6 end)
+        if (low - top).Magnitude < 2 then low = centre end
+        local out = Flat(low - centre)
+        foot = low + (out.Magnitude > 0.1 and out.Unit * 1.5 or Vector3.zero)
+    else
+        -- A step block: the nearest point of it to us, a stud and a half out.
+        local rel = cf:PointToObjectSpace(pos)
+        local q = cf:PointToWorldSpace(Vector3.new(math.clamp(rel.X, -s.X, s.X),
+            math.clamp(rel.Y, -s.Y, s.Y), math.clamp(rel.Z, -s.Z, s.Z)))
+        local out = Flat(pos - q)
+        foot = q + (out.Magnitude > 0.1 and out.Unit * 1.5 or Vector3.zero)
+    end
+    foot = Vector3.new(foot.X, pos.Y, foot.Z)
+
+    local WALK, JUMP = Enum.PathWaypointAction.Walk, Enum.PathWaypointAction.Jump
+    local wps = {{Position = foot, Action = WALK}}
+    if bestRamp then
+        local n = math.max(1, math.ceil((top.Y - foot.Y) / 3))
+        for i = 1, n do wps[#wps + 1] = {Position = foot:Lerp(top, i / n), Action = WALK} end
+    else
+        wps[#wps + 1] = {Position = top, Action = JUMP}
+    end
+    return wps
 end
 
 -- A wall judged before the steps beside it had streamed in. Walls near
@@ -3146,6 +3266,7 @@ end
 local function Unwall(w)
     local v = orig[w]
     walls[w] = nil
+    stairs[w] = true                 -- it joins a staircase after all
     if v then
         w.CanCollide = v.cc
         w.CanQuery = v.cq
@@ -3270,6 +3391,7 @@ function Look.RestoreMap()
     table.clear(orig)
     table.clear(done)
     table.clear(walls)
+    table.clear(stairs)
     newGround = {}
     print("[DQR] Map restored (decals stay stripped).")
 end
@@ -3490,6 +3612,23 @@ local function ComputePath(from, to)
     end
     pathFails = pathFails + 1
     local now = tick()
+    -- The goal is up a level and there is no route: take the stairs,
+    -- straight away. The flat-map pass knows every step and ramp, so
+    -- there is no need to steer at the goal or search the whole area
+    -- first - that is what had the bot walking at the platform and
+    -- re-routing for half a minute with the stairs right beside it.
+    if to.Y - from.Y > CONFIG.JumpMax then
+        local lead = Look.StairLead(from, to)
+        if lead then
+            -- Round anything in the way to the foot of it, then climb.
+            local r = Route(from, lead[1].Position, {{2, 60}, {1.5, 70}})
+            if r then
+                for i = 2, #lead do r[#r + 1] = lead[i] end
+                return r
+            end
+            return lead
+        end
+    end
     if pathFails < 2 then return nil end
 
     -- On a detour already: re-aim at the same spot rather than search
@@ -4083,17 +4222,138 @@ local function Sidestep(pos, origin, vel, rad)
     return Nav.SafeStep(pos, perp * sign, step) or Nav.SafeStep(pos, perp * -sign, step)
 end
 
--- The spot on the fighting ring nearest us whose straight walk crosses
--- no hazard; if every angle crosses one, the direct spot and `true`.
-local function RingPoint(pos, aim, ring)
-    local base = math.atan2(pos.Z - aim.Z, pos.X - aim.X)
-    for _, off in ipairs({0, 0.35, -0.35, 0.7, -0.7, 1.05, -1.05}) do
-        local a = base + off
-        local p = Vector3.new(aim.X + math.cos(a) * ring, aim.Y, aim.Z + math.sin(a) * ring)
-        if #Haz.shapes == 0 or not Haz.OnPath(pos, p) then return p, false end
+-- Solid floor under `p`, from 4 studs above it to 12 below, as a root
+-- position (floor + 3); nil if there is none - `p` is in mid-air.
+-- Non-solid decoration and creatures (and `skip`) are looked through.
+local function FloorNear(p, skip)
+    local rp = RaycastParams.new()
+    rp.FilterType = EXCLUDE
+    rp.IgnoreWater = true
+    local ignore = {GetChar()}
+    if skip then ignore[#ignore + 1] = skip end
+    for _ = 1, 4 do
+        rp.FilterDescendantsInstances = ignore
+        local hit = workspace:Raycast(p + Vector3.new(0, 4, 0), Vector3.new(0, -16, 0), rp)
+        if not hit then return nil end
+        local m = hit.Instance:FindFirstAncestorOfClass("Model")
+        if hit.Instance.CanCollide and not (m and m:FindFirstChildOfClass("Humanoid")) then
+            return hit.Position + Vector3.new(0, 3, 0)
+        end
+        ignore[#ignore + 1] = (m and m:FindFirstChildOfClass("Humanoid")) and m or hit.Instance
     end
-    return Vector3.new(aim.X + math.cos(base) * ring, aim.Y,
-                       aim.Z + math.sin(base) * ring), true
+    return nil
+end
+
+-- Nothing solid between two root positions, at knee and chest height.
+-- Invisible map edges count - they are solid - which is the point:
+-- a spot behind one is not on the target's side.
+local function OpenBetween(a, b, skip)
+    local rp = RaycastParams.new()
+    rp.FilterType = EXCLUDE
+    rp.IgnoreWater = true
+    for _, h in ipairs({-1.5, 0.5}) do
+        local ignore = {GetChar()}
+        if skip then ignore[#ignore + 1] = skip end
+        local off = Vector3.new(0, h, 0)
+        local blocked = false
+        for _ = 1, 4 do
+            rp.FilterDescendantsInstances = ignore
+            local hit = workspace:Raycast(a + off, b - a, rp)
+            if not hit then break end
+            local m = hit.Instance:FindFirstAncestorOfClass("Model")
+            if m and m:FindFirstChildOfClass("Humanoid") then
+                ignore[#ignore + 1] = m
+            elseif hit.Instance.CanCollide then
+                blocked = true
+                break
+            else
+                ignore[#ignore + 1] = hit.Instance
+            end
+        end
+        if blocked then return false end
+    end
+    return true
+end
+
+-- Where to stand to fight: a spot on the fighting ring, nearest us,
+-- that is REAL floor on the target's side - solid ground at about the
+-- target's own level with nothing solid between it and the target -
+-- and whose walk there crosses no hazard. A ring spot used to be taken
+-- at the target's height whatever was under it: with the target up on
+-- a platform that put the green ball in mid-air past the edge, or
+-- behind an invisible barrier, and the route to it ended on the ground
+-- underneath instead of up the stairs. Tries closer spots on each
+-- heading, then the floor at the target's feet. Returns spot,
+-- crossesHazard.
+local ringCache = {t = 0}
+local function RingPoint(pos, anchor, ring, model)
+    local now = tick()
+    local c = ringCache
+    if c.model == model and c.ring == ring and now - c.t < 0.3
+    and (c.anchor - anchor).Magnitude < 3 then
+        return c.p, c.crosses
+    end
+    local level = FloorNear(anchor, model)          -- the target's own floor
+    local base = math.atan2(pos.Z - anchor.Z, pos.X - anchor.X)
+    local p, crosses, spare = nil, true, nil
+    for _, off in ipairs({0, 0.35, -0.35, 0.7, -0.7, 1.05, -1.05}) do
+        local u = Vector3.new(math.cos(base + off), 0, math.sin(base + off))
+        for _, f in ipairs({1, 0.7, 0.45}) do
+            local g = FloorNear(anchor + u * (ring * f), model)
+            if g and (not level or math.abs(g.Y - level.Y) <= 5)
+            and OpenBetween(g, anchor, model) then
+                if #Haz.shapes == 0 or not Haz.OnPath(pos, g) then
+                    p, crosses = g, false
+                elseif not spare then
+                    spare = g
+                end
+                break                               -- this heading is settled
+            end
+        end
+        if p then break end
+    end
+    if not p then
+        p = spare or level or Vector3.new(anchor.X + math.cos(base) * ring, anchor.Y,
+                                          anchor.Z + math.sin(base) * ring)
+    end
+    c.model, c.ring, c.anchor, c.t, c.p, c.crosses = model, ring, anchor, now, p, crosses
+    return p, crosses
+end
+
+-- Distances for this target: its entry in CONFIG.Bosses (the dungeon's
+-- per-boss tuning) where it has one, else the class distances.
+local function Tune(tgt)
+    local t = nil
+    if tgt.Boss and type(CONFIG.Bosses) == "table" then
+        local n = Norm(tgt.Model.Name)
+        for k, v in pairs(CONFIG.Bosses) do
+            if Norm(k) == n then t = v break end
+        end
+    end
+    t = t or {}
+    return t.CircleRadius or CONFIG.CircleRadius, t.MinRange or CONFIG.MinRange,
+           t.AttackRange or CONFIG.AttackRange
+end
+
+-- A spot inside a safe zone whose hitbox clears `threats`, nearest us:
+-- the middle, then two rings of eight. Nil if all of it is covered.
+local function SpotInZone(zone, fit, pos, threats)
+    local best, bestD = nil, math.huge
+    local function Try(x, z)
+        local p = Vector3.new(x, pos.Y, z)
+        if Haz.BoxClear(p, true, threats) >= 0.5 then
+            local d = FlatDist(p, pos)
+            if d < bestD then best, bestD = p, d end
+        end
+    end
+    Try(zone.c.X, zone.c.Z)
+    for _, rr in ipairs({fit * 0.5, fit}) do
+        for i = 0, 7 do
+            local a = i * math.pi / 4
+            Try(zone.c.X + math.cos(a) * rr, zone.c.Z + math.sin(a) * rr)
+        end
+    end
+    return best
 end
 
 -- DodgeMove "blink": one CFrame write straight to the spot, facing
@@ -4129,10 +4389,11 @@ function Brain.Tick(root)
     -- aim: where to face and throw. anchor: what distance is measured
     -- from and the fighting ring is drawn around. reach: how far the
     -- surface is from the anchor.
-    local aim, anchor, flat, dist, spellR, ring, reach, name
+    local aim, anchor, flat, dist, spellR, ring, reach, name, minR
     local blocked, stranded = false, false
     if tgt then
         Nav.ExploreReset()
+        Brain.mobSeen = true            -- the run is on
         name = tgt.Model.Name
         -- Small mobs: from the root plus a radius, as always. Bosses and
         -- big mobs: to the nearest point of the body itself (Mobs.Body),
@@ -4160,8 +4421,10 @@ function Brain.Tick(root)
                 aim = Vector3.new(tgt.Pack.X, aim.Y, tgt.Pack.Z)
             end
         end
-        spellR = CONFIG.AttackRange + reach + (tgt.Boss and CONFIG.BossReach or 0)
-        ring   = CONFIG.CircleRadius + reach
+        local circleR, minRange, attackR = Tune(tgt)
+        spellR = attackR + reach + (tgt.Boss and CONFIG.BossReach or 0)
+        ring   = circleR + reach
+        minR   = minRange + reach
         -- Say what a new big target looks like, so a log shows at once
         -- whether the distances make sense.
         if tgt.Model ~= lastTarget then
@@ -4277,16 +4540,39 @@ function Brain.Tick(root)
         local s = CONFIG.HitboxSize
         -- Far enough in that the whole hitbox is inside.
         local fit = zone.r - math.max(s.X, s.Z) / 2 - 0.5
-        local centre = Vector3.new(zone.c.X, pos.Y, zone.c.Z)
-        if best <= math.max(0.5, fit) then
-            Nav.goal, Brain.state = nil, "Standing in the safe zone"
-        elseif Blink(root, centre) then
-            Nav.goal, Brain.state = nil, "Blinked into the safe zone"
+        fit = math.max(0.5, fit)
+        -- What still has to be dodged in here: flat footprints that
+        -- cover only PART of the zone (lava strips, circles dropped on
+        -- it). Left alone: anything covering the whole zone - the ring
+        -- closing in, the thing the zone protects from - and balls (the
+        -- red sphere shrinking onto us).
+        local threats = {}
+        for _, h in ipairs(Haz.shapes) do
+            if h.kind ~= "ball" and Haz.Clear(zone.c, false, {h}) > -zone.r then
+                threats[#threats + 1] = h
+            end
+        end
+        local want = nil
+        if best <= fit then
+            if #threats > 0 and Haz.BoxClear(pos, true, threats) < 0 then
+                want = SpotInZone(zone, fit, pos, threats)
+                Brain.state = want and "Dodging inside the safe zone"
+                              or "Standing in the safe zone (all of it is covered)"
+            else
+                Brain.state = "Standing in the safe zone"
+            end
         else
-            Nav.goal = centre
+            want = (#threats > 0 and SpotInZone(zone, fit, pos, threats))
+                   or Vector3.new(zone.c.X, pos.Y, zone.c.Z)
             Brain.state = ("Moving into the safe zone (%d studs)"):format(best)
         end
+        if want and Blink(root, want) then
+            want, Brain.state = nil, "Blinked into the safe zone"
+        end
+        Nav.goal = want
         settleUntil = now + 1.5
+        -- Time spent in here is not time failing to reach the target.
+        if prog then prog.since = now end
         Say(Brain.state)
         return
     end
@@ -4346,10 +4632,13 @@ function Brain.Tick(root)
             goal, state = p, "Stepping out of a hazard"
         end
     end
+    -- Dodging is not failing to reach the target: keep its progress
+    -- clock from running out (that is what latched "Cannot reach Lava
+    -- King - casting from here" after a spell of dodging).
+    if goal and prog then prog.since = now end
 
     -- 3. Positioning against the target.
     if not goal and tgt then
-        local minR = CONFIG.MinRange + reach
         if blocked or stranded then
             state = stranded and ("Casting at " .. name .. " from range")
                               or ("Fighting " .. name .. " from here")
@@ -4359,7 +4648,7 @@ function Brain.Tick(root)
             goal = Nav.SafeStep(pos, away, ring - flat + 2)
             state = goal and ("Backing off " .. name) or ("Fighting " .. name)
         elseif flat > ring + CONFIG.HoldSlack then
-            local pt, crosses = RingPoint(pos, anchor, ring)
+            local pt, crosses = RingPoint(pos, anchor, ring, tgt.Model)
             -- Already in range, and walking in would cross a hazard or
             -- undo a dodge we just made: cast from here instead.
             if dist <= spellR and (crosses or now < settleUntil) then
@@ -4378,6 +4667,19 @@ function Brain.Tick(root)
         if now - lastNoTarget > 5 then
             lastNoTarget = now
             print(("[DQR] No target. %d mob(s) in the scan."):format(#Mobs.list))
+        end
+        -- Not a single mob yet this run: it has not started. The mobs
+        -- spawn when the barriers drop, so wandering before then only
+        -- walks into them. After StartWait with none at all, assume a
+        -- dungeon that spawns as you go, and set off.
+        if not Brain.mobSeen then
+            if now - (Brain.bootAt or now) < CONFIG.StartWait then
+                if not goal then state = "Waiting for the run to start" end
+            elseif not Brain.saidNoMobs then
+                Brain.saidNoMobs = true
+                print(("[DQR] No mobs %ds after starting - exploring to find them.")
+                    :format(CONFIG.StartWait))
+            end
         end
         -- Lost the fight altogether - usually a death. The game only
         -- loads the world near us, so from the respawn point the boss
@@ -4405,7 +4707,7 @@ function Brain.Tick(root)
                 state = ("Heading back to the fight (%d studs)"):format(math.floor(far / 5) * 5)
             end
         end
-        if not goal then
+        if not goal and not state then
             goal = Nav.Explore(pos)
             state = goal and "Exploring for the next wave" or "Waiting for mobs"
         end
@@ -4426,6 +4728,7 @@ end
 function Brain.Loop()
     Brain.Reset()
     Nav.Start()
+    Brain.bootAt = Brain.bootAt or tick()   -- once per dungeon: survives respawns
     local lastLobby, lastStart, startVisible = 0, 0, false
     while Farm.Running do
         local now = tick()
@@ -4456,6 +4759,14 @@ function Brain.Loop()
             Nav.goal, Nav.face = nil, nil
             Brain.state = "Waiting for the run to start"
             S(0.5)
+            continue
+        end
+        -- START has gone: the countdown is running and the barriers are
+        -- still up. Stand still until it is over.
+        if Farm.startSeenAt and now - Farm.startSeenAt < CONFIG.StartCountdown then
+            Nav.goal, Nav.face = nil, nil
+            Brain.state = "Countdown - waiting for the barriers to drop"
+            S(0.25)
             continue
         end
         Brain.Tick(root)
@@ -5368,7 +5679,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.3 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.4 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
