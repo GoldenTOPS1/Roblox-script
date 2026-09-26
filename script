@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.4
+--  DQR AUTO FARM v12.5
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -232,6 +232,10 @@ local CONFIG = {
     -- be poison.
     SafeZone       = "",
     SafeZoneMin    = 6,      -- narrowest marker that counts as a zone
+    -- How far away a zone is still seen. Hazards are only looked for
+    -- within DodgeRange (40), and the Lava King's circle can land
+    -- further off than that - which is why the bot once ignored it.
+    SafeZoneRange  = 160,
 
     -- Per-boss distances: a boss named here is fought at these instead
     -- of the class's. Set per dungeon in MAP_PROFILES, e.g.
@@ -426,11 +430,12 @@ local MAP_PROFILES = {
         BossNames = {"Lava King"},
         -- The Lava King's closing red ring: stand in the green circle.
         SafeZone  = "green",
-        -- ...and fight him a little closer than the class distance.
-        Bosses    = {["Lava King"] = {CircleRadius = 22, MinRange = 12}},
+        -- ...and fight him closer than the class distance (from the
+        -- edge of his body, not his middle).
+        Bosses    = {["Lava King"] = {CircleRadius = 16, MinRange = 8}},
         Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
         Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
-        Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
+        Mage      = {CircleRadius = 26, MinRange = 15, AttackRange = 45},
         Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
     },
     ["Aquatic Temple"] = {
@@ -2450,6 +2455,43 @@ local function SafeZoneOf(o)
     return {c = o.Position, r = lo / 2, src = o}
 end
 
+-- Zone candidates anywhere in range, kept in a short list: every new
+-- part in the zone colour (checked a moment after it appears - the
+-- colour is often set after parenting), plus a wide sweep once a
+-- second for a floor panel that turns that colour in place.
+local zoneParts = setmetatable({}, {__mode = "k"})
+local function ZoneCheck(o)
+    local want = CONFIG.SafeZone
+    if want and want ~= "" and o.Parent and WarnColor(o.Color) == want then
+        zoneParts[o] = true
+    end
+end
+workspace.DescendantAdded:Connect(function(o)
+    if not o:IsA("BasePart") or not CONFIG.SafeZone or CONFIG.SafeZone == "" then return end
+    task.defer(ZoneCheck, o)
+    task.delay(0.3, ZoneCheck, o)
+end)
+local zoneSweepAt = 0
+local function ZonesAround(pos, done)
+    local want = CONFIG.SafeZone
+    if not want or want == "" then return end
+    local now, range = tick(), CONFIG.SafeZoneRange
+    if now - zoneSweepAt > 1 then
+        zoneSweepAt = now
+        for _, o in ipairs(NearbyParts(pos, range)) do pcall(ZoneCheck, o) end
+    end
+    for o in pairs(zoneParts) do
+        if not o.Parent then
+            zoneParts[o] = nil
+        elseif not done[o] and FlatDist(o.Position, pos) <= range
+        and math.abs(o.Position.Y - pos.Y) < 25 then
+            done[o] = true
+            local ok, z = pcall(SafeZoneOf, o)
+            if ok and z then Haz.safe[#Haz.safe + 1] = z end
+        end
+    end
+end
+
 local function Classify(o, pos, reach)
     if not o:IsA("BasePart") or IsOurs(o) then return end
     -- 0. A safe zone is where to stand, never a hazard.
@@ -2654,6 +2696,7 @@ function Haz.Scan(pos)
     end
     ScanBeams(pos, reach)
     ScanAdorns(pos, reach)
+    ZonesAround(pos, done)
     if CONFIG.HazardDebug then pcall(Haz.Draw) end
 end
 
@@ -3565,7 +3608,9 @@ function Nav.SafeStep(pos, dir, dist)
 end
 
 -- No route and the straight line is blocked: the most target-ward
--- heading that is actually clear.
+-- heading that is actually clear AND has floor all the way - the old
+-- test was walls only, so from a staircase landing it happily picked
+-- the open air past the edge.
 local function ClearDirection(pos, target)
     local base = Vector3.new(target.X - pos.X, 0, target.Z - pos.Z)
     if base.Magnitude < 1 then return nil end
@@ -3574,7 +3619,8 @@ local function ClearDirection(pos, target)
         local a = math.rad(deg)
         local d = Vector3.new(base.X * math.cos(a) - base.Z * math.sin(a), 0,
                               base.X * math.sin(a) + base.Z * math.cos(a))
-        if LineClear(pos, pos + d * CONFIG.ProbeDist) then return d end
+        local p = pos + d * CONFIG.ProbeDist
+        if LineClear(pos, p) and HasGround(p) and GroundOnPath(pos, p) then return d end
     end
     return nil
 end
@@ -3599,6 +3645,84 @@ local function Route(from, to, tries)
     return nil
 end
 
+-- ---- climbing -------------------------------------------------
+-- The way UP, when the pathfinder has no route to a goal above us.
+-- Found by looking, not by part shapes (a spiral staircase of flat
+-- slabs looks like any other floor): standable spots within 40 studs
+-- that are higher than our feet - the next turn of a staircase, a
+-- landing, the top of a ramp - each with standing room above it.
+-- Probes are cast down from just above each height band, never from
+-- high in the air: from up there the first thing hit is the platform
+-- we are trying to reach, or a ceiling.
+local function SurfaceIn(x, z, top, depth, rp)
+    local hit = workspace:Raycast(Vector3.new(x, top, z), Vector3.new(0, -depth, 0), rp)
+    if not hit or not hit.Instance.CanCollide or hit.Normal.Y < 0.6 then return nil end
+    local m = hit.Instance:FindFirstAncestorOfClass("Model")
+    if m and m:FindFirstChildOfClass("Humanoid") then return nil end
+    -- Standing room. Also rejects a probe that started inside a solid
+    -- column and came out on the floor underneath it, and the space
+    -- under a staircase.
+    local up = workspace:Raycast(hit.Position + Vector3.new(0, 0.2, 0), Vector3.new(0, 5, 0), rp)
+    if up and up.Instance.CanCollide then return nil end
+    return hit.Position
+end
+
+local climbTo, climbAt, nextClimb = nil, 0, 0
+local function ClimbLead(from, to)
+    local now = tick()
+    -- Still on the way to the spot picked last time: keep going there,
+    -- or every recompute from a step further on picks a different one.
+    if climbTo and now - climbAt < 6 and FlatDist(climbTo, from) > 4 and climbTo.Y - from.Y > 1.5 then
+        local r = Route(from, climbTo, {{2, 60}, {1.5, 70}})
+        if r then return r end
+    end
+    climbTo = nil
+    if now < nextClimb then return nil end
+    nextClimb = now + 0.8
+
+    local feet, rise = from.Y - 3, to.Y - from.Y
+    local rp = RayParams(true)
+    local toward = Flat(to - from)
+    toward = toward.Magnitude > 1 and toward.Unit or nil
+    local cands = {}
+    for i = 0, 15 do
+        local a = i * math.pi / 8
+        local u = Vector3.new(math.cos(a), 0, math.sin(a))
+        for _, d in ipairs({6, 12, 20, 30, 40}) do
+            local x, z = from.X + u.X * d, from.Z + u.Z * d
+            for _, h in ipairs({3, 8, 13, 18, 23, 28}) do
+                if h <= rise + 8 then
+                    local s = SurfaceIn(x, z, feet + h + 2.5, 5, rp)
+                    local gain = s and s.Y - feet
+                    if gain and gain >= 2 and gain <= rise + 5 then
+                        cands[#cands + 1] = {p = s + Vector3.new(0, 3, 0), gain = gain, d = d,
+                            score = gain * 4 - d * 0.35 + (toward and u:Dot(toward) * 4 or 0)}
+                    end
+                end
+            end
+        end
+    end
+    if #cands == 0 then return nil end
+    -- Highest reachable first.
+    table.sort(cands, function(x, y) return x.score > y.score end)
+    for i = 1, math.min(#cands, 6) do
+        local r = Route(from, cands[i].p, {{2, 60}, {1.5, 70}})
+        if r then
+            climbTo, climbAt = cands[i].p, now
+            print(("[DQR] No route up - climbing: %d studs up, %d away.")
+                :format(cands[i].gain, cands[i].d))
+            return r
+        end
+    end
+    -- The navmesh has none of them: hop onto the nearest step a jump away.
+    for _, c in ipairs(cands) do
+        if c.d <= 12 and c.gain <= CONFIG.JumpMax - 1 and LineClear(from, c.p) then
+            return {{Position = c.p, Action = Enum.PathWaypointAction.Jump}}
+        end
+    end
+    return nil
+end
+
 -- A route to `to`, or, when there is none, a route to somewhere
 -- reachable and closer: the stairs off to one side, a ramp behind us.
 -- It is hill-climbing on the navmesh, one leg at a time. The strictest
@@ -3613,11 +3737,14 @@ local function ComputePath(from, to)
     pathFails = pathFails + 1
     local now = tick()
     -- The goal is up a level and there is no route: take the stairs,
-    -- straight away. The flat-map pass knows every step and ramp, so
-    -- there is no need to steer at the goal or search the whole area
-    -- first - that is what had the bot walking at the platform and
-    -- re-routing for half a minute with the stairs right beside it.
+    -- straight away, instead of steering at the goal or searching the
+    -- whole area first - that is what had the bot walking at the
+    -- platform and re-routing for half a minute with the stairs right
+    -- beside it. Looked for first; the flat-map pass's list of ramps
+    -- and step blocks is the backup.
     if to.Y - from.Y > CONFIG.JumpMax then
+        local climb = ClimbLead(from, to)
+        if climb then return climb end
         local lead = Look.StairLead(from, to)
         if lead then
             -- Round anything in the way to the foot of it, then climb.
@@ -3668,7 +3795,9 @@ local function ComputePath(from, to)
     -- 3. Fan out. Height gained toward a target above us is worth more
     -- than horizontal progress: that is what a staircase looks like.
     local up, cands = to.Y - from.Y, {}
-    local w = math.abs(up) > 25 and 4 or 2
+    -- With the goal on another level, height is what counts: getting
+    -- closer underneath it only leads to a dead end below the platform.
+    local w = math.abs(up) > CONFIG.JumpMax and 5 or 2
     for deg = 0, 345, 15 do
         local a = math.rad(deg)
         for _, dist in ipairs({20, 35, 55, 80}) do
@@ -5679,7 +5808,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.4 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.5 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
