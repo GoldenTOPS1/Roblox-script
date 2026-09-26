@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.1
+--  DQR AUTO FARM v12.2
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -68,11 +68,12 @@ local CONFIG = {
     ShowLog        = false,  -- log window starts hidden; F7 shows it
     ShowDest       = true,   -- green ball where the bot is heading
     -- The map itself, on your screen only:
-    --   "flat" - walls, pillars, props and decor vanish and stop
-    --            blocking you; floors stay solid, repainted as a grey
-    --            baseplate. Mobs stay where they are. With nothing in
-    --            the way the bot walks straight at things.
-    --   "hide" - the same look, but everything keeps its collision.
+    --   "flat" - decor vanishes and walls turn invisible AND walk-
+    --            through; everything you can stand on (floors, stairs,
+    --            ramps, platforms) stays solid, repainted as a grey
+    --            baseplate. Mobs stay where they are. With the walls
+    --            out of the way the bot walks straight at things.
+    --   "hide" - the same look, but walls keep their collision.
     --   "off"  - leave the map alone.
     MapMode        = "flat",
     FloorColor     = Color3.fromRGB(96, 104, 116), -- nil = keep each floor's colour
@@ -109,7 +110,7 @@ local CONFIG = {
     CameraHeight   = 12,
     CameraBack     = 17,
     SetWalkSpeed   = true,
-    WalkSpeed      = 19,
+    WalkSpeed      = 19.5,
 
     -- ---- TARGETING ---------------------------------------------
     PreferBoss     = true,   -- a boss outranks the adds it summons
@@ -2827,16 +2828,29 @@ task.spawn(function()
 end)
 
 -- ---- flat map -------------------------------------------------
--- Floors stay solid and are repainted as a grey baseplate; everything
--- else under the map folders - walls, pillars, props, decor - turns
--- invisible and, in "flat", non-solid and invisible to raycasts. Walls
--- that are ALREADY invisible are the map's edges and are kept, or the
--- bot could walk off the world. Doors count as walls: if a dungeon
--- needs its doors, set MapMode = "hide" in that dungeon's profile.
+-- What stays is decided by what could be WALKED ON, not by what looks
+-- like floor. Everything solid stays solid - floors, stairs, ramps,
+-- step blocks, platforms, big rocks - repainted as a grey baseplate.
+-- Only two kinds of thing go:
+--   * decoration that was not solid anyway: hidden.
+--   * walls: a panel standing on end, at most WALL_THICK studs thick
+--     and taller than a jump, with NOTHING solid meeting its top edge.
+--     Hidden, and in "flat" non-solid too, so the bot walks straight
+--     through. The top-edge test is what spares a staircase built from
+--     step blocks - every step touches the next one up or down - where
+--     a wall between two rooms has only air along its top.
+-- v12.0 went by shape alone: a sloped staircase or a step block is
+-- taller than it is wide, so it read as a wall and was removed, and
+-- Volcanic Chambers' upper platforms were left floating.
+-- Walls that are ALREADY invisible are the map's edges and are kept.
+-- Doors are walls: if a dungeon needs its doors shut, use "hide".
 local STUDS = "rbxassetid://6372755229"      -- the Baseplate's own stud texture
 local SKIP = {camera = true, lighting = true, terrain = true}
-local done = setmetatable({}, {__mode = "k"})   -- part -> "floor" / "gone" / "edge"
-local orig = setmetatable({}, {__mode = "k"})   -- part -> saved properties
+local WALL_THICK, WALL_MIN_H = 6, 7.5        -- a jump clears about 7
+local done  = setmetatable({}, {__mode = "k"})  -- part -> "ground"/"wall"/"decor"/"edge"
+local orig  = setmetatable({}, {__mode = "k"})  -- part -> saved properties
+local walls = setmetatable({}, {__mode = "k"})  -- parts taken out as walls
+local newGround = {}                            -- where ground streamed in lately
 Look.mapMode = nil
 
 local function FolderSet()
@@ -2872,16 +2886,53 @@ local function Extents(o)
     return height, math.min(a, b), math.max(a, b)
 end
 
--- Something you stand on: a slab, a step, a ramp, a big block.
-local function FloorLike(o)
-    if o:IsA("WedgePart") or o:IsA("CornerWedgePart") or o:IsA("TrussPart") then return true end
-    if o:IsA("Part") and (o.Shape == Enum.PartType.Wedge
-                          or o.Shape == Enum.PartType.CornerWedge) then
-        return true
+-- A part's shortest own axis, and how thick it is along it.
+local function ThinAxis(o)
+    local cf, s = o.CFrame, PartSize(o)
+    if s.X <= s.Y and s.X <= s.Z then return cf.RightVector, s.X end
+    if s.Y <= s.Z then return cf.UpVector, s.Y end
+    return cf.LookVector, s.Z
+end
+
+-- Shaped like a wall: standing on end (its thin axis roughly level -
+-- a ramp's thin axis points up out of its surface, so no ramp or
+-- slope passes), thin, and taller than a jump. Wedges never are.
+local function WallLike(o)
+    if o:IsA("WedgePart") or o:IsA("CornerWedgePart") or o:IsA("TrussPart") then return false end
+    if o:IsA("Part") and o.Shape ~= Enum.PartType.Block and o.Shape ~= Enum.PartType.Cylinder then
+        return false
     end
-    local height, lo, hi = Extents(o)
-    if height <= 3 and hi >= 4 then return true end
-    return lo >= 8 and height <= lo * 1.5
+    local axis, thin = ThinAxis(o)
+    if thin > WALL_THICK or math.abs(axis.Y) > 0.5 then return false end
+    local height, _, long = Extents(o)
+    return height >= WALL_MIN_H and long >= 4
+end
+
+-- Something solid meets this panel's top edge, on either face, within
+-- a step's height: the next step of a staircase, a landing, the
+-- platform it holds up. Three probes along each face.
+local function TopConnected(o)
+    local axis, thin = ThinAxis(o)
+    local across = Vector3.new(axis.X, 0, axis.Z)
+    if across.Magnitude < 0.1 then return true end
+    across = across.Unit
+    local along = Vector3.new(-across.Z, 0, across.X)
+    local height, _, long = Extents(o)
+    local c = o.Position
+    local top = c.Y + height / 2
+    local rp = RaycastParams.new()
+    rp.FilterType = EXCLUDE
+    rp.FilterDescendantsInstances = {GetChar(), o}
+    rp.IgnoreWater = true
+    for _, side in ipairs({1, -1}) do
+        for _, f in ipairs({0, 0.3, -0.3}) do
+            local p = Vector3.new(c.X, top + 4, c.Z)
+                + across * (side * (thin / 2 + 1.5)) + along * (f * long)
+            local hit = workspace:Raycast(p, Vector3.new(0, -8, 0), rp)
+            if hit and hit.Instance.CanCollide then return true end
+        end
+    end
+    return false
 end
 
 -- Which face of a block points up, for the stud texture.
@@ -2895,44 +2946,102 @@ local function UpFace(cf)
     return face
 end
 
-local function Strip(o, mode)
+-- Grey baseplate look. Lava, glowing panels and anything else in a
+-- warning colour keep their looks: they may hurt, and you should still
+-- see them.
+local function Repaint(o)
+    if o.Material == Enum.Material.Neon or Haz.WarnColor(o.Color) then return end
+    if CONFIG.FloorColor then o.Color = CONFIG.FloorColor end
+    o.Material = Enum.Material.SmoothPlastic
+    for _, d in ipairs(o:GetChildren()) do
+        if d:IsA("Decal") or d:IsA("Texture") then pcall(function() d.Transparency = 1 end) end
+    end
+    if CONFIG.FloorStuds and o.ClassName == "Part" and o.Shape == Enum.PartType.Block
+    and not o:FindFirstChild("DQR_Studs") then
+        local face = UpFace(o.CFrame)
+        if face then
+            local tx = Instance.new("Texture")
+            tx.Name, tx.Texture, tx.Face = "DQR_Studs", STUDS, face
+            tx.StudsPerTileU, tx.StudsPerTileV = 8, 8
+            tx.Color3, tx.Transparency = Color3.new(0, 0, 0), 0.8
+            tx.Parent = o
+        end
+    end
+end
+
+local function Vanish(o)
+    o.LocalTransparencyModifier = 1
+    for _, d in ipairs(o:GetChildren()) do pcall(function()
+        if d:IsA("Decal") or d:IsA("Texture") then d.Transparency = 1
+        elseif d:IsA("SurfaceGui") or d:IsA("BillboardGui") or d:IsA("Light")
+            or d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail") then
+            d.Enabled = false
+        end
+    end) end
+end
+
+local function Strip(o, mode, streamed)
     if done[o] or o.Name:sub(1, 4) == "DQR_" then return end
     if o.CanCollide and o.Transparency >= 0.99 then done[o] = "edge" return end
     orig[o] = {cc = o.CanCollide, cq = o.CanQuery, ltm = o.LocalTransparencyModifier,
                mat = o.Material, col = o.Color}
-    if o.CanCollide and FloorLike(o) then
-        done[o] = "floor"
-        if CONFIG.FloorColor then o.Color = CONFIG.FloorColor end
-        o.Material = Enum.Material.SmoothPlastic
-        for _, d in ipairs(o:GetChildren()) do
-            if d:IsA("Decal") or d:IsA("Texture") then pcall(function() d.Transparency = 1 end) end
-        end
-        if CONFIG.FloorStuds and o.ClassName == "Part" and o.Shape == Enum.PartType.Block then
-            local face = UpFace(o.CFrame)
-            if face then
-                local tx = Instance.new("Texture")
-                tx.Name, tx.Texture, tx.Face = "DQR_Studs", STUDS, face
-                tx.StudsPerTileU, tx.StudsPerTileV = 8, 8
-                tx.Color3, tx.Transparency = Color3.new(0, 0, 0), 0.8
-                tx.Parent = o
-            end
-        end
-    else
-        done[o] = "gone"
-        o.LocalTransparencyModifier = 1
-        for _, d in ipairs(o:GetChildren()) do pcall(function()
-            if d:IsA("Decal") or d:IsA("Texture") then d.Transparency = 1
-            elseif d:IsA("SurfaceGui") or d:IsA("BillboardGui") or d:IsA("Light")
-                or d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail") then
-                d.Enabled = false
-            end
-        end) end
-        if mode == "flat" and o.CanCollide then
+    if not o.CanCollide then
+        done[o] = "decor"
+        Vanish(o)
+    elseif WallLike(o) and not TopConnected(o) then
+        done[o] = "wall"
+        walls[o] = true
+        Vanish(o)
+        if mode == "flat" then
             o.CanCollide = false
             o.CanQuery = false       -- rays and overlaps skip it too
         end
+    else
+        done[o] = "ground"
+        Repaint(o)
+        if streamed then newGround[#newGround + 1] = o.Position end
     end
 end
+
+-- A wall judged before the steps beside it had streamed in. Walls near
+-- ground that arrived since are looked at again, and any that now turn
+-- out to be part of a staircase are given back.
+local function Unwall(w)
+    local v = orig[w]
+    walls[w] = nil
+    if v then
+        w.CanCollide = v.cc
+        w.CanQuery = v.cq
+        w.LocalTransparencyModifier = v.ltm
+    end
+    done[w] = "ground"
+    Repaint(w)
+end
+task.spawn(function()
+    while true do
+        S(1)
+        if #newGround > 0 then
+            local pts = newGround
+            newGround = {}
+            local n = 0
+            for w in pairs(walls) do
+                if not w.Parent then
+                    walls[w] = nil
+                else
+                    for _, p in ipairs(pts) do
+                        if (w.Position - p).Magnitude < 40 then
+                            n = n + 1
+                            local ok, joined = pcall(TopConnected, w)
+                            if ok and joined then pcall(Unwall, w) end
+                            break
+                        end
+                    end
+                    if n >= 60 then task.wait() n = 0 end
+                end
+            end
+        end
+    end
+end)
 
 -- The map folders themselves: any child of the workspace (or one level
 -- down) named like one of CONFIG.MapFolders.
@@ -2974,22 +3083,23 @@ function Look.ApplyMap()
                 if o:IsA("BasePart") and not done[o] and IsScenery(o, want)
                 and not Haz.NameHas(o, CONFIG.HazardNames)
                 and (not recentParts[o] or LooksBuilt(o)) then
-                    pcall(Strip, o, mode)
+                    pcall(Strip, o, mode, false)
                     n = n + 1
-                    if n % 400 == 0 then task.wait() end
+                    if n % 300 == 0 then task.wait() end
                 end
             end
         end
-        local floors, gone = 0, 0
-        for _, v in pairs(done) do
-            if v == "floor" then floors = floors + 1 elseif v == "gone" then gone = gone + 1 end
-        end
+        local count = {ground = 0, wall = 0, decor = 0, edge = 0}
+        for _, v in pairs(done) do count[v] = (count[v] or 0) + 1 end
         if #roots == 0 then
             print("[DQR] Map look: no map folder found (looked for "
                 .. "CONFIG.MapFolders under the workspace) - leaving it alone.")
         else
-            print(("[DQR] Map look '%s': %d floor part(s) repainted, %d part(s) hidden.")
-                :format(mode, floors, gone))
+            print(("[DQR] Map look '%s': %d solid part(s) kept as baseplate, %d wall(s) %s, "
+                .. "%d decoration(s) hidden, %d map edge(s) kept.")
+                :format(mode, count.ground, count.wall,
+                        mode == "flat" and "made walk-through" or "hidden",
+                        count.decor, count.edge))
         end
     end)
 end
@@ -3003,7 +3113,7 @@ workspace.DescendantAdded:Connect(function(o)
     task.delay(1.5, function()
         if not o.Parent or done[o] or not Look.mapMode then return end
         if (o.Position - at).Magnitude > 0.5 or not LooksBuilt(o) then return end
-        pcall(Strip, o, Look.mapMode)
+        pcall(Strip, o, Look.mapMode, true)
     end)
 end)
 
@@ -3022,6 +3132,8 @@ function Look.RestoreMap()
     end
     table.clear(orig)
     table.clear(done)
+    table.clear(walls)
+    newGround = {}
     print("[DQR] Map restored (decals stay stripped).")
 end
 end
@@ -5087,7 +5199,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.1 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.2 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
