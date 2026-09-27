@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.13
+--  DQR AUTO FARM v12.14
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -163,7 +163,9 @@ local CONFIG = {
     EvadeMax       = 26,     -- furthest a hazard exit may be
     EvadeFar       = 45,     -- no exit that close: look this far before
                              -- giving up and trading hits
-    EvadeClear     = 1.5,    -- an exit's hitbox must sit this far clear
+    EvadeClear     = 0.5,    -- an exit's hitbox must sit this far clear (the
+                             -- hitbox has HitboxPad of margin already; 1.5 on
+                             -- top left no exit in a dense pattern)
     DodgeStep      = 8,      -- sidestep from a projectile
     DodgeLead      = 0.6,    -- a moving or growing hazard also counts where
                              -- it will be this many seconds from now, so
@@ -1061,14 +1063,21 @@ local function HookAnimator(pl, a, char)
     pcall(Core)
     a.AnimationPlayed:Connect(function(track)
         local anim = track.Animation
-        if anim and core[anim.AnimationId] then return end
-        local n = ((anim and anim.Name or "") .. " " .. track.Name):lower()
-        for _, w in ipairs(MOVE_WORDS) do
-            if n:find(w, 1, true) then return end
-        end
         if next(core) == nil then pcall(Core) end      -- Animate loads late
         if anim and core[anim.AnimationId] then return end
+        -- Walking and idling play at Core / Idle priority. A name is only
+        -- trusted when it IS a move word ("Run2"), not when it merely
+        -- contains one - "run" is in "Rune", "land" in "Island".
+        local pr = track.Priority
+        if pr == Enum.AnimationPriority.Core or pr == Enum.AnimationPriority.Idle then return end
+        for _, nm in ipairs({anim and anim.Name or "", track.Name}) do
+            local w = nm:lower():gsub("%d", ""):gsub("%s", "")
+            for _, mw in ipairs(MOVE_WORDS) do
+                if w == mw then return end
+            end
+        end
         castAt[pl] = tick()
+        if pl == LP then Haz.castVia = "animation" end
     end)
 end
 local function HookCharacter(pl, char)
@@ -1092,6 +1101,7 @@ Players.PlayerRemoving:Connect(function(pl) castAt[pl] = nil end)
 -- animation did.
 task.spawn(function()
     local labels, last, scanAt = {}, {}, 0
+    local logged, shown = nil, 0
     while true do
         S(0.1)
         local now = tick()
@@ -1103,10 +1113,11 @@ task.spawn(function()
             local vp = cam and cam.ViewportSize
             if pg and vp then
                 for _, o in ipairs(pg:GetDescendants()) do
-                    if o:IsA("TextLabel") and not (LogGui and o:IsDescendantOf(LogGui)) then
+                    if (o:IsA("TextLabel") or o:IsA("TextButton"))
+                    and not (LogGui and o:IsDescendantOf(LogGui)) then
                         local p, s = o.AbsolutePosition, o.AbsoluteSize
                         local cx = p.X + s.X / 2
-                        if p.Y > vp.Y * 0.7 and cx > vp.X * 0.25 and cx < vp.X * 0.75 then
+                        if p.Y > vp.Y * 0.6 and cx > vp.X * 0.2 and cx < vp.X * 0.8 then
                             labels[#labels + 1] = o
                         end
                     end
@@ -1118,8 +1129,19 @@ task.spawn(function()
             local was = last[o]
             if v and v > 0.5 and v < 60 and (was == nil or v > was + 0.5) then
                 castAt[LP] = now
+                Haz.castVia = "cooldown"
             end
             last[o] = v
+        end
+        -- Say so for the first few casts, so a log shows at once whether
+        -- casts are being noticed at all.
+        local c = castAt[LP]
+        if c and c ~= logged then
+            logged, shown = c, shown + 1
+            if shown <= 3 then
+                print(("[DQR] Your spell cast noticed (by %s) - parts it makes near you "
+                    .. "are not hazards."):format(tostring(Haz.castVia)))
+            end
         end
     end
 end)
@@ -2571,6 +2593,7 @@ local warnAt, censusAt = setmetatable({}, {__mode = "k"}), setmetatable({}, {__m
 local srcFirst, srcLast, srcBan = setmetatable({}, {__mode = "k"}),
     setmetatable({}, {__mode = "k"}), setmetatable({}, {__mode = "k"})
 Haz.safe, Haz.orphans = {}, 0       -- safe zones / leftovers dropped, per sweep
+Haz.real = {}                       -- Haz.shapes without the look-ahead ghosts
 local firstSeen = setmetatable({}, {__mode = "k"})  -- source -> first footprint
 local castBy    = setmetatable({}, {__mode = "k"})  -- source -> a mob was near then
 local owners    = {}                                -- living mobs about: {p, r}
@@ -2710,10 +2733,17 @@ end
 -- moves into place instead of creating anew - those never "appear",
 -- so the birth check never sees them.
 local firstSight = setmetatable({}, {__mode = "k"})
+local firstNear = setmetatable({}, {__mode = "k"})  -- part -> nearest player then
 local function SpellOnSight(o)
     if firstSight[o] then return false end
     local now = tick()
     firstSight[o] = now
+    local near = math.huge
+    for _, c in ipairs(chars) do
+        local r = c:FindFirstChild("HumanoidRootPart")
+        if r then near = math.min(near, FlatDist(o.Position, r.Position)) end
+    end
+    firstNear[o] = near
     local ca = Haz.castAt
     if not ca then return false end
     for _, c in ipairs(chars) do
@@ -2944,6 +2974,7 @@ local function Add(h)
     end
     Bound(h)
     Haz.shapes[#Haz.shapes + 1] = h
+    Haz.real[#Haz.real + 1] = h
     local g = Ghost(h)
     if g then
         Bound(g)
@@ -3198,6 +3229,10 @@ local function Classify(o, pos, reach)
         -- A named tornado/whirlpool is a column like any other - its
         -- hitBox is usually invisible, so that is allowed here.
         local height, w = ColumnShape(o, true)
+        if height and (firstNear[o] or math.huge) < 6 then
+            Haz.spell[o] = true                     -- ours: see rule 3a
+            return
+        end
         if height then AddColumn(o, height, w) return end
         AddFootprint(o, CONFIG.TelegraphPad)
         return
@@ -3212,6 +3247,14 @@ local function Classify(o, pos, reach)
     -- one that did get through was sized from its height as a ball.
     do
         local height, w = ColumnShape(o)
+        -- A column that FIRST showed up on top of a player is that
+        -- player's spell - the Mage's red swirl looks exactly like a
+        -- whirlpool, and got a pillar. Real whirlpools start at the boss
+        -- and travel; they are first seen well away from us.
+        if height and (firstNear[o] or math.huge) < 6 then
+            Haz.spell[o] = true
+            return
+        end
         if height and (LooksActive(o) or WarnColor(o.Color) ~= nil) then
             if math.abs(o.Position.Y - pos.Y) < 10 + height / 2 then
                 AddColumn(o, height, w)
@@ -3391,6 +3434,7 @@ function Haz.Scan(pos)
     if now - Haz.t < CONFIG.HazardTTL then return end
     Haz.t = now
     table.clear(Haz.shapes)
+    table.clear(Haz.real)
     table.clear(Haz.safe)
     Haz.orphans = 0
     local done = {}
@@ -4983,8 +5027,11 @@ local function Worker(myGen)
         -- above us: on a staircase the line clears through the open air
         -- over the steps, and dropping the route walks us into the side
         -- of the flight.
-        local need = Nav.force or (flat > CONFIG.PathMinDist
-                     and (rise > CONFIG.JumpMax or not LineClear(pos, goal)))
+        -- A dodge (Nav.direct) is a short step picked because the way is
+        -- clear: walk it now, never stop to route it - computing a path
+        -- yields, and the bot stood in the hazard while it did.
+        local need = not Nav.direct and (Nav.force or (flat > CONFIG.PathMinDist
+                     and (rise > CONFIG.JumpMax or not LineClear(pos, goal))))
         if need then
             local moved = Nav.qGoal and (goal - Nav.qGoal).Magnitude or 1e9
             if Nav.force or moved > CONFIG.RepathDist or #Nav.queue == 0 then
@@ -5063,7 +5110,7 @@ local function Heartbeat(dt)
     local step = goal
     if Nav.unstick and now < Nav.unstickUntil then
         step = pos + Nav.unstick * CONFIG.UnstickDist
-    elseif goal and #Nav.queue > 0 then
+    elseif goal and #Nav.queue > 0 and not Nav.direct then
         local wp = Nav.queue[1]
         -- Reached only when close in BOTH axes: judging on X/Z alone
         -- popped the waypoint on top of a ledge while we stood under it.
@@ -5472,7 +5519,9 @@ local function PickExit(pos, aim, keepR, heading, maxD, fallback)
         end
     end
     table.sort(cands, function(x, y) return x.s < y.s end)
-    for i = 1, math.min(#cands, 5) do
+    -- Up to ten tried (five used to be all, and in a busy pattern all
+    -- five paths crossed something - so it stood still instead).
+    for i = 1, math.min(#cands, 10) do
         local p = cands[i].p
         if not Haz.OnPath(pos, p, near) and LineClear(pos, p)
         and HasGround(p) and GroundOnPath(pos, p) then
@@ -5503,9 +5552,15 @@ local function PickExit(pos, aim, keepR, heading, maxD, fallback)
     -- Best first; the walk there must not cross into another hazard -
     -- no leaving the gap we are in for one past a strip.
     table.sort(cands2, function(x, y) return x.s > y.s end)
-    for i = 1, math.min(#cands2, 8) do
+    for i = 1, math.min(#cands2, 10) do
         local p = cands2[i].p
         if not Haz.OnPath(pos, p, near) and LineClear(pos, p) and HasGround(p) then return p end
+    end
+    -- Last resort: every way out crosses something. Standing here is a
+    -- sure hit; the best spot, crossing a strip on the way, may not be.
+    for i = 1, math.min(#cands2, 10) do
+        local p = cands2[i].p
+        if LineClear(pos, p) and HasGround(p) then return p end
     end
     return nil
 end
@@ -5943,7 +5998,7 @@ function Brain.Tick(root)
         if want and Blink(root, want) then
             want, Brain.state = nil, "Blinked into the safe zone"
         end
-        Nav.goal = want
+        Nav.goal, Nav.direct = want, true
         settleUntil = now + 1.5
         -- Time spent in here is not time failing to reach the target.
         if prog then prog.since = now end
@@ -5977,15 +6032,17 @@ function Brain.Tick(root)
         local reached = FlatDist(evade.goal, pos) <= 2
         if reached then settleUntil = now + 1.5 end
         -- A new footprint landed on the spot we were heading for:
-        -- drop it and pick again straight away.
-        if reached or now > evade.untilT or Haz.BoxClear(evade.goal, true) < 0 then
+        -- drop it and pick again straight away. Real footprints only:
+        -- a growing one's look-ahead ghost reaching it had the bot drop
+        -- and re-pick its way out over and over, standing still.
+        if reached or now > evade.untilT or Haz.BoxClear(evade.goal, true, Haz.real) < 0 then
             evade = nil
             if not reached then lastPick = 0 end
         else
             goal, state = evade.goal, "Stepping out of a hazard"
         end
     end
-    if not goal and inHaz and now - lastPick > 0.15 then
+    if not goal and inHaz and now - lastPick > 0.05 then
         lastPick = now
         local heading = nil
         if Nav.goal then
@@ -6006,6 +6063,8 @@ function Brain.Tick(root)
             goal, state = p, "Stepping out of a hazard"
         end
     end
+    -- Dodges and exits are walked straight, never routed.
+    local direct = goal ~= nil
     -- Dodging is not failing to reach the target: keep its progress
     -- clock from running out (that is what latched "Cannot reach Lava
     -- King - casting from here" after a spell of dodging).
@@ -6100,6 +6159,7 @@ function Brain.Tick(root)
         state = state .. " (in a hazard, no clean exit)"
     end
     Nav.goal = goal
+    Nav.direct = direct and goal ~= nil
     Brain.state = state
     Say(state)
 end
@@ -7092,7 +7152,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.13 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.14 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
