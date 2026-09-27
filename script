@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.10
+--  DQR AUTO FARM v12.11
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -20,9 +20,9 @@ local CONFIG = {
     -- The dungeon to run. This also picks the settings: whatever that
     -- dungeon's entry in MAP_PROFILES (further down) says is used for
     -- the run, on top of the defaults in this CONFIG block.
-    TargetDungeon  = "Volcanic Chambers",
+    TargetDungeon  = "Northern Lands",
     Difficulty     = "Nightmare",
-    Hardcore       = true,  -- true = also press HARDCORE MODE
+    Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
     -- CARRY MODE: after creating the lobby, wait on the party screen
@@ -1016,7 +1016,52 @@ end
 -- new part is checked a moment after it arrives, once whatever made it
 -- has had a frame to put it in place: if its nearest point is more than
 -- StreamFar studs from us, it is scenery, not new.
+do
 local bornQ = {}
+-- Named attack volumes ("<attack>.precast" / ".hitBox", tornadoes...),
+-- wherever they are, however long they live, CanQuery or not. They used
+-- to be reached only through the spatial query (CanQuery on), the
+-- recently-born list (eight seconds, and emptied of anything that
+-- appeared far away) or the hidden-part list (which skipped anything
+-- inside a creature's model) - a whirlpool that is spawned beside the
+-- boss and then travels to us passed through none of them.
+Haz.named = {}
+-- OUR SPELLS. When any player's character starts a spell animation
+-- (anything the Animate script does not play), parts that appear
+-- around that player in the next second are that spell - the bot's
+-- own ice fan and red rings read as hazards and set the hitbox off.
+-- Marked parts, and everything later added under the same model, are
+-- never hazards (see IsOurs).
+Haz.spell = {}                                   -- part -> true
+local spellModel = {}                            -- model -> true
+local castAt = {}                                -- player -> last spell cast
+local CAST_WINDOW, CAST_RADIUS = 1.0, 20
+local MOVE_WORDS = {"idle", "walk", "run", "jump", "fall", "climb", "swim", "sit", "land", "toolnone"}
+local function HookAnimator(pl, a)
+    a.AnimationPlayed:Connect(function(track)
+        local n = ((track.Animation and track.Animation.Name or "") .. " " .. track.Name):lower()
+        for _, w in ipairs(MOVE_WORDS) do
+            if n:find(w, 1, true) then return end
+        end
+        if track.Priority.Value >= Enum.AnimationPriority.Action.Value then castAt[pl] = tick() end
+    end)
+end
+local function HookCharacter(pl, char)
+    local function Try(d)
+        if d:IsA("Animator") then pcall(HookAnimator, pl, d) end
+    end
+    for _, d in ipairs(char:GetDescendants()) do Try(d) end
+    char.DescendantAdded:Connect(Try)
+end
+local function HookPlayer(pl)
+    if pl.Character then HookCharacter(pl, pl.Character) end
+    pl.CharacterAdded:Connect(function(c) HookCharacter(pl, c) end)
+end
+for _, pl in ipairs(Players:GetPlayers()) do HookPlayer(pl) end
+Players.PlayerAdded:Connect(HookPlayer)
+Players.PlayerRemoving:Connect(function(pl) castAt[pl] = nil end)
+Haz.castAt = castAt
+
 workspace.DescendantAdded:Connect(function(o)
     if o:IsA("Beam") then
         beamObjects[o] = true
@@ -1049,31 +1094,77 @@ task.spawn(function()
             bornQ = {}
             local root = GetRoot()
             local me = root and root.Position
-            -- Every player's position, for telling their spells (which
-            -- appear on them) from attacks.
-            local people = {}
+            -- Every player: where they are, their names, and whether
+            -- they cast a spell a moment ago.
+            local people, names = {}, {}
             for _, pl in ipairs(Players:GetPlayers()) do
                 local r = pl.Character and pl.Character:FindFirstChild("HumanoidRootPart")
-                if r then people[#people + 1] = r.Position end
+                if r then
+                    people[#people + 1] = {p = r.Position,
+                        cast = castAt[pl] ~= nil and t - castAt[pl] < CAST_WINDOW}
+                end
+                names[#names + 1] = pl.Name:lower()
+                if pl.DisplayName ~= pl.Name then names[#names + 1] = pl.DisplayName:lower() end
             end
             for _, o in ipairs(q) do
-                if o.Parent and recentParts[o] then
-                    for _, pp in ipairs(people) do
-                        if (o.Position - pp).Magnitude < 8 then playerBorn[o] = true break end
+                if o.Parent then
+                    -- Settings are often filled in just after parenting,
+                    -- so these are asked here rather than on arrival.
+                    if Haz.NameHas and Haz.NameHas(o, CONFIG.HazardNames) then Haz.named[o] = true end
+                    if not o.CanQuery and not hiddenParts[o] and Haz.Track and Haz.Track(o) then
+                        hiddenParts[o] = true
                     end
-                end
-                if me and recentParts[o] and o.Parent then
-                    local ok, d = pcall(function()
-                        local h = o.Size / 2
-                        local rel = o.CFrame:PointToObjectSpace(me)
-                        return (rel - Vector3.new(math.clamp(rel.X, -h.X, h.X),
-                            math.clamp(rel.Y, -h.Y, h.Y), math.clamp(rel.Z, -h.Z, h.Z))).Magnitude
-                    end)
-                    if ok and d > CONFIG.StreamFar then
-                        recentParts[o], streamed[o] = nil, true
+                    -- A spell: born beside a player who just cast, or
+                    -- under a model already known to be one, or named
+                    -- after a player.
+                    local spell = false
+                    local m = o:FindFirstAncestorOfClass("Model")
+                    if m and spellModel[m] then spell = true end
+                    if not spell then
+                        for _, pp in ipairs(people) do
+                            if pp.cast and (o.Position - pp.p).Magnitude < CAST_RADIUS then
+                                spell = true break
+                            end
+                        end
+                    end
+                    if not spell then
+                        local n = o.Name:lower() .. " " .. (o.Parent.Name:lower())
+                        for _, nm in ipairs(names) do
+                            if #nm >= 3 and n:find(nm, 1, true) then spell = true break end
+                        end
+                    end
+                    if spell then
+                        Haz.spell[o] = true
+                        if m and not IsCreature(m) and not Players:GetPlayerFromCharacter(m) then
+                            spellModel[m] = true
+                        end
+                    end
+                    for _, pp in ipairs(people) do
+                        if (o.Position - pp.p).Magnitude < 8 then playerBorn[o] = true break end
+                    end
+                    -- Streaming: arrived far away. Kept in the recent list
+                    -- (effects with CanQuery off are found through it), but
+                    -- never counted as "new".
+                    if me and recentParts[o] then
+                        local ok, d = pcall(function()
+                            local h = o.Size / 2
+                            local rel = o.CFrame:PointToObjectSpace(me)
+                            return (rel - Vector3.new(math.clamp(rel.X, -h.X, h.X),
+                                math.clamp(rel.Y, -h.Y, h.Y), math.clamp(rel.Z, -h.Z, h.Z))).Magnitude
+                        end)
+                        if ok and d > CONFIG.StreamFar then streamed[o] = true end
                     end
                 end
             end
+        end
+    end
+end)
+-- Named attack volumes already in the game when the script starts.
+task.spawn(function()
+    S(1.5)
+    for _, o in ipairs(workspace:GetDescendants()) do
+        if o:IsA("BasePart") and Haz.NameHas and Haz.NameHas(o, CONFIG.HazardNames) then
+            Haz.named[o] = true
         end
     end
 end)
@@ -1084,7 +1175,9 @@ end)
 -- nobody had looked at for a moment simply fell out of the list.
 workspace.DescendantRemoving:Connect(function(o)
     beamObjects[o], recentParts[o], hiddenParts[o], playerBorn[o] = nil, nil, nil, nil
+    Haz.named[o], Haz.spell[o], spellModel[o] = nil, nil, nil
 end)
+end
 pcall(function()
     game.DescendantAdded:Connect(function(o)
         if IsAdorn(o) then adornObjects[o] = true end
@@ -1140,7 +1233,7 @@ end
 function LooksActive(o, fresh)
     local now  = tick()
     local born = recentParts[o]
-    local new  = born ~= nil and now - born < CONFIG.RecentWindow
+    local new  = born ~= nil and now - born < CONFIG.RecentWindow and not streamed[o]
     fresh = fresh == true and CONFIG.FreshSightRule == true
 
     local rec = seen[o]
@@ -2409,10 +2502,21 @@ end
 -- The Ancient Lava Mage's orange floor lines live inside the boss, and
 -- "everything in a creature is its body" hid them: the bot stood on
 -- one until the laser it marked fired.
+-- Also an attack: a loose part of it that has travelled well away from
+-- it (DetachedAt studs) - a whirlpool or orb the boss keeps in its own
+-- model and sends across the arena. Its body never gets that far from
+-- its root.
+local DETACHED_AT = 40
+local function CreatureRoot(model, hum)
+    return (typeof(hum) == "Instance" and hum.RootPart) or model.PrimaryPart
+        or model:FindFirstChild("HumanoidRootPart")
+end
 local function CreatureEffect(o, model, hum)
-    if o.CanCollide or not o.Anchored then return false end
-    local root = hum.RootPart or model.PrimaryPart
-    if root and o.AssemblyRootPart == root.AssemblyRootPart then return false end
+    if o.CanCollide then return false end
+    local root = CreatureRoot(model, hum)
+    if not o.Anchored and root and o.AssemblyRootPart == root.AssemblyRootPart then return false end
+    if root and FlatDist(o.Position, root.Position) > DETACHED_AT then return true end
+    if not o.Anchored then return false end
     local cf, s = o.CFrame, PartSize(o)
     local height = math.abs(cf.RightVector.Y) * s.X + math.abs(cf.UpVector.Y) * s.Y
                  + math.abs(cf.LookVector.Y) * s.Z
@@ -2423,30 +2527,44 @@ local function CreatureEffect(o, model, hum)
         or (sat >= 0.5 and val >= 0.6)
 end
 
+-- Built map, or a creature's own body: never an attack. The answer is
+-- remembered, except for loose parts inside a creature, which are asked
+-- again every time - a whirlpool born beside the boss is part of it
+-- until it moves away, and remembering "body" hid it for good.
 local function IsMapPart(o)
     local known = mapMemo[o]
-    if known ~= nil then return known end
+    if known == true or known == false then return known end
+    if type(known) == "table" then
+        if not known.m.Parent then mapMemo[o] = nil return true end
+        return not CreatureEffect(o, known.m, known.h)
+    end
     if not mapLower then
         mapLower = {}
         for k in pairs(CONFIG.MapFolders) do mapLower[k:lower()] = true end
     end
-    local n, depth, found = o.Parent, 0, false
+    local n, depth = o.Parent, 0
     while n and n ~= workspace and depth < 10 do
-        if mapLower[n.Name:lower()] then found = true break end
+        if mapLower[n.Name:lower()] then mapMemo[o] = true return true end
         -- A creature's own body and weapons are not attacks either
         -- (Lord Varosh's greatsword read as a laser) - but a marker it
-        -- is drawing on the floor is.
+        -- is drawing on the floor, or a piece it has thrown, is.
         if n:IsA("Model") then
             local hum = n:FindFirstChildOfClass("Humanoid") or (Mobs.models and Mobs.models[n])
             if hum then
-                found = not CreatureEffect(o, n, hum)
-                break
+                local root = CreatureRoot(n, hum)
+                if o.CanCollide or (not o.Anchored and root
+                   and o.AssemblyRootPart == root.AssemblyRootPart) then
+                    mapMemo[o] = true               -- the body itself
+                    return true
+                end
+                mapMemo[o] = {m = n, h = hum}
+                return not CreatureEffect(o, n, hum)
             end
         end
         n, depth = n.Parent, depth + 1
     end
-    mapMemo[o] = found
-    return found
+    mapMemo[o] = false
+    return false
 end
 
 local function NameHas(o, list)
@@ -2458,15 +2576,51 @@ local function NameHas(o, list)
     return false
 end
 
--- Anything this script made, our own spells, and anything on any
--- player's character.
+-- Stuck to a player: welded to one, or keeping the same offset from one
+-- while that player walks - an aura or glow that goes where they go.
+-- An attack aimed at us stays where it landed when we move away.
+local followRec = setmetatable({}, {__mode = "k"})
+local function FollowsPlayer(o)
+    local p = o.Position
+    local best, bestD = nil, 6
+    for _, c in ipairs(chars) do
+        local r = c:FindFirstChild("HumanoidRootPart")
+        if r then
+            if o.AssemblyRootPart == r.AssemblyRootPart then return true end
+            local d = FlatDist(p, r.Position)
+            if d < bestD then best, bestD = r, d end
+        end
+    end
+    if not best then followRec[o] = nil return false end
+    local off, rp = p - best.Position, best.Position
+    local rec = followRec[o]
+    if rec and rec.r == best then
+        if (rp - rec.rp).Magnitude > 1 then
+            -- The player moved: did the part come along?
+            if (off - rec.off).Magnitude < 0.8 then
+                rec.hits = rec.hits + 1
+                if rec.hits >= 2 then Haz.spell[o] = true return true end
+            else
+                rec.hits = 0
+            end
+            rec.off, rec.rp = off, rp
+        end
+        return false
+    end
+    followRec[o] = {r = best, off = off, rp = rp, hits = 0}
+    return false
+end
+
+-- Anything this script made, our own spells (Haz.spell: born beside a
+-- player who had just cast), anything on or stuck to a player.
 local function IsOurs(o)
     if o.Name:sub(1, 4) == "DQR_" then return true end
+    if Haz.spell and Haz.spell[o] then return true end
     if NameHas(o, CONFIG.IgnoreNames) then return true end
     for _, c in ipairs(chars) do
         if o:IsDescendantOf(c) then return true end
     end
-    return false
+    return FollowsPlayer(o)
 end
 
 -- This game's "about to be hit" colours, or nil. Being one does NOT
@@ -2811,23 +2965,29 @@ local function ZonesAround(pos, done)
     end
 end
 
--- Column-shaped: taller than wide, round from above, not solid, visible.
+-- Column-shaped: round from above, standing up (at least 0.6 times as
+-- tall as it is wide, and 5 studs tall), not solid. The Midgardian
+-- Champion's whirlpools are coils about as tall as they are wide - the
+-- old "clearly taller than wide" test never matched one. `named`
+-- allows an invisible one: the game's own hitBox for it.
 -- Returns height, width - or nil.
-local function ColumnShape(o)
-    if o.CanCollide or o.Transparency > 0.95 then return nil end
+local function ColumnShape(o, named)
+    if o.CanCollide or (o.Transparency > 0.95 and not named) then return nil end
     local height, a, b = Footprint(o)
     local w = math.max(a, b)
-    if height > 8 and height > w * 1.2 and w >= 4 and w <= CONFIG.RedMaxWide
+    if height >= 5 and height >= w * 0.6 and w >= 4 and w <= CONFIG.RedMaxWide
     and math.abs(a - b) <= w * 0.35 then
         return height, w
     end
     return nil
 end
 
--- A column's footprint, and a note for the pillar that follows it.
+-- A column's footprint, and a note for the pillar that follows it
+-- (drawn at least 12 studs tall, so it blocks properly).
 Haz.columns = {}                                   -- source -> {h, w, t}
 local function AddColumn(o, height, w)
-    AddDisc(o.Position, w / 2 + CONFIG.TelegraphPad, height / 2, o)
+    AddDisc(o.Position, w / 2 + CONFIG.TelegraphPad, math.max(height, 12) / 2, o)
+    height = math.max(height, 12)
     Haz.columns[o] = {h = height, w = w + CONFIG.TelegraphPad * 2, t = tick()}
 end
 
@@ -2883,14 +3043,16 @@ local function Classify(o, pos, reach)
             Haz.orphans = Haz.orphans + 1
             return
         end
-        -- A named tornado/whirlpool is a column like any other.
-        local height, w = ColumnShape(o)
+        -- A named tornado/whirlpool is a column like any other - its
+        -- hitBox is usually invisible, so that is allowed here.
+        local height, w = ColumnShape(o, true)
         if height then AddColumn(o, height, w) return end
         AddFootprint(o, CONFIG.TelegraphPad)
         return
     end
-    -- 2. The built map, unless it was added mid-run.
-    if IsMapPart(o) and not recentParts[o] then return end
+    -- 2. The built map, unless it was added mid-run (streamed-in map is
+    -- not "added mid-run"), and creatures' bodies.
+    if IsMapPart(o) and (not recentParts[o] or streamed[o]) then return end
     -- 3a. A column: taller than it is wide, round from above, not solid,
     -- and moving or in a warning colour - the Midgardian Champion's
     -- whirlpools. The danger is its footprint, sized from its WIDTH.
@@ -2932,14 +3094,8 @@ local function Classify(o, pos, reach)
     -- ones count as a line, compact ones as a ball. Not a player's own
     -- spell: those appear right on the player (playerBorn), and the
     -- bot's own ice fan must not send it running from itself.
-    local inCreature = false
-    do
-        local n, depth = o.Parent, 0
-        while n and n ~= workspace and depth < 10 do
-            if n:IsA("Model") and IsCreature(n) then inCreature = true break end
-            n, depth = n.Parent, depth + 1
-        end
-    end
+    -- A creature's body (a mob that spawned a moment ago moves too).
+    local inCreature = IsMapPart(o)
     if not o.CanCollide and o.Transparency <= 0.9 and not playerBorn[o] and not inCreature then
         local active, why = LooksActive(o)
         if active and why == "moved" then
@@ -3056,8 +3212,21 @@ function Haz.Track(o)
     if o.Name:sub(1, 4) == "DQR_" then return false end
     local s = PartSize(o)
     local mx = math.max(s.X, s.Y, s.Z)
-    if mx < CONFIG.TelegraphMinLen or mx > CONFIG.RedMaxWide * 2 then return false end
-    return not IsMapPart(o)
+    -- Down to 1.5 studs: a whirlpool may be built of thin strands, the
+    -- Frost Giant's bars are small. Parts inside a creature are kept
+    -- too (IsMapPart is not asked here) - they may be thrown attacks;
+    -- Classify still throws out the body itself.
+    if mx < 1.5 or mx > CONFIG.RedMaxWide * 2 then return false end
+    if not mapLower then
+        mapLower = {}
+        for k in pairs(CONFIG.MapFolders) do mapLower[k:lower()] = true end
+    end
+    local n, depth = o.Parent, 0
+    while n and n ~= workspace and depth < 10 do
+        if mapLower[n.Name:lower()] then return false end
+        n, depth = n.Parent, depth + 1
+    end
+    return true
 end
 
 Haz.IsOurs = IsOurs
@@ -3113,12 +3282,26 @@ function Haz.Scan(pos)
             if ok and d < reach then Try(p) end
         end
     end
+    -- Hidden (CanQuery off) and named parts: a cheap distance test
+    -- first - these lists can be long.
+    local function Near(p)
+        local s = p.Size
+        if (p.Position - pos).Magnitude > reach + math.max(s.X, s.Y, s.Z) then return false end
+        local ok, d = pcall(NearDist, p, pos)
+        return ok and d < reach
+    end
     for p in pairs(hiddenParts) do
         if not p.Parent then
             hiddenParts[p] = nil
-        elseif not done[p] then
-            local ok, d = pcall(NearDist, p, pos)
-            if ok and d < reach then Try(p) end
+        elseif not done[p] and Near(p) then
+            Try(p)
+        end
+    end
+    for p in pairs(Haz.named) do
+        if not p.Parent then
+            Haz.named[p] = nil
+        elseif not done[p] and Near(p) then
+            Try(p)
         end
     end
     ScanBeams(pos, reach)
@@ -3335,36 +3518,58 @@ function Haz.Diag()
         print(("[Hazard] %s <- %s"):format(Describe(h),
             h.src and h.src:GetFullName() or "?"))
     end
-    -- Brightly coloured parts near us that were NOT counted, and why:
-    -- when a telegraph is missed, this names it and the rule that let
-    -- it through.
+    -- Parts near us that were NOT counted, and why: anything in a warning
+    -- colour, named like an attack, moving, or kept on the hidden list.
+    -- When an attack is missed, this names it and the rule that let it
+    -- through.
     local counted = {}
     for _, h in ipairs(Haz.shapes) do if h.src then counted[h.src] = true end end
     for _, z in ipairs(Haz.safe) do counted[z.src] = true end
-    local n = 0
-    for _, o in ipairs(NearbyParts(pos, CONFIG.DodgeRange)) do
-        if n >= 15 then break end
-        if o:IsA("BasePart") and not counted[o] and o.Transparency < 0.95 then
+    local pool, seenP = {}, {}
+    local function Take(o)
+        if not seenP[o] and o:IsA("BasePart") and o.Parent then
+            seenP[o] = true
+            pool[#pool + 1] = o
+        end
+    end
+    for _, o in ipairs(NearbyParts(pos, CONFIG.DodgeRange)) do Take(o) end
+    for _, list in ipairs({hiddenParts, Haz.named}) do
+        for o in pairs(list) do
+            if o.Parent and (o.Position - pos).Magnitude < CONFIG.DodgeRange + 20 then Take(o) end
+        end
+    end
+    local n, spells = 0, 0
+    for _, o in ipairs(pool) do
+        if n >= 20 then break end
+        if not counted[o] then
             local warn = WarnColor(o.Color)
-            if warn then
+            local named = NameHas(o, CONFIG.HazardNames)
+            local active, what = LooksActive(o)
+            if Haz.spell[o] then
+                spells = spells + 1
+            elseif (warn and o.Transparency < 0.95) or named or (active and what == "moved") then
                 n = n + 1
                 local why
                 if IsOurs(o) then why = "ours / on a player"
-                elseif NameHas(o, CONFIG.HazardNames) then
-                    why = DeadOwner(o) and "named attack, caster dead" or "named attack, left over"
-                elseif IsMapPart(o) and not recentParts[o] then
+                elseif named then
+                    why = DeadOwner(o) and "named attack, caster dead"
+                          or "named attack, dropped (left over, or aged out)"
+                elseif IsMapPart(o) and (not recentParts[o] or streamed[o]) then
                     why = streamed[o] and "map part that streamed in (not new)"
                           or "map part or a creature's body"
                 else
                     local _, a, b = Footprint(o)
-                    local active, what = LooksActive(o)
                     why = ("failed the shape/activity tests (%dx%d footprint, %s)")
                         :format(a, b, active and ("active: " .. tostring(what)) or "not moving")
                 end
-                print(("[Not a hazard] %s %s size=%s: %s"):format(warn, o:GetFullName(),
-                    tostring(PartSize(o)), why))
+                print(("[Not a hazard] %s%s %s | %s size=%s canQuery=%s solid=%s: %s")
+                    :format(warn or "", named and " named" or "", o:GetFullName(), o.ClassName,
+                        tostring(PartSize(o)), tostring(o.CanQuery), tostring(o.CanCollide), why))
             end
         end
+    end
+    if spells > 0 then
+        print(("[DQR] %d part(s) near us ignored as players' own spells."):format(spells))
     end
     print("[DQR] === END HAZARD DIAG ===")
 end
@@ -5208,9 +5413,13 @@ local function SafeApproach(pos, goal)
     local len = d.Magnitude
     if len < 1 then return goal end
     local u = d / len
-    -- Only the next 40 studs matter this tick: it is looked at again
-    -- twenty times a second as we walk.
-    local span = math.min(len, 40)
+    -- Only the next 14 studs matter: it is looked at again twenty times
+    -- a second as we walk, and a strip further on will have fired and
+    -- gone by the time we reach it. Looking 40 studs ahead, some strip
+    -- was always in the way, and the bot stood at 80 studs from the
+    -- Midgardian Champion - out of spell range - "waiting for it to
+    -- clear" for most of the fight.
+    local span = math.min(len, 14)
     if not Haz.OnPath(pos, pos + u * span) then return goal end
     -- As far along the straight line as the hitbox gets without touching
     -- a hazard it is not already touching, or going deeper into one.
@@ -5233,15 +5442,17 @@ local function SafeApproach(pos, goal)
     -- "wait for it to clear" while the next volley came down; the gaps
     -- between the strips lead straight to the boss.
     -- Checked closest-first, so the (costly) path test usually runs once.
-    local here = FlatDist(pos, goal) - 1
+    -- Sideways counts too (a little further from the goal, never much):
+    -- stepping along a strip to the end of it is how to get round it.
+    local here = FlatDist(pos, goal)
     local cands = {}
     for i = 0, 15 do
         local a = i * math.pi / 8
         local v = Vector3.new(math.cos(a), 0, math.sin(a))
-        for _, s in ipairs({6, 10, 16, 24}) do
+        for _, s in ipairs({6, 10, 14}) do
             local p = pos + v * s
             local dd = FlatDist(p, goal)
-            if dd < here then cands[#cands + 1] = {p = p, d = dd} end
+            if dd < here + 6 then cands[#cands + 1] = {p = p, d = dd} end
         end
     end
     table.sort(cands, function(x, y) return x.d < y.d end)
@@ -6630,7 +6841,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.10 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.11 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
