@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.17
+--  DQR AUTO FARM v12.18
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -169,6 +169,13 @@ local CONFIG = {
                              -- hitbox has HitboxPad of margin already; 1.5 on
                              -- top left no exit in a dense pattern)
     DodgeStep      = 8,      -- sidestep from a projectile
+    -- WEAVING: with hazards close, ten times a second the bot picks the
+    -- best spot within 16 studs - clear of every edge, toward where it
+    -- wants to be, still in spell range - and steps to it. Constant
+    -- small moves, like the reference script. WeaveClear is how far
+    -- (beyond HitboxPad) it likes the box to stay from any edge.
+    Weave          = true,
+    WeaveClear     = 4,
     DodgeLead      = 0.6,    -- a moving or growing hazard also counts where
                              -- it will be this many seconds from now, so
                              -- the bot moves before it arrives (0 = off)
@@ -2173,7 +2180,11 @@ function Mobs.BossBar()
             -- not the boss bar: never look inside one.
             local isGui = c:IsA("GuiObject")
             if not c:IsA("LayerCollector") and (not isGui or c.Visible) then
-                if c:IsA("TextLabel") and c.AbsoluteSize.X >= 1
+                -- The boss bar is at the top of the screen: a health-like
+                -- reading lower down is something else (an item card).
+                local cam = workspace.CurrentCamera
+                local topY = cam and cam.ViewportSize.Y * 0.4 or math.huge
+                if c:IsA("TextLabel") and c.AbsoluteSize.X >= 1 and c.AbsolutePosition.Y < topY
                 and c.Text:find("/", 1, true) and c.Text:match(HP_READING) then
                     local cur, mx = c.Text:match("^%s*([^/]-)%s*/%s*(.-)%s*$")
                     local maxHp = ParseShort(mx)
@@ -2469,6 +2480,15 @@ function Mobs.Target()
         for _, rec in ipairs(open) do
             if rec.Boss and (not best or rec.Flat < best.Flat) then best = rec end
         end
+    end
+    -- Mobs we can already hit come before a bigger pack further off: the
+    -- pack bonus used to walk the bot away from mobs in spell range.
+    if not best then
+        local reach = {}
+        for _, rec in ipairs(open) do
+            if rec.Flat - rec.Radius <= CONFIG.AttackRange + 5 then reach[#reach + 1] = rec end
+        end
+        if #reach > 0 then open = reach end
     end
     if not best and CONFIG.PreferGroups and #open > 1 then
         local bestScore = -math.huge
@@ -5700,6 +5720,72 @@ local function PickExit(pos, aim, keepR, heading, maxD, fallback)
     return nil
 end
 
+-- WEAVING - the reference bot's dodging. Ten times a second, every spot
+-- within 16 studs (16 headings x 5 distances, plus where we stand) is
+-- scored on: how far the hitbox would be from the nearest hazard edge
+-- (up to WeaveClear - past that, safe is safe), how close it is to
+-- where we want to be, how far it is to walk, and, with a target,
+-- whether we could still cast from there. We go to the best spot whose
+-- walk crosses no hazard. The result is constant small steps that keep
+-- the box off every edge: into the gap between two strips, along it,
+-- sideways out of a beam, never through the next strip - while still
+-- closing in on the target. The look-ahead ghosts of moving hazards
+-- are scored too, so it steps aside before they arrive.
+-- Returns the spot (our own position when standing still is best, nil
+-- when every good spot's walk crosses something) and our own clearance.
+local weaveMemo = {t = 0}
+local WEAVE_R = {2.5, 5, 8, 12, 16}
+local function Weave(pos, desire, near, anchor, spellR, minR)
+    local now, m = tick(), weaveMemo
+    if now - m.t < 0.1 and m.pos and (pos - m.pos).Magnitude < 1.5
+    and ((desire == nil) == (m.desire == nil))
+    and (not desire or (desire - m.desire).Magnitude < 3) then
+        return m.spot, m.here
+    end
+    local cap = CONFIG.WeaveClear
+    local last = m.spot
+    local function Score(c, move)
+        local cl = Haz.BoxClear(c, true, near)
+        local s
+        if cl < 0 then s = -60 + cl * 6 else s = math.min(cl, cap) * 6 end
+        if desire then s = s - FlatDist(c, desire) * 0.5 end
+        s = s - move * 0.35
+        if anchor then
+            local d = FlatDist(c, anchor)
+            if spellR and d > spellR then s = s - (d - spellR) * 1.5 end
+            if minR and d < minR then s = s - (minR - d) * 1.5 end
+        end
+        -- A little loyalty to the spot picked last time: re-deciding from
+        -- scratch every tenth of a second would dither between two.
+        if last and FlatDist(c, last) < 2 then s = s + 1.5 end
+        return s, cl
+    end
+    local s0, here = Score(pos, 0)
+    local cands = {{p = pos, s = s0, move = 0}}
+    for i = 0, 15 do
+        local a = i * math.pi / 8
+        local u = Vector3.new(math.cos(a), 0, math.sin(a))
+        for _, r in ipairs(WEAVE_R) do
+            local c = pos + u * r
+            local s = Score(c, r)
+            cands[#cands + 1] = {p = c, s = s, move = r}
+        end
+    end
+    table.sort(cands, function(x, y) return x.s > y.s end)
+    -- The walk is only checked for the best few: usually the first one.
+    local spot = nil
+    for i = 1, math.min(#cands, 14) do
+        local c = cands[i]
+        if c.move == 0 then spot = pos break end
+        if not Haz.OnPath(pos, c.p, near) and LineClear(pos, c.p) and HasGround(c.p) then
+            spot = c.p
+            break
+        end
+    end
+    m.t, m.pos, m.desire, m.spot, m.here = now, pos, desire, spot, here
+    return spot, here
+end
+
 -- Out of a projectile's line: to the side it is NOT drifting toward.
 local function Sidestep(pos, origin, vel, rad)
     local toward = Vector3.new(origin.X - pos.X, 0, origin.Z - pos.Z)
@@ -6081,6 +6167,25 @@ function Brain.Tick(root)
         if dist <= CONFIG.MeleeRange + reach then DoMelee(aim) end
         DoSpell(dist, stranded and math.max(spellR, dist + 5) or spellR, aim)
         Nav.face = aim
+        -- The target is out of range, but something else is in it: turn
+        -- and throw at that instead of holding fire. It used to cast only
+        -- at the one target, so walking to a far one - or waiting out a
+        -- hazard at 55 studs - it passed mobs it could have hit.
+        if dist > spellR and not stranded then
+            local best, bestD = nil, math.huge
+            for _, rec in ipairs(Mobs.list) do
+                if rec.Model ~= tgt.Model and not Mobs.Banned(rec.Model)
+                and math.abs(rec.Aim.Y - pos.Y) <= CONFIG.AimMaxDrop then
+                    local d = FlatDist(rec.Aim, pos) - rec.Radius
+                    if d <= CONFIG.AttackRange and d < bestD then best, bestD = rec, d end
+                end
+            end
+            if best then
+                local a = Vector3.new(best.Aim.X, pos.Y, best.Aim.Z)
+                DoSpell(0, 1, a)
+                Nav.face = a
+            end
+        end
         -- Our own spot while engaged: known walkable ground in the arena.
         if dist <= spellR + 15 then lastFight = {pos = pos, t = now} end
         backSince = 0
@@ -6187,61 +6292,32 @@ function Brain.Tick(root)
         end
     end
 
-    -- 2. Standing in a hazard with a clean way out.
-    if not goal and evade then
-        local reached = FlatDist(evade.goal, pos) <= 2
-        if reached then settleUntil = now + 1.5 end
-        -- A new footprint landed on the spot we were heading for:
-        -- drop it and pick again straight away. Real footprints only:
-        -- a growing one's look-ahead ghost reaching it had the bot drop
-        -- and re-pick its way out over and over, standing still.
-        if reached or now > evade.untilT or Haz.BoxClear(evade.goal, true, Haz.real) < 0 then
-            evade = nil
-            if not reached then lastPick = 0 end
-        else
-            goal, state = evade.goal, "Stepping out of a hazard"
-        end
-    end
-    if not goal and inHaz and now - lastPick > 0.05 then
-        lastPick = now
-        local heading = nil
-        if Nav.goal then
-            local d = Flat(Nav.goal - pos)
-            if d.Magnitude > 1 then heading = d.Unit end
-        end
-        -- Close exits first; a big ring or a room-wide pattern gets a
-        -- second, wider look before giving up and trading hits.
-        local p = PickExit(pos, anchor, spellR, heading)
-                  or PickExit(pos, anchor, spellR, heading, CONFIG.EvadeFar, true)
-        if p and Blink(root, p) then
-            settleUntil = now + 1.5
-            Nav.goal, Brain.state = nil, "Blinked out of a hazard"
-            Say(Brain.state)
-            return
-        elseif p then
-            evade = {goal = p, untilT = now + 0.6 + FlatDist(p, pos) / math.max(8, CONFIG.WalkSpeed)}
-            goal, state = p, "Stepping out of a hazard"
-        end
-    end
-    -- Dodges and exits are walked straight, never routed.
+    -- (2. Getting out of hazards is the weaving pass, step 5 below: it
+    -- has the final say on where to stand whenever hazards are about.)
+    -- Projectile dodges are walked straight, never routed.
     local direct = goal ~= nil
     -- Dodging is not failing to reach the target: keep its progress
     -- clock from running out (that is what latched "Cannot reach Lava
     -- King - casting from here" after a spell of dodging).
     if goal and prog then prog.since = now end
 
-    -- 3. Positioning against the target.
+    -- 3. Positioning against the target. `desire` is where we would like
+    -- to be; the weaving pass takes it from there when hazards are near.
+    local desire = nil
     if not goal and tgt then
         if blocked or stranded then
+            desire = pos
             state = stranded and ("Casting at " .. name .. " from range")
                               or ("Fighting " .. name .. " from here")
         elseif flat < minR then
             local away = Flat(pos - anchor)
             if away.Magnitude < 0.5 then away = Flat(-root.CFrame.LookVector) end
             goal = Nav.SafeStep(pos, away, ring - flat + 2)
+            desire = goal or (pos + away.Unit * (ring - flat + 2))
             state = goal and ("Backing off " .. name) or ("Fighting " .. name)
         elseif flat > ring + CONFIG.HoldSlack then
             local pt, crosses = RingPoint(pos, anchor, ring, tgt.Model)
+            desire = pt
             -- Already in range, and walking in would cross a hazard or
             -- undo a dodge we just made: cast from here instead.
             if dist <= spellR and (crosses or now < settleUntil) then
@@ -6261,8 +6337,10 @@ function Brain.Tick(root)
                 if goal ~= pt and prog then prog.since = now end
             end
         else
+            desire = pos
             state = "Fighting " .. name
         end
+        if not desire then desire = pos end
     end
 
     -- 4. Nothing to fight.
@@ -6314,10 +6392,61 @@ function Brain.Tick(root)
             goal = Nav.Explore(pos)
             state = goal and "Exploring for the next wave" or "Waiting for mobs"
         end
+        desire = goal
+    end
+
+    -- 5. WEAVING (see Weave): the final say on where to stand while any
+    -- hazard is close - an edge within WeaveClear + 3 studs of the
+    -- hitbox, or on the way to where we are going. Otherwise the plan
+    -- above stands (routes, stairs, approaches).
+    local weaving = false
+    if CONFIG.Weave and not dodge and #Haz.shapes > 0 then
+        local near = Haz.Near(pos, 16 + CONFIG.WeaveClear + 2)
+        if #near > 0 then
+            local here0 = Haz.BoxClear(pos, true, near)
+            local ahead = false
+            local g = goal or desire
+            if g then
+                local d = Flat(g - pos)
+                if d.Magnitude > 16 then g = pos + d.Unit * 16 end
+                ahead = d.Magnitude > 0.5 and Haz.OnPath(pos, g, near)
+            end
+            if here0 < CONFIG.WeaveClear + 3 or ahead then
+                weaving = true
+                local spot, here = Weave(pos, desire or goal, near, tgt and anchor or nil,
+                    tgt and spellR or nil, tgt and minR or nil)
+                if spot and FlatDist(spot, pos) > 0.8 then
+                    if here < 0 and Blink(root, spot) then
+                        Nav.goal, Nav.direct, Brain.state = nil, false, "Blinked out of a hazard"
+                        Say(Brain.state)
+                        return
+                    end
+                    goal, direct = spot, true
+                    if here < 0 then
+                        state = "Stepping out of a hazard"
+                    elseif here < CONFIG.WeaveClear or ahead then
+                        state = tgt and ("Weaving between hazards - " .. name) or "Weaving between hazards"
+                    end
+                elseif spot then
+                    goal = nil                  -- right here is the best spot
+                elseif here < 0 then
+                    -- Every good spot's walk crosses something: the wide
+                    -- search, which will cross a strip if it has to.
+                    local p = PickExit(pos, anchor, spellR, nil, CONFIG.EvadeFar, true)
+                    goal, direct = p, p ~= nil
+                    state = p and "Stepping out of a hazard" or state
+                else
+                    goal = nil
+                    state = "Waiting for a gap"
+                end
+                -- Weaving is not failing to reach the target.
+                if prog then prog.since = now end
+            end
+        end
     end
 
     state = state or "Idle"
-    if inHaz and not evade and not dodge then
+    if inHaz and not goal and not dodge then
         state = state .. " (in a hazard, no clean exit)"
     end
     -- BACK AND FORTH. Trying to move for six seconds but still inside a
@@ -6327,7 +6456,7 @@ function Brain.Tick(root)
     if now - wob.at >= 0.5 then
         wob.at = now
         local pts = wob.pts
-        pts[#pts + 1] = {p = pos, moving = goal ~= nil, dodging = evade ~= nil or dodge ~= nil}
+        pts[#pts + 1] = {p = pos, moving = goal ~= nil, dodging = weaving or evade ~= nil or dodge ~= nil}
         if #pts > 12 then table.remove(pts, 1) end
         if #pts == 12 and now >= wob.detourUntil then
             local sx, sz, moving, dodging, pathLen = 0, 0, 0, 0, 0
@@ -7352,7 +7481,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.17 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.18 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
