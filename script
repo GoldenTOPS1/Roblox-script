@@ -20,9 +20,9 @@ local CONFIG = {
     -- The dungeon to run. This also picks the settings: whatever that
     -- dungeon's entry in MAP_PROFILES (further down) says is used for
     -- the run, on top of the defaults in this CONFIG block.
-    TargetDungeon  = "Northern Lands",
+    TargetDungeon  = "Volcanic Chambers",
     Difficulty     = "Nightmare",
-    Hardcore       = false,  -- true = also press HARDCORE MODE
+    Hardcore       = true,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
     -- CARRY MODE: after creating the lobby, wait on the party screen
