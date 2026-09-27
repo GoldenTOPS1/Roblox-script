@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.9
+--  DQR AUTO FARM v12.10
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -165,6 +165,13 @@ local CONFIG = {
                              -- giving up and trading hits
     EvadeClear     = 1.5,    -- an exit's hitbox must sit this far clear
     DodgeStep      = 8,      -- sidestep from a projectile
+    DodgeLead      = 0.6,    -- a moving or growing hazard also counts where
+                             -- it will be this many seconds from now, so
+                             -- the bot moves before it arrives (0 = off)
+    -- Moving columns (whirlpools, tornadoes) get a solid grey pillar on
+    -- your screen: your character is pushed back off it instead of
+    -- walking in, like the reference script's.
+    ColumnWalls    = true,
     DodgeCooldown  = 0.8,
     HazardDebug    = false,  -- log each hazard's source and draw it red
 
@@ -988,6 +995,7 @@ end
 -- ============================================================
 local recentParts  = {}  -- part -> born
 local streamed     = setmetatable({}, {__mode = "k"})  -- arrived far away: scenery
+local playerBorn   = {}  -- appeared right on a player: their spell, not an attack
 local beamObjects  = {}  -- Beam -> true
 local adornObjects = {}  -- adornment -> true
 local hiddenParts  = {}  -- CanQuery-off effects
@@ -1041,7 +1049,19 @@ task.spawn(function()
             bornQ = {}
             local root = GetRoot()
             local me = root and root.Position
+            -- Every player's position, for telling their spells (which
+            -- appear on them) from attacks.
+            local people = {}
+            for _, pl in ipairs(Players:GetPlayers()) do
+                local r = pl.Character and pl.Character:FindFirstChild("HumanoidRootPart")
+                if r then people[#people + 1] = r.Position end
+            end
             for _, o in ipairs(q) do
+                if o.Parent and recentParts[o] then
+                    for _, pp in ipairs(people) do
+                        if (o.Position - pp).Magnitude < 8 then playerBorn[o] = true break end
+                    end
+                end
                 if me and recentParts[o] and o.Parent then
                     local ok, d = pcall(function()
                         local h = o.Size / 2
@@ -1063,7 +1083,7 @@ end)
 -- object - even though it is still in the game. A beam or a laser part
 -- nobody had looked at for a moment simply fell out of the list.
 workspace.DescendantRemoving:Connect(function(o)
-    beamObjects[o], recentParts[o], hiddenParts[o] = nil, nil, nil
+    beamObjects[o], recentParts[o], hiddenParts[o], playerBorn[o] = nil, nil, nil, nil
 end)
 pcall(function()
     game.DescendantAdded:Connect(function(o)
@@ -2580,6 +2600,46 @@ local function Orphan(h)
     return not near
 end
 
+-- LOOKING AHEAD. A footprint that is moving or growing is also added
+-- where it will be DodgeLead seconds from now, so the bot is already
+-- stepping away while a strip is still sweeping or extending toward it
+-- - not when it arrives. Rates come from where the footprint was on the
+-- last sweep; a still one gets no ghost.
+local motion = setmetatable({}, {__mode = "k"})   -- source -> last reading
+local function Ghost(h)
+    local L = CONFIG.DodgeLead or 0
+    if not h.src or L <= 0 then return nil end
+    local now = tick()
+    local c
+    if h.kind == "box" then c = h.cf.Position
+    elseif h.kind == "line" then c = (h.a + h.b) / 2
+    else c = Vector3.new(h.x, h.y, h.z) end
+    local e1 = h.kind == "box" and h.hx or h.r
+    local e2 = h.kind == "box" and h.hz or h.r
+    local m = motion[h.src]
+    motion[h.src] = {c = c, e1 = e1, e2 = e2, t = now}
+    if not m then return nil end
+    local dt = now - m.t
+    if dt < 0.03 or dt > 0.5 then return nil end
+    local v = (c - m.c) / dt
+    local shift = Vector3.new(v.X, 0, v.Z) * L
+    if shift.Magnitude > 25 then shift = shift.Unit * 25 end
+    local d1 = math.clamp((e1 - m.e1) / dt * L, 0, 20)
+    local d2 = math.clamp((e2 - m.e2) / dt * L, 0, 20)
+    if shift.Magnitude < 1 and d1 < 1 and d2 < 1 then return nil end
+    local g = {}
+    for k, val in pairs(h) do g[k] = val end
+    g.ghost = true
+    if h.kind == "disc" or h.kind == "ball" then
+        g.x, g.z, g.r = h.x + shift.X, h.z + shift.Z, h.r + math.max(d1, d2)
+    elseif h.kind == "box" then
+        g.cf, g.hx, g.hz = h.cf + shift, h.hx + d1, h.hz + d2
+    else
+        g.a, g.b = h.a + shift, h.b + shift
+    end
+    return g
+end
+
 local function Add(h)
     if TooOld(h.src) then return end
     if h.src and CONFIG.IgnoreOrphans and Orphan(h) then
@@ -2587,6 +2647,8 @@ local function Add(h)
         return
     end
     Haz.shapes[#Haz.shapes + 1] = h
+    local g = Ghost(h)
+    if g then Haz.shapes[#Haz.shapes + 1] = g end
     if CONFIG.HazardDebug and h.src then
         local now = tick()
         if not censusAt[h.src] or now - censusAt[h.src] > 5 then
@@ -2749,6 +2811,62 @@ local function ZonesAround(pos, done)
     end
 end
 
+-- Column-shaped: taller than wide, round from above, not solid, visible.
+-- Returns height, width - or nil.
+local function ColumnShape(o)
+    if o.CanCollide or o.Transparency > 0.95 then return nil end
+    local height, a, b = Footprint(o)
+    local w = math.max(a, b)
+    if height > 8 and height > w * 1.2 and w >= 4 and w <= CONFIG.RedMaxWide
+    and math.abs(a - b) <= w * 0.35 then
+        return height, w
+    end
+    return nil
+end
+
+-- A column's footprint, and a note for the pillar that follows it.
+Haz.columns = {}                                   -- source -> {h, w, t}
+local function AddColumn(o, height, w)
+    AddDisc(o.Position, w / 2 + CONFIG.TelegraphPad, height / 2, o)
+    Haz.columns[o] = {h = height, w = w + CONFIG.TelegraphPad * 2, t = tick()}
+end
+
+-- THE PILLARS. Each column seen gets a solid grey cylinder of its own
+-- size on our screen, moved with it every frame. Our character is
+-- simulated here, so it cannot walk into one - brushing against it
+-- pushes us back off, the way the reference script's whirlpool
+-- hitboxes did. A pillar goes soft while we are already inside it (a
+-- column spawned on top of us), or it would fling us out; the dodge
+-- walks us out instead.
+do
+local pillars = {}                                  -- source -> part
+RunService.Heartbeat:Connect(function()
+    local now, root = tick(), GetRoot()
+    for src, info in pairs(Haz.columns) do
+        if not CONFIG.ColumnWalls or not src.Parent or now - info.t > 1 then
+            Haz.columns[src] = nil
+            if pillars[src] then pillars[src]:Destroy() pillars[src] = nil end
+        else
+            local p = pillars[src]
+            if not p or not p.Parent then
+                p = Instance.new("Part")
+                p.Name, p.Shape = "DQR_Pillar", Enum.PartType.Cylinder
+                p.Anchored, p.CanQuery, p.CanTouch = true, false, false
+                p.CastShadow, p.Material = false, Enum.Material.SmoothPlastic
+                p.Color, p.Transparency = Color3.fromRGB(110, 115, 125), 0.55
+                p.Parent = workspace
+                pillars[src] = p
+            end
+            local size = Vector3.new(info.h, info.w, info.w)   -- a cylinder's axis is X
+            if p.Size ~= size then p.Size = size end
+            local c = src.Position
+            p.CFrame = CFrame.new(c) * CFrame.Angles(0, 0, math.pi / 2)
+            p.CanCollide = not (root and FlatDist(root.Position, c) < info.w / 2 + 1.5)
+        end
+    end
+end)
+end
+
 local function Classify(o, pos, reach)
     if not o:IsA("BasePart") or IsOurs(o) then return end
     -- 0. A safe zone is where to stand, never a hazard.
@@ -2765,6 +2883,9 @@ local function Classify(o, pos, reach)
             Haz.orphans = Haz.orphans + 1
             return
         end
+        -- A named tornado/whirlpool is a column like any other.
+        local height, w = ColumnShape(o)
+        if height then AddColumn(o, height, w) return end
         AddFootprint(o, CONFIG.TelegraphPad)
         return
     end
@@ -2776,13 +2897,10 @@ local function Classify(o, pos, reach)
     -- Every rule below rejected these as "too thick", and a tall round
     -- one that did get through was sized from its height as a ball.
     do
-        local height, a, b = Footprint(o)
-        local w = math.max(a, b)
-        if height > 8 and height > w * 1.2 and not o.CanCollide and o.Transparency <= 0.95
-        and w >= 4 and w <= CONFIG.RedMaxWide and math.abs(a - b) <= w * 0.35
-        and (LooksActive(o) or WarnColor(o.Color) ~= nil) then
+        local height, w = ColumnShape(o)
+        if height and (LooksActive(o) or WarnColor(o.Color) ~= nil) then
             if math.abs(o.Position.Y - pos.Y) < 10 + height / 2 then
-                AddDisc(o.Position, w / 2 + CONFIG.TelegraphPad, height / 2, o)
+                AddColumn(o, height, w)
             end
             return
         end
@@ -2805,6 +2923,36 @@ local function Classify(o, pos, reach)
         if LooksActive(o) or (BeamColoured(o) and AtBodyHeight(o, pos)) then
             local a, b, thin = Segment(o)
             AddLine(a, b, thin / 2 + CONFIG.BeamPad, o)
+            return
+        end
+    end
+    -- 6. Anything else moving through: Bob the Frost Giant's white bars
+    -- with a ball on each end passed every test above - wrong colour for
+    -- a telegraph, wrong shape for a laser, too small for a blob. Long
+    -- ones count as a line, compact ones as a ball. Not a player's own
+    -- spell: those appear right on the player (playerBorn), and the
+    -- bot's own ice fan must not send it running from itself.
+    local inCreature = false
+    do
+        local n, depth = o.Parent, 0
+        while n and n ~= workspace and depth < 10 do
+            if n:IsA("Model") and IsCreature(n) then inCreature = true break end
+            n, depth = n.Parent, depth + 1
+        end
+    end
+    if not o.CanCollide and o.Transparency <= 0.9 and not playerBorn[o] and not inCreature then
+        local active, why = LooksActive(o)
+        if active and why == "moved" then
+            local s = PartSize(o)
+            local mx, mn = math.max(s.X, s.Y, s.Z), math.min(s.X, s.Y, s.Z)
+            if mx >= 1.5 and mx <= CONFIG.ThreatMaxSize then
+                if mx >= mn * 3 then
+                    local a, b, thin = Segment(o)
+                    AddLine(a, b, thin / 2 + CONFIG.BeamPad, o)
+                else
+                    AddBall(o.Position, mx / 2 + CONFIG.TelegraphPad, o)
+                end
+            end
         end
     end
 end
@@ -2978,80 +3126,128 @@ function Haz.Scan(pos)
     if CONFIG.HazardDebug then pcall(Haz.Draw) end
 end
 
+-- How far `p` is from shape `h`'s edge; negative = inside; nil when `p`
+-- is not at a height the shape reaches. Discs and boxes count within
+-- their own height plus a body; lasers within chest height; balls in
+-- true 3D against the body's height.
+local function ShapeClear(h, p)
+    if h.kind == "disc" then
+        if math.abs(p.Y - h.y) < math.max(8, h.hy + 5) then
+            local dx, dz = p.X - h.x, p.Z - h.z
+            return math.sqrt(dx * dx + dz * dz) - h.r
+        end
+    elseif h.kind == "box" then
+        local rel = h.cf:PointToObjectSpace(p)
+        if math.abs(rel.Y) < math.max(8, h.hy + 5) then
+            return math.max(math.abs(rel.X) - h.hx, math.abs(rel.Z) - h.hz)
+        end
+    elseif h.kind == "ball" then
+        local cy = math.clamp(h.y, p.Y - 3, p.Y + 2)
+        local dx, dy, dz = p.X - h.x, cy - h.y, p.Z - h.z
+        return math.sqrt(dx * dx + dy * dy + dz * dz) - h.r
+    else
+        local ab = h.b - h.a
+        local len2 = ab:Dot(ab)
+        if len2 > 0.01 then
+            local t = math.clamp((p - h.a):Dot(ab) / len2, 0, 1)
+            local n = h.a + ab * t
+            if math.abs(p.Y - n.Y) < 8 then return FlatDist(p, n) - h.r end
+        end
+    end
+    return nil
+end
+
 -- How far `p` is from the nearest hazard edge; negative = inside.
--- Discs and boxes count within their own height plus a body; lasers
--- within chest height; balls in true 3D against the body's height.
 function Haz.Clear(p, ignoreHuge, list)
     local best = math.huge
     for _, h in ipairs(list or Haz.shapes) do
-        local c = nil
-        if ignoreHuge and h.huge then
-            -- too big to step out of
-        elseif h.kind == "disc" then
-            if math.abs(p.Y - h.y) < math.max(8, h.hy + 5) then
-                local dx, dz = p.X - h.x, p.Z - h.z
-                c = math.sqrt(dx * dx + dz * dz) - h.r
-            end
-        elseif h.kind == "box" then
-            local rel = h.cf:PointToObjectSpace(p)
-            if math.abs(rel.Y) < math.max(8, h.hy + 5) then
-                c = math.max(math.abs(rel.X) - h.hx, math.abs(rel.Z) - h.hz)
-            end
-        elseif h.kind == "ball" then
-            local cy = math.clamp(h.y, p.Y - 3, p.Y + 2)
-            local dx, dy, dz = p.X - h.x, cy - h.y, p.Z - h.z
-            c = math.sqrt(dx * dx + dy * dy + dz * dz) - h.r
-        else
-            local ab = h.b - h.a
-            local len2 = ab:Dot(ab)
-            if len2 > 0.01 then
-                local t = math.clamp((p - h.a):Dot(ab) / len2, 0, 1)
-                local n = h.a + ab * t
-                if math.abs(p.Y - n.Y) < 8 then c = FlatDist(p, n) - h.r end
-            end
+        if not (ignoreHuge and h.huge) then
+            local c = ShapeClear(h, p)
+            if c and c < best then best = c end
         end
-        if c and c < best then best = c end
     end
     return best
 end
 
--- How far the HITBOX at `p` is from the nearest hazard edge; negative
--- = a hazard touches it. The box is CONFIG.HitboxSize plus HitboxPad,
--- world-aligned like the one drawn; sampled at its corners, edge
--- middles and centre, which are closer together than the thinnest
--- footprint (a laser is BeamPad * 2 wide at least), so nothing slips
--- between them.
+-- THE HITBOX: CONFIG.HitboxSize plus HitboxPad, turned to face the way
+-- the character faces (Haz.look, kept up to date every frame by the box
+-- drawn on screen), sampled at its corners, edge middles and centre -
+-- closer together than the thinnest footprint (a laser is BeamPad * 2
+-- wide at least), so nothing slips between them.
+Haz.look = Vector3.new(0, 0, -1)
 local SIGNS = {-1, 0, 1}
-function Haz.BoxClear(p, ignoreHuge, list)
-    if #(list or Haz.shapes) == 0 then return math.huge end
+local function EachBoxPoint(p, fn)
     local s, pad = CONFIG.HitboxSize, CONFIG.HitboxPad
     local hx, hz = s.X / 2 + pad, s.Z / 2 + pad
-    local best = math.huge
+    local f = Haz.look
+    local rx, rz = -f.Z * hx, f.X * hx
+    local fx, fz = f.X * hz, f.Z * hz
     for _, sx in ipairs(SIGNS) do
         for _, sz in ipairs(SIGNS) do
-            local c = Haz.Clear(Vector3.new(p.X + sx * hx, p.Y, p.Z + sz * hz), ignoreHuge, list)
-            if c < best then best = c end
+            fn(Vector3.new(p.X + sx * rx + sz * fx, p.Y, p.Z + sx * rz + sz * fz))
         end
     end
+end
+
+-- How far the hitbox at `p` is from the nearest hazard edge; negative =
+-- a hazard touches it.
+function Haz.BoxClear(p, ignoreHuge, list)
+    list = list or Haz.shapes
+    if #list == 0 then return math.huge end
+    local best = math.huge
+    EachBoxPoint(p, function(q)
+        for _, h in ipairs(list) do
+            if not (ignoreHuge and h.huge) then
+                local c = ShapeClear(h, q)
+                if c and c < best then best = c end
+            end
+        end
+    end)
     return best
+end
+
+-- Which hazards the hitbox at `p` touches, and how deep: shape -> its
+-- worst (most negative) clearance.
+function Haz.BoxTouch(p)
+    local set = {}
+    EachBoxPoint(p, function(q)
+        for _, h in ipairs(Haz.shapes) do
+            if not h.huge then
+                local c = ShapeClear(h, q)
+                if c and c < 0 and (set[h] == nil or c < set[h]) then set[h] = c end
+            end
+        end
+    end)
+    return set
 end
 
 -- Does a hazard we could actually step out of touch the hitbox?
 function Haz.At(p) return Haz.BoxClear(p, true) < 0 end
 
--- Does walking a -> b enter a hazard (or end in one)? Samples every
--- 3 studs. Leaving the one we start in does not count.
+-- Does walking a -> b take the hitbox into a hazard? Every 2 studs, and
+-- tracking WHICH hazards: stepping into one it did not start in is a
+-- crossing, and so is going more than a stud deeper into one it did.
+-- The old check only asked "in a hazard or not" - with strips laid
+-- close together the box never left "a hazard" as it walked from one
+-- strip straight into the next, so the crossing went unseen, and the
+-- bot left a perfectly good gap for another through a strip.
 function Haz.OnPath(a, b)
+    if #Haz.shapes == 0 then return false end
+    local start = Haz.BoxTouch(a)
     local d = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
     local len = d.Magnitude
-    if len < 0.5 then return Haz.At(b) end
-    local u, inside, s = d / len, Haz.At(a), 3
-    while s < len do
-        local h = Haz.At(a + u * s)
-        if h and not inside then return true end
-        inside, s = h, s + 3
+    local u = len > 0.01 and d / len or Vector3.zero
+    local s = math.min(2, len)
+    while true do
+        local p = s >= len and b or (a + u * s)
+        for h, c in pairs(Haz.BoxTouch(p)) do
+            local c0 = start[h]
+            if c0 == nil or c < c0 - 1 then return true end
+        end
+        if s >= len then break end
+        s = s + 2
     end
-    return Haz.At(b)
+    return false
 end
 
 -- Share of the ground within 30 studs that is covered.
@@ -3245,12 +3441,16 @@ do
 local box = nil
 local GREY, RED = Color3.fromRGB(120, 128, 138), Color3.fromRGB(235, 70, 70)
 function Look.Hitbox(show)
+    local root, hum = GetRoot(), GetHuman()
+    if root then
+        local lv = Flat(root.CFrame.LookVector)
+        if lv.Magnitude > 0.1 then Haz.look = lv.Unit end
+    end
     if not (show and CONFIG.ShowHitbox) then
         if box and box.Parent then box:Destroy() end
         box = nil
         return
     end
-    local root, hum = GetRoot(), GetHuman()
     if not root or not hum or hum.Health <= 0 then return end
     if not box or not box.Parent then
         box = Instance.new("Part")
@@ -3265,7 +3465,11 @@ function Look.Hitbox(show)
     local hip = hum.RigType == Enum.HumanoidRigType.R6 and 3
                 or (hum.HipHeight + root.Size.Y / 2)
     local p = root.Position
-    box.CFrame = CFrame.new(p.X, p.Y - hip + s.Y / 2, p.Z)
+    -- Turned the way the character faces - and the hazard test uses the
+    -- same facing (Haz.look, set above), so what is drawn is exactly
+    -- what is checked.
+    local c = Vector3.new(p.X, p.Y - hip + s.Y / 2, p.Z)
+    box.CFrame = CFrame.lookAt(c, c + Haz.look)
     box.Color = Haz.At(p) and RED or GREY
 end
 RunService.Heartbeat:Connect(function() pcall(Look.Hitbox, Farm.Running) end)
@@ -4858,21 +5062,28 @@ local function PickExit(pos, aim, keepR, heading, maxD, fallback)
     -- leave wider gaps further out.
     if not fallback then return nil end
     local here = Haz.BoxClear(pos, true)
-    local best, bestS = nil, -math.huge
+    local cands2 = {}
     for i = 0, 15 do
         local a = i * math.pi / 8
         local u = Vector3.new(math.cos(a), 0, math.sin(a))
-        for _, d in ipairs({4, 8, 12, 16}) do
+        for _, d in ipairs({2, 4, 7, 10, 14}) do
             local p = pos + u * d
             local c = Haz.BoxClear(p, true)
             if c > here + 1 then
-                local s = c * 2 - d * 0.1
+                local s = c * 2 - d * 0.15
                 if aim then s = s + (FlatDist(p, aim) - FlatDist(pos, aim)) * 0.15 end
-                if s > bestS and LineClear(pos, p) and HasGround(p) then best, bestS = p, s end
+                cands2[#cands2 + 1] = {p = p, s = s}
             end
         end
     end
-    return best
+    -- Best first; the walk there must not cross into another hazard -
+    -- no leaving the gap we are in for one past a strip.
+    table.sort(cands2, function(x, y) return x.s > y.s end)
+    for i = 1, math.min(#cands2, 8) do
+        local p = cands2[i].p
+        if not Haz.OnPath(pos, p) and LineClear(pos, p) and HasGround(p) then return p end
+    end
+    return nil
 end
 
 -- Out of a projectile's line: to the side it is NOT drifting toward.
@@ -4992,15 +5203,26 @@ end
 -- into anything between it and a target it was not yet in range of -
 -- the Deity of the Volcano's red dome, the Lava King's floor beams.
 local function SafeApproach(pos, goal)
-    if #Haz.shapes == 0 or not Haz.OnPath(pos, goal) then return goal end
+    if #Haz.shapes == 0 then return goal end
     local d = Flat(goal - pos)
     local len = d.Magnitude
     if len < 1 then return goal end
     local u = d / len
+    -- Only the next 40 studs matter this tick: it is looked at again
+    -- twenty times a second as we walk.
+    local span = math.min(len, 40)
+    if not Haz.OnPath(pos, pos + u * span) then return goal end
+    -- As far along the straight line as the hitbox gets without touching
+    -- a hazard it is not already touching, or going deeper into one.
+    local start = Haz.BoxTouch(pos)
     local last = nil
-    for s = 2, len, 2 do
+    for s = 2, span, 2 do
         local p = pos + u * s
-        if Haz.At(p) then break end
+        local bad = false
+        for h, c in pairs(Haz.BoxTouch(p)) do
+            if start[h] == nil or c < start[h] - 1 then bad = true break end
+        end
+        if bad then break end
         last = p
     end
     if last and FlatDist(last, pos) > 4 then return last end
@@ -5010,19 +5232,24 @@ local function SafeApproach(pos, goal)
     -- straight line to it crosses one, and the bot used to stand and
     -- "wait for it to clear" while the next volley came down; the gaps
     -- between the strips lead straight to the boss.
-    local best, bestD = nil, FlatDist(pos, goal) - 1
+    -- Checked closest-first, so the (costly) path test usually runs once.
+    local here = FlatDist(pos, goal) - 1
+    local cands = {}
     for i = 0, 15 do
         local a = i * math.pi / 8
         local v = Vector3.new(math.cos(a), 0, math.sin(a))
         for _, s in ipairs({6, 10, 16, 24}) do
             local p = pos + v * s
-            local d = FlatDist(p, goal)
-            if d < bestD and not Haz.At(p) and not Haz.OnPath(pos, p) then
-                if LineClear(pos, p) and HasGround(p) then best, bestD = p, d end
-            end
+            local dd = FlatDist(p, goal)
+            if dd < here then cands[#cands + 1] = {p = p, d = dd} end
         end
     end
-    return best
+    table.sort(cands, function(x, y) return x.d < y.d end)
+    for i = 1, math.min(#cands, 24) do
+        local p = cands[i].p
+        if not Haz.OnPath(pos, p) and LineClear(pos, p) and HasGround(p) then return p end
+    end
+    return nil
 end
 
 -- Distances for this target: its entry in CONFIG.Bosses (the dungeon's
@@ -6403,7 +6630,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.9 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.10 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
