@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.12
+--  DQR AUTO FARM v12.13
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -1042,20 +1042,38 @@ Haz.named = {}
 Haz.spell = {}                                   -- part -> true
 local spellModel = {}                            -- model -> true
 local castAt = {}                                -- player -> last spell cast
+local pending = {}                               -- parts to ask again: {o, pl, t, m}
 local CAST_WINDOW, CAST_RADIUS = 1.0, 20
 local MOVE_WORDS = {"idle", "walk", "run", "jump", "fall", "climb", "swim", "sit", "land", "toolnone"}
-local function HookAnimator(pl, a)
+-- Cast signal 1: an animation starts on a player's character that is
+-- not one of its Animate script's moves (walk, idle, jump...). Any
+-- priority - spells are not always played at Action.
+local function HookAnimator(pl, a, char)
+    local core = {}
+    local function Core()
+        local animate = char:FindFirstChild("Animate")
+        if animate then
+            for _, v in ipairs(animate:GetDescendants()) do
+                if v:IsA("Animation") and v.AnimationId ~= "" then core[v.AnimationId] = true end
+            end
+        end
+    end
+    pcall(Core)
     a.AnimationPlayed:Connect(function(track)
-        local n = ((track.Animation and track.Animation.Name or "") .. " " .. track.Name):lower()
+        local anim = track.Animation
+        if anim and core[anim.AnimationId] then return end
+        local n = ((anim and anim.Name or "") .. " " .. track.Name):lower()
         for _, w in ipairs(MOVE_WORDS) do
             if n:find(w, 1, true) then return end
         end
-        if track.Priority.Value >= Enum.AnimationPriority.Action.Value then castAt[pl] = tick() end
+        if next(core) == nil then pcall(Core) end      -- Animate loads late
+        if anim and core[anim.AnimationId] then return end
+        castAt[pl] = tick()
     end)
 end
 local function HookCharacter(pl, char)
     local function Try(d)
-        if d:IsA("Animator") then pcall(HookAnimator, pl, d) end
+        if d:IsA("Animator") then pcall(HookAnimator, pl, d, char) end
     end
     for _, d in ipairs(char:GetDescendants()) do Try(d) end
     char.DescendantAdded:Connect(Try)
@@ -1067,6 +1085,44 @@ end
 for _, pl in ipairs(Players:GetPlayers()) do HookPlayer(pl) end
 Players.PlayerAdded:Connect(HookPlayer)
 Players.PlayerRemoving:Connect(function(pl) castAt[pl] = nil end)
+
+-- Cast signal 2 (us only): a cooldown number appearing on the Q / E
+-- slots. When the text there goes from nothing (spell ready) to a
+-- number, or jumps back up, a spell has just gone off - whatever the
+-- animation did.
+task.spawn(function()
+    local labels, last, scanAt = {}, {}, 0
+    while true do
+        S(0.1)
+        local now = tick()
+        if now - scanAt > 3 then
+            scanAt = now
+            table.clear(labels)
+            local pg = LP:FindFirstChildOfClass("PlayerGui")
+            local cam = workspace.CurrentCamera
+            local vp = cam and cam.ViewportSize
+            if pg and vp then
+                for _, o in ipairs(pg:GetDescendants()) do
+                    if o:IsA("TextLabel") and not (LogGui and o:IsDescendantOf(LogGui)) then
+                        local p, s = o.AbsolutePosition, o.AbsoluteSize
+                        local cx = p.X + s.X / 2
+                        if p.Y > vp.Y * 0.7 and cx > vp.X * 0.25 and cx < vp.X * 0.75 then
+                            labels[#labels + 1] = o
+                        end
+                    end
+                end
+            end
+        end
+        for _, o in ipairs(labels) do
+            local v = o.Parent and o.Visible and tonumber((o.Text:gsub("%s", ""))) or nil
+            local was = last[o]
+            if v and v > 0.5 and v < 60 and (was == nil or v > was + 0.5) then
+                castAt[LP] = now
+            end
+            last[o] = v
+        end
+    end
+end)
 Haz.castAt = castAt
 
 workspace.DescendantAdded:Connect(function(o)
@@ -1096,9 +1152,29 @@ task.spawn(function()
                 if t - born > CONFIG.RecentWindow then recentParts[p] = nil end
             end
         end
-        if #bornQ > 0 then
+        if #bornQ > 0 or #pending > 0 then
             local q = bornQ
             bornQ = {}
+            -- The re-check: a cast by that player from half a second
+            -- before the part appeared to a second after makes it theirs.
+            if #pending > 0 then
+                local keep = {}
+                for _, e in ipairs(pending) do
+                    if t - e.t < 1.0 then
+                        keep[#keep + 1] = e
+                    elseif e.o.Parent then
+                        local c = castAt[e.pl]
+                        if c and c > e.t - 0.5 and c < e.t + 1.0 then
+                            Haz.spell[e.o] = true
+                            if e.m and e.m.Parent and not IsCreature(e.m)
+                            and not Players:GetPlayerFromCharacter(e.m) then
+                                spellModel[e.m] = true
+                            end
+                        end
+                    end
+                end
+                pending = keep
+            end
             local root = GetRoot()
             local me = root and root.Position
             -- Every player: where they are, their names, and whether
@@ -1107,7 +1183,7 @@ task.spawn(function()
             for _, pl in ipairs(Players:GetPlayers()) do
                 local r = pl.Character and pl.Character:FindFirstChild("HumanoidRootPart")
                 if r then
-                    people[#people + 1] = {p = r.Position,
+                    people[#people + 1] = {p = r.Position, pl = pl,
                         cast = castAt[pl] ~= nil and t - castAt[pl] < CAST_WINDOW}
                 end
                 names[#names + 1] = pl.Name:lower()
@@ -1144,6 +1220,17 @@ task.spawn(function()
                         Haz.spell[o] = true
                         if m and not IsCreature(m) and not Players:GetPlayerFromCharacter(m) then
                             spellModel[m] = true
+                        end
+                    else
+                        -- Near a player but no cast yet: the effect often
+                        -- arrives a moment BEFORE the cast signal (the
+                        -- server spawns it, the HUD and animation follow).
+                        -- Asked again shortly.
+                        for _, pp in ipairs(people) do
+                            if (o.Position - pp.p).Magnitude < CAST_RADIUS then
+                                pending[#pending + 1] = {o = o, pl = pp.pl, t = t, m = m}
+                                break
+                            end
                         end
                     end
                     for _, pp in ipairs(people) do
@@ -2618,6 +2705,29 @@ local function FollowsPlayer(o)
     return false
 end
 
+-- Seen for the first time within 12 studs of a player who cast in the
+-- last 1.2 seconds: that spell. Catches effects the game keeps and
+-- moves into place instead of creating anew - those never "appear",
+-- so the birth check never sees them.
+local firstSight = setmetatable({}, {__mode = "k"})
+local function SpellOnSight(o)
+    if firstSight[o] then return false end
+    local now = tick()
+    firstSight[o] = now
+    local ca = Haz.castAt
+    if not ca then return false end
+    for _, c in ipairs(chars) do
+        local pl = Players:GetPlayerFromCharacter(c)
+        local r = c:FindFirstChild("HumanoidRootPart")
+        local t = pl and ca[pl]
+        if r and t and now - t < 1.2 and FlatDist(o.Position, r.Position) < 12 then
+            Haz.spell[o] = true
+            return true
+        end
+    end
+    return false
+end
+
 -- Anything this script made, our own spells (Haz.spell: born beside a
 -- player who had just cast), anything on or stuck to a player.
 local function IsOurs(o)
@@ -2630,7 +2740,8 @@ local function IsOurs(o)
     -- Parts only: Beams and adornments come through here too, and have
     -- no Position (v12.11 crashed the farm loop on Northern Lands'
     -- aurora beams, over and over).
-    return o:IsA("BasePart") and FollowsPlayer(o)
+    if not o:IsA("BasePart") then return false end
+    return SpellOnSight(o) or FollowsPlayer(o)
 end
 
 -- This game's "about to be hit" colours, or nil. Being one does NOT
@@ -6981,7 +7092,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.12 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.13 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
