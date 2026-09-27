@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.6
+--  DQR AUTO FARM v12.7
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -424,6 +424,17 @@ local MAP_PROFILES = {
         Mage      = {CircleRadius = 30, MinRange = 18, AttackRange = 45},
         Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
     },
+    ["Northern Lands"] = {
+        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        DodgeMove = "walk",   -- "walk" / "blink"
+        EvadeMax  = 26,       -- furthest a hazard exit may be
+        HitboxPad = 1.5,      -- bigger = dodges earlier and wider
+        BossNames = {},
+        Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
+        Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
+        Mage      = {CircleRadius = 26, MinRange = 15, AttackRange = 45},
+        Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
+    },
     ["Volcanic Chambers"] = {
         MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
         DodgeMove = "walk",   -- "walk" / "blink"
@@ -710,6 +721,13 @@ local function GetRoot()
 end
 local function GetHuman()
     local c = GetChar() return c and c:FindFirstChildOfClass("Humanoid")
+end
+-- A creature's model: one with a Humanoid, or a mob the registry found
+-- without one (see MOBS - newer dungeons build mobs without Humanoids).
+local function IsCreature(m)
+    if not m then return false end
+    return m:FindFirstChildOfClass("Humanoid") ~= nil
+        or (Mobs.models ~= nil and Mobs.models[m] ~= nil)
 end
 local function Flat(v) return Vector3.new(v.X, 0, v.Z) end
 local function FlatDist(a, b)
@@ -1654,11 +1672,78 @@ local function IsPlayerChar(obj)
     return false
 end
 
--- The registry.
+-- ENEMY FOLDERS. Every dungeon keeps its mobs in a folder of their own
+-- (Workspace.dungeon.room8.enemyFolder.<mob>). A model in one is a mob
+-- whatever it is built from: Northern Lands' mobs were stood in plain
+-- view while the scan found "0 mobs", because it only ever looked for
+-- models with a Humanoid in them, and newer mobs are built without one
+-- (an AnimationController rig, health kept as a value or attribute).
+local enemyOf = setmetatable({}, {__mode = "k"})    -- model -> true
+local function EnemyFolderName(n)
+    local l = n.Name:lower()
+    return l:find("enem", 1, true) ~= nil or l:find("mob", 1, true) ~= nil
+        or l:find("monster", 1, true) ~= nil
+end
+
+-- Health for a mob with no Humanoid, from wherever the game keeps it:
+-- an attribute on the model, or a Number/IntValue on it or in a stats
+-- folder. With nothing readable, it is alive while it has a body.
+local HEALTH_KEYS = {"Health", "health", "HP", "Hp", "hp", "CurrentHealth", "currentHealth"}
+local MAX_KEYS    = {"MaxHealth", "maxHealth", "MaxHP", "MaxHp", "maxHP", "maxHp"}
+local function StatOf(model, keys)
+    for _, k in ipairs(keys) do
+        local v = model:GetAttribute(k)
+        if type(v) == "number" then return v end
+    end
+    local holders = {model}
+    for _, n in ipairs({"Stats", "stats", "Configuration", "Config", "Values", "Data"}) do
+        local h = model:FindFirstChild(n)
+        if h then holders[#holders + 1] = h end
+    end
+    for _, h in ipairs(holders) do
+        for _, k in ipairs(keys) do
+            local v = h:FindFirstChild(k)
+            if v and (v:IsA("NumberValue") or v:IsA("IntValue")) then return v.Value end
+        end
+    end
+    return nil
+end
+-- Stands in for a Humanoid everywhere a record uses one: .Health,
+-- .MaxHealth, .Parent and .DisplayName, read live.
+local function Proxy(model)
+    return setmetatable({}, {__index = function(_, k)
+        if k == "Parent" then return model.Parent and model or nil end
+        if k == "Health" then
+            local v = StatOf(model, HEALTH_KEYS)
+            if v then return v end
+            return model:FindFirstChildWhichIsA("BasePart", true) and 1 or 0
+        end
+        if k == "MaxHealth" then
+            return StatOf(model, MAX_KEYS) or StatOf(model, HEALTH_KEYS) or 1
+        end
+        if k == "DisplayName" then return "" end
+        return nil
+    end})
+end
+
+-- The registry: models with a Humanoid, and every model in an enemy
+-- folder (directly, or one folder down - waves are sometimes grouped).
 local function Watch(o)
     if o:IsA("Humanoid") then
         local m = o.Parent
         if m and m:IsA("Model") then models[m] = o end
+    elseif o:IsA("Model") and not models[o] then
+        -- The containers must not be models themselves, or a mob called
+        -- "Frost Enemy" would make its own sword model a mob too.
+        local p = o.Parent
+        local gp = p and p.Parent
+        local inEnemy = p and not p:IsA("Model") and (EnemyFolderName(p)
+            or (gp and not gp:IsA("Model") and EnemyFolderName(gp)))
+        if inEnemy then
+            enemyOf[o] = true
+            local hum = o:FindFirstChildOfClass("Humanoid")
+            models[o] = hum or Proxy(o)
+        end
     end
 end
 workspace.DescendantAdded:Connect(Watch)
@@ -1817,24 +1902,35 @@ local function Record(obj, hum, me, barHit)
     local bossy = hum.MaxHealth >= CONFIG.BossHealthHint
     local a, b = NamesOf(obj, hum)
     local named = barHit == obj or Listed(a, b)
-    if mr.Anchored and not (bossy or named) then return nil end
+    -- In an enemy folder: a mob, anchored or not (some stand anchored
+    -- until the fight reaches them).
+    local enemy = enemyOf[obj]
+    if mr.Anchored and not (bossy or named or enemy) then return nil end
 
     local now = tick()
     local sh = shape[obj]
     -- A "no" is looked at again after a couple of seconds: health bars
     -- are often added a moment after the mob spawns.
     if sh == nil or (not sh.ok and now - sh.t > 2) then
-        local hasBB, pc = false, 0
+        local hasBB, pc, anim = false, 0, false
         for _, c in ipairs(obj:GetDescendants()) do
             if c:IsA("BillboardGui") or c:IsA("Highlight") then hasBB = true
-            elseif c:IsA("BasePart") then pc = pc + 1 end
-            if hasBB and pc >= 2 then break end
+            elseif c:IsA("BasePart") then pc = pc + 1
+            elseif c:IsA("AnimationController") or c:IsA("Animator") then anim = true end
         end
         -- Mobs carry a health bar overhead; a boss's is at the top of
         -- the screen. Parts are counted at any depth: counting only the
         -- model's direct children threw out every boss that keeps its
         -- parts in sub-models - it never even reached the list.
-        sh = {ok = (hasBB and pc >= 2) or (bossy and pc >= 1), bb = hasBB, t = now}
+        local ok = (hasBB and pc >= 2) or (bossy and pc >= 1)
+        if enemy and pc >= 1 then
+            -- A Humanoid-less model in an enemy folder still has to look
+            -- alive - a health bar, an animated rig, or a health value -
+            -- or a folder of spawn markers would be a pack of targets.
+            local real = typeof(hum) == "Instance"
+            ok = ok or real or hasBB or anim or StatOf(obj, HEALTH_KEYS) ~= nil
+        end
+        sh = {ok = ok, bb = hasBB, t = now}
         shape[obj] = sh
     end
     if not (sh.ok or named) then return nil end
@@ -2134,8 +2230,10 @@ function Mobs.Diag()
                 verdict = rec.Boss and ("BOSS (" .. tostring(rec.Why) .. ")")
                           or (rec.Far and "boss, body too far for now" or "mob")
             end
-            print(("%s | d=%d hp=%s/%s root=%s rootdY=%d anchored=%s ok=%s %s banned=%s")
-                :format(obj:GetFullName(), d, Hud.Short(hum.Health), Hud.Short(hum.MaxHealth),
+            local kind = typeof(hum) == "Instance" and "humanoid" or "no humanoid"
+            if enemyOf[obj] then kind = kind .. ", enemy folder" end
+            print(("%s | %s | d=%d hp=%s/%s root=%s rootdY=%d anchored=%s ok=%s %s banned=%s")
+                :format(obj:GetFullName(), kind, d, Hud.Short(hum.Health), Hud.Short(hum.MaxHealth),
                         mr.Name, mr.Position.Y - root.Position.Y, tostring(mr.Anchored),
                         tostring(sh and sh.ok), verdict, tostring(Mobs.Banned(obj))))
         end
@@ -2151,7 +2249,43 @@ function Mobs.Diag()
         print(("[Boss] %s | found by %s | %s | banned=%s")
             :format(m.Name, tostring(why), body, tostring(Mobs.Banned(m))))
     end
-    print(("[DQR] === END (%d humanoid models within 400) ==="):format(n))
+    -- Models near us that look like mobs (a health bar or an animated
+    -- rig) but are not in the registry, and what they are made of: when
+    -- a dungeon's mobs are missed, this says how they are built.
+    local seenM, shown = {}, 0
+    for _, p in ipairs(NearbyParts(root.Position, 150)) do
+        if shown >= 12 then break end
+        local m = p:FindFirstAncestorOfClass("Model")
+        while m and m.Parent and m.Parent:IsA("Model") and m.Parent ~= workspace do
+            m = m.Parent                                   -- the outermost model
+        end
+        if m and not seenM[m] and not models[m] and not IsPlayerChar(m) then
+            seenM[m] = true
+            local bb, anim = false, false
+            for _, d in ipairs(m:GetDescendants()) do
+                if d:IsA("BillboardGui") then bb = true
+                elseif d:IsA("AnimationController") or d:IsA("Animator") then anim = true end
+            end
+            if bb or anim then
+                shown = shown + 1
+                local attrs = {}
+                for k, v in pairs(m:GetAttributes()) do
+                    attrs[#attrs + 1] = k .. "=" .. tostring(v)
+                    if #attrs >= 6 then break end
+                end
+                local kids = {}
+                for _, c in ipairs(m:GetChildren()) do
+                    if not c:IsA("BasePart") then kids[#kids + 1] = c.Name .. ":" .. c.ClassName end
+                    if #kids >= 8 then break end
+                end
+                print(("[Not a mob?] %s | bar=%s rig=%s | attrs: %s | children: %s")
+                    :format(m:GetFullName(), tostring(bb), tostring(anim),
+                        #attrs > 0 and table.concat(attrs, ", ") or "none",
+                        #kids > 0 and table.concat(kids, ", ") or "parts only"))
+            end
+        end
+    end
+    print(("[DQR] === END (%d mob models within 400) ==="):format(n))
 end
 end
 
@@ -2203,7 +2337,7 @@ local function DeadOwner(o)
     local n, depth = o.Parent, 0
     while n and n ~= workspace and depth < 8 do
         if n:IsA("Model") then
-            local h = n:FindFirstChildOfClass("Humanoid")
+            local h = n:FindFirstChildOfClass("Humanoid") or (Mobs.models and Mobs.models[n])
             if h then return h.Health <= 0 end
         end
         n, depth = n.Parent, depth + 1
@@ -2247,7 +2381,7 @@ local function IsMapPart(o)
         -- (Lord Varosh's greatsword read as a laser) - but a marker it
         -- is drawing on the floor is.
         if n:IsA("Model") then
-            local hum = n:FindFirstChildOfClass("Humanoid")
+            local hum = n:FindFirstChildOfClass("Humanoid") or (Mobs.models and Mobs.models[n])
             if hum then
                 found = not CreatureEffect(o, n, hum)
                 break
@@ -3012,7 +3146,7 @@ function Haz.Threat()
         local rad = math.max(s.X, s.Y, s.Z) / 2
         if rad * 2 > CONFIG.ThreatMaxSize then return end
         local owner = obj:FindFirstAncestorOfClass("Model")
-        if owner and owner:FindFirstChildOfClass("Humanoid") then return end
+        if owner and IsCreature(owner) then return end
         local vel = obj.AssemblyLinearVelocity
         local rec = tseen[obj]
         if vel.Magnitude < 8 and rec and now - rec.t > 0.02 then
@@ -3189,7 +3323,7 @@ end
 local function IsScenery(o, want)
     local n, depth = o.Parent, 0
     while n and n ~= workspace and depth < 14 do
-        if n:IsA("Model") and n:FindFirstChildOfClass("Humanoid") then return false end
+        if n:IsA("Model") and IsCreature(n) then return false end
         if want[n.Name:lower()] then return true end
         n, depth = n.Parent, depth + 1
     end
@@ -3475,7 +3609,7 @@ local function MapRoots(want)
             if want[c.Name:lower()] then
                 out[#out + 1] = c
             elseif depth > 0 and (c:IsA("Folder") or c:IsA("Model"))
-            and not c:FindFirstChildOfClass("Humanoid") then
+            and not IsCreature(c) then
                 Walk(c, depth - 1)
             end
         end
@@ -3780,7 +3914,7 @@ local function SurfaceIn(x, z, top, depth, rp)
     local hit = workspace:Raycast(Vector3.new(x, top, z), Vector3.new(0, -depth, 0), rp)
     if not hit or not hit.Instance.CanCollide or hit.Normal.Y < 0.6 then return nil end
     local m = hit.Instance:FindFirstAncestorOfClass("Model")
-    if m and m:FindFirstChildOfClass("Humanoid") then return nil end
+    if m and IsCreature(m) then return nil end
     -- Standing room. Also rejects a probe that started inside a solid
     -- column and came out on the floor underneath it, and the space
     -- under a staircase.
@@ -4487,10 +4621,10 @@ local function FloorNear(p, skip)
         local hit = workspace:Raycast(p + Vector3.new(0, 4, 0), Vector3.new(0, -16, 0), rp)
         if not hit then return nil end
         local m = hit.Instance:FindFirstAncestorOfClass("Model")
-        if hit.Instance.CanCollide and not (m and m:FindFirstChildOfClass("Humanoid")) then
+        if hit.Instance.CanCollide and not (m and IsCreature(m)) then
             return hit.Position + Vector3.new(0, 3, 0)
         end
-        ignore[#ignore + 1] = (m and m:FindFirstChildOfClass("Humanoid")) and m or hit.Instance
+        ignore[#ignore + 1] = (m and IsCreature(m)) and m or hit.Instance
     end
     return nil
 end
@@ -4512,7 +4646,7 @@ local function OpenBetween(a, b, skip)
             local hit = workspace:Raycast(a + off, b - a, rp)
             if not hit then break end
             local m = hit.Instance:FindFirstAncestorOfClass("Model")
-            if m and m:FindFirstChildOfClass("Humanoid") then
+            if m and IsCreature(m) then
                 ignore[#ignore + 1] = m
             elseif hit.Instance.CanCollide then
                 blocked = true
@@ -5979,7 +6113,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.6 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.7 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
