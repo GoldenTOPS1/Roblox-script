@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.7
+--  DQR AUTO FARM v12.8
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -982,11 +982,11 @@ end
 --  us - track them all. Handle adornments are drawn, not built, and
 --  can live anywhere (PlayerGui, Camera), so watch the whole game.
 -- ============================================================
-local recentParts  = setmetatable({}, {__mode = "k"})  -- part -> born
+local recentParts  = {}  -- part -> born
 local streamed     = setmetatable({}, {__mode = "k"})  -- arrived far away: scenery
-local beamObjects  = setmetatable({}, {__mode = "k"})  -- Beam -> true
-local adornObjects = setmetatable({}, {__mode = "k"})  -- adornment -> true
-local hiddenParts  = setmetatable({}, {__mode = "k"})  -- CanQuery-off effects
+local beamObjects  = {}  -- Beam -> true
+local adornObjects = {}  -- adornment -> true
+local hiddenParts  = {}  -- CanQuery-off effects
 
 local function IsAdorn(o)
     return o:IsA("LineHandleAdornment") or o:IsA("CylinderHandleAdornment")
@@ -1020,8 +1020,18 @@ workspace.DescendantAdded:Connect(function(o)
     end
 end)
 task.spawn(function()
+    local trimAt = 0
     while true do
         S(0.1)
+        -- Old entries out, farm or no farm (the hazard scan trims them
+        -- too, but only runs while farming).
+        local t = tick()
+        if t - trimAt > 2 then
+            trimAt = t
+            for p, born in pairs(recentParts) do
+                if t - born > CONFIG.RecentWindow then recentParts[p] = nil end
+            end
+        end
         if #bornQ > 0 then
             local q = bornQ
             bornQ = {}
@@ -1043,6 +1053,11 @@ task.spawn(function()
         end
     end
 end)
+-- These registries hold their parts strongly and are emptied here. They
+-- used to be weak tables, and a weak table keyed by Roblox objects
+-- drops an entry whenever the script holds no other reference to that
+-- object - even though it is still in the game. A beam or a laser part
+-- nobody had looked at for a moment simply fell out of the list.
 workspace.DescendantRemoving:Connect(function(o)
     beamObjects[o], recentParts[o], hiddenParts[o] = nil, nil, nil
 end)
@@ -1648,12 +1663,12 @@ end
 do
 Mobs.list, Mobs.at, Mobs.current = {}, 0, nil
 local banned = {}                                   -- model -> until
-local knownBoss = setmetatable({}, {__mode = "k"})  -- model -> why (sticky)
-local models = setmetatable({}, {__mode = "k"})     -- model -> Humanoid
+local knownBoss = {}  -- model -> why (sticky)
+local models = {}     -- model -> Humanoid
 local shape  = setmetatable({}, {__mode = "k"})     -- model -> {ok, bb, t}
 local radius = setmetatable({}, {__mode = "k"})     -- model -> studs
 local rootOf = setmetatable({}, {__mode = "k"})     -- model -> part
-local bossHum = setmetatable({}, {__mode = "k"})    -- boss being fought -> Humanoid
+local bossHum = {}    -- boss being fought -> Humanoid
 Mobs.bossDiedAt = nil                               -- read by Haz: leftovers
 
 function Mobs.Ban(model, secs)
@@ -1678,7 +1693,7 @@ end
 -- view while the scan found "0 mobs", because it only ever looked for
 -- models with a Humanoid in them, and newer mobs are built without one
 -- (an AnimationController rig, health kept as a value or attribute).
-local enemyOf = setmetatable({}, {__mode = "k"})    -- model -> true
+local enemyOf = {}    -- model -> true
 local function EnemyFolderName(n)
     local l = n.Name:lower()
     return l:find("enem", 1, true) ~= nil or l:find("mob", 1, true) ~= nil
@@ -1749,6 +1764,16 @@ end
 workspace.DescendantAdded:Connect(Watch)
 task.spawn(function()
     for _, o in ipairs(workspace:GetDescendants()) do Watch(o) end
+end)
+-- The registry holds its models strongly (a weak one lost Northern
+-- Lands' first room - registered at boot, dropped by the garbage
+-- collector before the first scan seven seconds later), so a model
+-- leaving the game leaves the registry here. One moved within the
+-- workspace is re-registered by Watch straight after.
+workspace.DescendantRemoving:Connect(function(o)
+    if models[o] or enemyOf[o] or knownBoss[o] then
+        models[o], enemyOf[o], knownBoss[o] = nil, nil, nil
+    end
 end)
 
 -- The part a model is measured from. Big boss rigs rarely have a
@@ -2019,6 +2044,13 @@ function Mobs.Scan(force)
             local rec = Record(obj, hum, me, barHit)
             if rec and rec.Dist <= CONFIG.MobScanRadius then list[#list + 1] = rec end
         end
+    end
+    -- Nothing at all: re-register from scratch now and then, in case a
+    -- mob slipped past the registry (it is event driven, and one missed
+    -- event used to mean a room of mobs the bot could never see).
+    if #list == 0 and now - (Mobs.resweepAt or 0) > 3 then
+        Mobs.resweepAt = now
+        for _, o in ipairs(workspace:GetDescendants()) do Watch(o) end
     end
 
     -- Anything with BossHealthRatio times the health of a typical mob
@@ -2676,7 +2708,7 @@ end
 -- part in the zone colour (checked a moment after it appears - the
 -- colour is often set after parenting), plus a wide sweep once a
 -- second for a floor panel that turns that colour in place.
-local zoneParts = setmetatable({}, {__mode = "k"})
+local zoneParts = {}
 local function ZoneCheck(o)
     local want = CONFIG.SafeZone
     if want and want ~= "" and o.Parent and WarnColor(o.Color) == want then
@@ -3303,10 +3335,10 @@ end)
 local STUDS = "rbxassetid://6372755229"      -- the Baseplate's own stud texture
 local SKIP = {camera = true, lighting = true, terrain = true}
 local WALL_THICK, WALL_MIN_H = 6, 7.5        -- a jump clears about 7
-local done  = setmetatable({}, {__mode = "k"})  -- part -> "ground"/"wall"/"decor"/"edge"
-local orig  = setmetatable({}, {__mode = "k"})  -- part -> saved properties
-local walls = setmetatable({}, {__mode = "k"})  -- parts taken out as walls
-local stairs = setmetatable({}, {__mode = "k"}) -- steps and ramps: ways up
+local done  = {}  -- part -> "ground"/"wall"/"decor"/"edge"
+local orig  = {}  -- part -> saved properties
+local walls = {}  -- parts taken out as walls
+local stairs = {} -- steps and ramps: ways up
 local newGround = {}                            -- where ground streamed in lately
 Look.mapMode = nil
 
@@ -3672,6 +3704,14 @@ workspace.DescendantAdded:Connect(function(o)
         if (o.Position - at).Magnitude > 0.5 or not LooksBuilt(o) then return end
         pcall(Strip, o, Look.mapMode, true)
     end)
+end)
+-- Map parts leaving (the run over, or streamed out) leave these lists.
+-- Strong tables - the staircase list is exactly what must not forget a
+-- step - so this is what keeps them from growing run after run.
+workspace.DescendantRemoving:Connect(function(o)
+    if done[o] then
+        done[o], orig[o], walls[o], stairs[o] = nil, nil, nil, nil
+    end
 end)
 
 -- Put the map back the way it was (DQR_Map("off") in the console).
@@ -6113,7 +6153,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.7 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.8 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
