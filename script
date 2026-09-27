@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.18
+--  DQR AUTO FARM v12.19
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -17,7 +17,7 @@ local CONFIG = {
     -- Class to "" to tune those by hand instead.
     Class          = "Mage",
 
-    -- The dungeon to run. This also picks the settings: whatever that
+    -- The dungeon to run. This also picks thet settings: whatever that
     -- dungeon's entry in MAP_PROFILES (further down) says is used for
     -- the run, on top of the defaults in this CONFIG block.
     TargetDungeon  = "Enchanted Forest",
@@ -4345,7 +4345,9 @@ local function FloorLevel()
     if not root then return nil end
     local rp = RaycastParams.new()
     rp.FilterType = EXCLUDE
-    rp.FilterDescendantsInstances = {GetChar()}
+    -- Not our own plane: after a replay it may still sit where the
+    -- last run's fight lowered it.
+    rp.FilterDescendantsInstances = {GetChar(), plane}
     rp.IgnoreWater = true
     local c, ys = root.Position, {}
     for _, d in ipairs({0, 20, 40, 70}) do
@@ -4661,7 +4663,11 @@ function Look.ApplyMap()
             end) end
             local n = 0
             for _, o in ipairs(workspace:GetDescendants()) do
-                if o:IsA("BasePart") and not done[o] and not recentParts[o]
+                -- Recently added parts too, if they look built: on a replay
+                -- the game rebuilds the map, so ALL of it is "recent" - and
+                -- skipping recent parts left the replayed map untouched.
+                if o:IsA("BasePart") and not done[o]
+                and (not recentParts[o] or streamed[o] or LooksBuilt(o))
                 and not Haz.NameHas(o, CONFIG.HazardNames) and IsWorldScenery(o) then
                     pcall(StripBase, o, y0, false)
                     n = n + 1
@@ -4739,6 +4745,41 @@ end)
 workspace.DescendantRemoving:Connect(function(o)
     if done[o] then
         done[o], orig[o], walls[o], stairs[o] = nil, nil, nil, nil
+    end
+end)
+
+-- WATCHDOG. Every 3 seconds while farming: if more than 40 map parts
+-- around us are still showing untouched, the map was rebuilt (a replay)
+-- or loaded after the pass - run the pass again.
+task.spawn(function()
+    local lastRe = 0
+    while true do
+        S(3)
+        local mode = CONFIG.MapMode
+        local root = GetRoot()
+        -- At most once every 20 seconds: a full pass walks the whole
+        -- workspace, and parts it deliberately leaves must not make it
+        -- run over and over.
+        if Farm.Running and root and tick() - lastRe > 20 and (mode == "baseplate" or mode == "flat" or mode == "hide") then
+            local want = mode ~= "baseplate" and FolderSet() or nil
+            local left = 0
+            for _, o in ipairs(NearbyParts(root.Position, 80)) do
+                if not done[o] and o.Transparency < 0.95 and o.LocalTransparencyModifier < 1
+                and o.Name:sub(1, 4) ~= "DQR_" and not recentParts[o]
+                and not Haz.NameHas(o, CONFIG.HazardNames) then
+                    local scenery
+                    if want then scenery = IsScenery(o, want) else scenery = IsWorldScenery(o) end
+                    if scenery then left = left + 1 end
+                end
+                if left > 40 then break end
+            end
+            if left > 40 then
+                print("[DQR] Map look: the map is showing again (rebuilt for a replay?) - "
+                    .. "applying it again.")
+                lastRe = tick()
+                Look.ApplyMap()
+            end
+        end
     end
 end)
 
@@ -7481,7 +7522,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.18 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.19 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
