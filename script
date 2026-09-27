@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.14
+--  DQR AUTO FARM v12.15
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -1045,7 +1045,9 @@ Haz.spell = {}                                   -- part -> true
 local spellModel = {}                            -- model -> true
 local castAt = {}                                -- player -> last spell cast
 local pending = {}                               -- parts to ask again: {o, pl, t, m}
-local CAST_WINDOW, CAST_RADIUS = 1.0, 20
+-- 10 studs: a spell's parts are born on or beside the caster. At 20, a
+-- mob's attack landing near us in the same second counted as ours.
+local CAST_WINDOW, CAST_RADIUS = 1.0, 10
 local MOVE_WORDS = {"idle", "walk", "run", "jump", "fall", "climb", "swim", "sit", "land", "toolnone"}
 -- Cast signal 1: an animation starts on a player's character that is
 -- not one of its Animate script's moves (walk, idle, jump...). Any
@@ -1076,6 +1078,13 @@ local function HookAnimator(pl, a, char)
                 if w == mw then return end
             end
         end
+        -- A looping track is a stance or a hold, not a cast.
+        if track.Looped then return end
+        -- For us, the cooldown number on the Q / E slots is the proof,
+        -- once it has been seen working: a hit reaction or any other
+        -- one-off animation would otherwise open the "our spell" window
+        -- and hide the mobs' attacks landing around us.
+        if pl == LP and Haz.cdWorks then return end
         castAt[pl] = tick()
         if pl == LP then Haz.castVia = "animation" end
     end)
@@ -1129,7 +1138,7 @@ task.spawn(function()
             local was = last[o]
             if v and v > 0.5 and v < 60 and (was == nil or v > was + 0.5) then
                 castAt[LP] = now
-                Haz.castVia = "cooldown"
+                Haz.castVia, Haz.cdWorks = "cooldown", true
             end
             last[o] = v
         end
@@ -2750,7 +2759,7 @@ local function SpellOnSight(o)
         local pl = Players:GetPlayerFromCharacter(c)
         local r = c:FindFirstChild("HumanoidRootPart")
         local t = pl and ca[pl]
-        if r and t and now - t < 1.2 and FlatDist(o.Position, r.Position) < 12 then
+        if r and t and now - t < 1.0 and FlatDist(o.Position, r.Position) < 10 then
             Haz.spell[o] = true
             return true
         end
@@ -2785,6 +2794,8 @@ local function WarnColor(c)
     if h >= 0.70 and h <= 0.97 and s >= 0.18 and v >= 0.35 then return "purple" end
     if h >= 0.20 and h <= 0.45 and s >= 0.30 and v >= 0.45 then return "green" end
     if h >= 0.45 and h <= 0.62 and s >= 0.35 and v >= 0.55 then return "cyan" end
+    -- Blue, between cyan and purple - the gap a blue telegraph fell into.
+    if h > 0.62 and h < 0.70 and s >= 0.45 and v >= 0.5 then return "blue" end
     return nil
 end
 
@@ -2863,6 +2874,22 @@ local function TooOld(src)
         return true
     end
     return false
+end
+
+-- The footprints touching the hitbox at `pos` that have been there,
+-- unbroken, for 10 seconds or more: banned like aged-out decoration.
+-- Fresh attacks are left alone however many there are. Returns names.
+function Haz.BanTouching(pos)
+    local now, names = tick(), {}
+    for _, h in ipairs(Haz.real) do
+        local src = h.src
+        if src and srcFirst[src] and now - srcFirst[src] > 10
+        and Haz.BoxClear(pos, true, {h}) < 0 then
+            srcBan[src] = now + CONFIG.HazardBanTime
+            names[#names + 1] = src:GetFullName()
+        end
+    end
+    return names
 end
 
 local function Describe(h)
@@ -5190,11 +5217,18 @@ local function Heartbeat(dt)
             human.Jump = true
             pcall(function() human:ChangeState(Enum.HumanoidStateType.Jumping) end)
             ClearPath()
-            Nav.force = true
-            local back = Flat(-root.CFrame.LookVector)
+            Nav.force, Nav.direct = true, false
+            -- Back away from where we were trying to GO. The body faces
+            -- the target, not the way we walk, so "behind us" was often
+            -- sideways to whatever we were stuck on.
+            local back = Flat(pos - (step or goal))
+            if back.Magnitude < 0.01 then back = Flat(-root.CFrame.LookVector) end
             if back.Magnitude < 0.01 then back = Vector3.new(1, 0, 0) end
             back = back.Unit
-            local side = Vector3.new(-back.Z, 0, back.X) * ((stuckCount % 2 == 0) and 1 or -1)
+            -- The same side twice before trying the other: flipping every
+            -- time walked it left, right, left, right on one spot.
+            local sideSign = (math.floor((stuckCount - 1) / 2) % 2 == 0) and 1 or -1
+            local side = Vector3.new(-back.Z, 0, back.X) * sideSign
             local spot = Nav.SafeStep(pos, (back * 0.7 + side).Unit, CONFIG.UnstickDist)
             Nav.unstick = spot and Flat(spot - pos).Unit or back
             Nav.unstickUntil = now + CONFIG.UnstickTime
@@ -5453,6 +5487,8 @@ local lastPos, lastTarget = nil, nil
 -- back to it. Survives Brain.Reset on purpose: a death is exactly when
 -- it is needed.
 local lastFight, backSince = nil, 0
+-- Going back and forth: where we were every half second for 6 seconds.
+local wob = {pts = {}, at = 0, detourUntil = 0, lastHit = 0}
 
 -- Forget everything decided about the last position: after a death, a
 -- respawn or any teleport. A "can't get closer" verdict reached beside
@@ -5682,6 +5718,7 @@ end
 -- into anything between it and a target it was not yet in range of -
 -- the Deity of the Volcano's red dome, the Lava King's floor beams.
 local approachMemo = {t = 0}
+local approachSide = {s = nil, t = 0}           -- the way round last chosen
 local SafeApproachRaw
 local function SafeApproach(pos, goal)
     if #Haz.shapes == 0 then return goal end
@@ -5697,6 +5734,7 @@ local function SafeApproach(pos, goal)
     return out
 end
 function SafeApproachRaw(pos, goal)
+    local now0 = tick()
     local d = Flat(goal - pos)
     local len = d.Magnitude
     if len < 1 then return goal end
@@ -5724,7 +5762,11 @@ function SafeApproachRaw(pos, goal)
     -- Checked closest-first, so the (costly) path test usually runs once.
     -- Sideways counts too (a little further from the goal, never much):
     -- stepping along a strip to the end of it is how to get round it.
+    -- Once a side is picked, it is kept for two seconds: re-deciding from
+    -- each new spot picked left, then right, then left again, and the
+    -- bot walked back and forth in front of the strip.
     local here = FlatDist(pos, goal)
+    local keepSide = now0 - (approachSide.t or 0) < 2 and approachSide.s or nil
     local cands = {}
     for i = 0, 15 do
         local a = i * math.pi / 8
@@ -5732,13 +5774,21 @@ function SafeApproachRaw(pos, goal)
         for _, s in ipairs({6, 10, 14}) do
             local p = pos + v * s
             local dd = FlatDist(p, goal)
-            if dd < here + 6 then cands[#cands + 1] = {p = p, d = dd} end
+            if dd < here + 6 then
+                local side = (u.X * v.Z - u.Z * v.X) >= 0 and 1 or -1
+                local key = dd + ((keepSide and side ~= keepSide) and 12 or 0)
+                cands[#cands + 1] = {p = p, d = key, side = side}
+            end
         end
     end
     table.sort(cands, function(x, y) return x.d < y.d end)
     for i = 1, math.min(#cands, 24) do
-        local p = cands[i].p
-        if not Haz.OnPath(pos, p, near) and LineClear(pos, p) and HasGround(p) then return p end
+        local c = cands[i]
+        local p = c.p
+        if not Haz.OnPath(pos, p, near) and LineClear(pos, p) and HasGround(p) then
+            approachSide.s, approachSide.t = c.side, now0
+            return p
+        end
     end
     return nil
 end
@@ -5938,17 +5988,22 @@ function Brain.Tick(root)
     local goal, state = nil, nil
     local inHaz = #Haz.shapes > 0 and Haz.At(pos)
 
-    -- In a "hazard" far longer than any real attack lasts: the scanner
-    -- is misreading something. Stop listening to it for a while.
+    -- In the SAME footprint far longer than any real attack lasts: the
+    -- scanner is misreading that one part. Ignore it - just it. This
+    -- used to switch off ALL hazards for 15 seconds after 25 seconds of
+    -- touching any hazard at all, and a busy fight (one strip after
+    -- another) got there easily: the bot then dodged nothing.
     if inHaz then
         if Haz.inSince == 0 then Haz.inSince = now end
         if now - Haz.inSince > CONFIG.HazardStuckTime then
-            Haz.inSince, Haz.muteUntil = 0, now + CONFIG.HazardMute
-            table.clear(Haz.shapes)
-            evade, inHaz = nil, false
-            print(("[DQR] In a 'hazard' for %ds straight - treating it as a misreading "
-                .. "and ignoring hazards for %ds. HazardDebug will name it.")
-                :format(CONFIG.HazardStuckTime, CONFIG.HazardMute))
+            Haz.inSince = 0
+            local names = Haz.BanTouching(pos)
+            evade = nil
+            if #names > 0 then
+                print(("[DQR] Under the same part for %ds - treating it as a misreading "
+                    .. "and ignoring it: %s"):format(CONFIG.HazardStuckTime,
+                    table.concat(names, ", ")))
+            end
         end
     else
         Haz.inSince = 0
@@ -6087,7 +6142,9 @@ function Brain.Tick(root)
             if dist <= spellR and (crosses or now < settleUntil) then
                 state = "Fighting " .. name
             else
-                goal = SafeApproach(pos, pt)
+                -- On a detour (see the back-and-forth check below): straight
+                -- for the target, routed, no stepping round strips.
+                goal = (now < wob.detourUntil) and pt or SafeApproach(pos, pt)
                 if goal == pt then
                     state = ("Approaching %s (%d studs)"):format(name, math.floor(dist / 5) * 5)
                 elseif goal then
@@ -6158,6 +6215,44 @@ function Brain.Tick(root)
     if inHaz and not evade and not dodge then
         state = state .. " (in a hazard, no clean exit)"
     end
+    -- BACK AND FORTH. Trying to move for six seconds but still inside a
+    -- small circle, not dodging: stuck swinging between two choices.
+    -- First time: head for the target by a route for three seconds,
+    -- ignoring the ways round. Again within 20s: leave that target.
+    if now - wob.at >= 0.5 then
+        wob.at = now
+        local pts = wob.pts
+        pts[#pts + 1] = {p = pos, moving = goal ~= nil, dodging = evade ~= nil or dodge ~= nil}
+        if #pts > 12 then table.remove(pts, 1) end
+        if #pts == 12 and now >= wob.detourUntil then
+            local sx, sz, moving, dodging, pathLen = 0, 0, 0, 0, 0
+            for i, e in ipairs(pts) do
+                sx, sz = sx + e.p.X, sz + e.p.Z
+                if e.moving then moving = moving + 1 end
+                if e.dodging then dodging = dodging + 1 end
+                if i > 1 then pathLen = pathLen + FlatDist(e.p, pts[i - 1].p) end
+            end
+            local c = Vector3.new(sx / 12, 0, sz / 12)
+            local maxR = 0
+            for _, e in ipairs(pts) do maxR = math.max(maxR, FlatDist(e.p, c)) end
+            if moving >= 10 and dodging <= 4 and maxR < 6 and pathLen > 14 then
+                table.clear(pts)
+                if tgt and now - wob.lastHit < 20 then
+                    Mobs.Ban(tgt.Model, CONFIG.UnreachableFor)
+                    print(("[DQR] Still going back and forth - leaving %s for %ds.")
+                        :format(tgt.Model.Name, CONFIG.UnreachableFor))
+                else
+                    wob.detourUntil = now + 3
+                    Nav.force = true
+                    print("[DQR] Going back and forth in one spot - taking a route "
+                        .. "straight for the target instead.")
+                end
+                wob.lastHit = now
+            end
+        end
+    end
+    if now < wob.detourUntil then direct = false end
+
     Nav.goal = goal
     Nav.direct = direct and goal ~= nil
     Brain.state = state
@@ -7152,7 +7247,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.14 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.15 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
