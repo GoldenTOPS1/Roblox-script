@@ -22,7 +22,7 @@ local CONFIG = {
     -- the run, on top of the defaults in this CONFIG block.
     TargetDungeon  = "Enchanted Forest",
     Difficulty     = "Nightmare",
-    Hardcore       = true,  -- true = also press HARDCORE MODE
+    Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
     -- CARRY MODE: after creating the lobby, wait on the party screen
