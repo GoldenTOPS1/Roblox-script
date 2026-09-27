@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.22
+--  DQR AUTO FARM v12.23
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -1316,28 +1316,12 @@ task.spawn(function()
         end
     end
 end)
--- Named attack volumes already in the game when the script starts, and
--- small loose parts already hanging around a player (a pet, an aura):
--- theirs, as if they had been born beside them.
+-- Named attack volumes already in the game when the script starts.
 task.spawn(function()
     S(1.5)
-    local roots = {}
-    for _, pl in ipairs(Players:GetPlayers()) do
-        local r = pl.Character and pl.Character:FindFirstChild("HumanoidRootPart")
-        if r then roots[#roots + 1] = r.Position end
-    end
     for _, o in ipairs(workspace:GetDescendants()) do
-        if o:IsA("BasePart") then
-            if Haz.NameHas and Haz.NameHas(o, CONFIG.HazardNames) then
-                Haz.named[o] = true
-            elseif not o.Anchored or not o.CanCollide then
-                local s = o.Size
-                if math.max(s.X, s.Y, s.Z) <= 8 then
-                    for _, rp in ipairs(roots) do
-                        if (o.Position - rp).Magnitude < 12 then playerBorn[o] = true break end
-                    end
-                end
-            end
+        if o:IsA("BasePart") and Haz.NameHas and Haz.NameHas(o, CONFIG.HazardNames) then
+            Haz.named[o] = true
         end
     end
 end)
@@ -2736,6 +2720,10 @@ Haz.real = {}                       -- Haz.shapes without the look-ahead ghosts
 local firstSeen = setmetatable({}, {__mode = "k"})  -- source -> first footprint
 local castBy    = setmetatable({}, {__mode = "k"})  -- source -> a mob was near then
 local owners    = {}                                -- living mobs about: {p, r}
+-- Invisible named attack volumes: where and how big they were when we
+-- first saw them like that, and since when (see rule 1 in Classify).
+local namedSeen = setmetatable({}, {__mode = "k"})
+Haz.spent = 0
 
 -- Inside a creature that is dead: whatever it was casting is over.
 local function DeadOwner(o)
@@ -2832,17 +2820,9 @@ local function NameHas(o, list)
     return false
 end
 
--- Stuck to a player, or going wherever a player goes: never an attack.
---   * welded to them, or keeping the same offset while they walk (an
---     aura or a glow);
---   * a COMPANION: small, and staying within 15 studs of the same player
---     for 2.5 seconds while that player covers 12 studs, or for 4
---     seconds while it drifts about - a pet orb. The green orb that
---     follows the character was read as a moving ball of damage: the
---     hitbox went red on open ground, the bot "dodged" it (it follows),
---     sidestepped it as a projectile, and its predicted path blocked
---     every way out of the dragon's circle. A homing attack never
---     stays that long - it hits or it is gone.
+-- Stuck to a player: welded to one, or keeping the same offset from one
+-- while that player walks - an aura or glow that goes where they go.
+-- An attack aimed at us stays where it landed when we move away.
 -- A part found to be one marks its whole model (Haz.followModel).
 local followRec = setmetatable({}, {__mode = "k"})
 Haz.followModel = {}
@@ -2855,7 +2835,7 @@ local function MarkFollower(o)
 end
 local function FollowsPlayer(o)
     local p = o.Position
-    local best, bestD = nil, 15
+    local best, bestD = nil, 6
     for _, c in ipairs(chars) do
         local r = c:FindFirstChild("HumanoidRootPart")
         if r then
@@ -2865,33 +2845,22 @@ local function FollowsPlayer(o)
         end
     end
     if not best then followRec[o] = nil return false end
-    local now, rp = tick(), best.Position
-    local off = p - rp
+    local off, rp = p - best.Position, best.Position
     local rec = followRec[o]
-    if not rec or rec.r ~= best then
-        followRec[o] = {r = best, since = now, rp = rp, pp = p, off = off,
-                        pMoved = 0, oMoved = 0, hits = 0}
+    if rec and rec.r == best then
+        if (rp - rec.rp).Magnitude > 1 then
+            -- The player moved: did the part come along?
+            if (off - rec.off).Magnitude < 0.8 then
+                rec.hits = rec.hits + 1
+                if rec.hits >= 2 then MarkFollower(o) return true end
+            else
+                rec.hits = 0
+            end
+            rec.off, rec.rp = off, rp
+        end
         return false
     end
-    local step = FlatDist(rp, rec.rp)
-    rec.pMoved = rec.pMoved + step
-    rec.oMoved = rec.oMoved + (p - rec.pp).Magnitude
-    if step > 1 then
-        -- The player moved: did the part keep its place beside them?
-        if (off - rec.off).Magnitude < 0.8 then rec.hits = rec.hits + 1 else rec.hits = 0 end
-    end
-    rec.rp, rec.pp, rec.off = rp, p, off
-    if rec.hits >= 2 then MarkFollower(o) return true end
-    local s = o.Size
-    local held = now - rec.since
-    if math.max(s.X, s.Y, s.Z) <= 8 and held >= 2.5
-    -- It must have come along: a marker lying still while we walk
-    -- about near it is not following anyone.
-    and ((rec.pMoved >= 12 and rec.oMoved >= rec.pMoved * 0.6)
-         or (held >= 4 and rec.oMoved >= 3)) then
-        MarkFollower(o)
-        return true
-    end
+    followRec[o] = {r = best, off = off, rp = rp, hits = 0}
     return false
 end
 
@@ -3429,6 +3398,23 @@ local function Classify(o, pos, reach)
             Haz.orphans = Haz.orphans + 1
             return
         end
+        -- SPENT: invisible, and not moved or resized for 2.5 seconds. A
+        -- hitBox is live for the moment its attack fires; one still sitting
+        -- there invisible afterwards has been left behind (or parked for
+        -- the next cast). Counted, it turned the hitbox red on open ground
+        -- for ten seconds and had the bot stepping round nothing.
+        if VisTrans(o) > 0.95 then
+            local now, rec = tick(), namedSeen[o]
+            local sz = PartSize(o)
+            if not rec or (o.Position - rec.p).Magnitude > 0.5 or (sz - rec.s).Magnitude > 0.5 then
+                namedSeen[o] = {p = o.Position, s = sz, t = now}
+            elseif now - rec.t > 2.5 then
+                Haz.spent = Haz.spent + 1
+                return
+            end
+        else
+            namedSeen[o] = nil
+        end
         -- A named tornado/whirlpool is a column like any other - its
         -- hitBox is usually invisible, so that is allowed here.
         local height, w = ColumnShape(o, true)
@@ -3654,7 +3640,7 @@ function Haz.Scan(pos)
     table.clear(Haz.shapes)
     table.clear(Haz.real)
     table.clear(Haz.safe)
-    Haz.orphans = 0
+    Haz.orphans, Haz.spent = 0, 0
     local done = {}
     -- Safe zones first, and even while hazards are muted: the mute is
     -- for misread footprints, and it used to switch the Lava King's
@@ -3978,6 +3964,10 @@ function Haz.Diag()
     if Haz.orphans > 0 then
         print(("[DQR] %d leftover footprint(s) ignored - their casters are dead or gone.")
             :format(Haz.orphans))
+    end
+    if Haz.spent > 0 then
+        print(("[DQR] %d invisible attack volume(s) ignored - unchanged for 2.5s, spent.")
+            :format(Haz.spent))
     end
     for _, z in ipairs(Haz.safe) do
         print(("[Safe zone] r=%d, %d studs away <- %s"):format(z.r,
@@ -7755,7 +7745,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.22 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.23 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
