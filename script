@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.5
+--  DQR AUTO FARM v12.6
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -207,6 +207,8 @@ local CONFIG = {
     FootOffset     = 3,
     ThreatMaxSize  = 40,     -- biggest thing still treated as a projectile
     RecentWindow   = 8,      -- a part this new counts as just spawned
+    StreamFar      = 50,     -- ...unless it appeared further away than
+                             -- this: that is the map streaming in
     ActiveLinger   = 3.5,    -- stays a hazard this long after it last changed
     HazardMaxAge   = 20,     -- a source live longer than this is decor...
     HazardBanTime  = 120,    -- ...and is ignored for this long
@@ -963,6 +965,7 @@ end
 --  can live anywhere (PlayerGui, Camera), so watch the whole game.
 -- ============================================================
 local recentParts  = setmetatable({}, {__mode = "k"})  -- part -> born
+local streamed     = setmetatable({}, {__mode = "k"})  -- arrived far away: scenery
 local beamObjects  = setmetatable({}, {__mode = "k"})  -- Beam -> true
 local adornObjects = setmetatable({}, {__mode = "k"})  -- adornment -> true
 local hiddenParts  = setmetatable({}, {__mode = "k"})  -- CanQuery-off effects
@@ -973,16 +976,52 @@ local function IsAdorn(o)
         or o:IsA("ImageHandleAdornment")
 end
 
+-- STREAMING. The game loads the map in around us as we walk, and every
+-- part it loads fires DescendantAdded exactly like an attack spawning.
+-- An orange lava crack that had just streamed in read as a brand-new
+-- orange telegraph for eight seconds - the hitbox went red on bare
+-- floor, the bot "stepped out of hazards" that were not there, and
+-- every approach path "crossed" one. Streamed parts arrive far away
+-- (at the edge of the streaming radius); attacks appear near us. So a
+-- new part is checked a moment after it arrives, once whatever made it
+-- has had a frame to put it in place: if its nearest point is more than
+-- StreamFar studs from us, it is scenery, not new.
+local bornQ = {}
 workspace.DescendantAdded:Connect(function(o)
     if o:IsA("Beam") then
         beamObjects[o] = true
     elseif o:IsA("BasePart") then
         recentParts[o] = tick()
+        bornQ[#bornQ + 1] = o
         -- The broadphase never returns CanQuery-off parts, and effect
         -- parts very often have it off. Haz.Track filters out the map
         -- decor so this stays a short list.
         if not o.CanQuery and Haz.Track and Haz.Track(o) then
             hiddenParts[o] = true
+        end
+    end
+end)
+task.spawn(function()
+    while true do
+        S(0.1)
+        if #bornQ > 0 then
+            local q = bornQ
+            bornQ = {}
+            local root = GetRoot()
+            local me = root and root.Position
+            for _, o in ipairs(q) do
+                if me and recentParts[o] and o.Parent then
+                    local ok, d = pcall(function()
+                        local h = o.Size / 2
+                        local rel = o.CFrame:PointToObjectSpace(me)
+                        return (rel - Vector3.new(math.clamp(rel.X, -h.X, h.X),
+                            math.clamp(rel.Y, -h.Y, h.Y), math.clamp(rel.Z, -h.Z, h.Z))).Magnitude
+                    end)
+                    if ok and d > CONFIG.StreamFar then
+                        recentParts[o], streamed[o] = nil, true
+                    end
+                end
+            end
         end
     end
 end)
@@ -1051,6 +1090,9 @@ function LooksActive(o, fresh)
     -- Out of sight for a while and back: a pooled spoke fired at the
     -- same angle as last time would otherwise read as "never moved".
     if rec and now - rec.seen > 3 then rec = nil end
+    -- Seen in the moment before it was found to have streamed in: it
+    -- was never new.
+    if rec and rec.why == "new" and streamed[o] then rec.why, rec.moved = nil, 0 end
     if not rec then
         local why = new and "new" or fresh and "fresh" or nil
         seen[o] = {pos = o.Position, tr = o.Transparency, size = PartSize(o),
@@ -1872,6 +1914,7 @@ function Mobs.Scan(force)
                 .. "health - F8 lists what is there."):format(bb.text))
         end
     end
+    Mobs.barModel = barHit
 
     for obj, hum in pairs(models) do
         if not obj.Parent or hum.Parent ~= obj then
@@ -1973,6 +2016,19 @@ end
 -- spot between two mobs and walk nowhere.
 function Mobs.Target()
     local list = Mobs.Scan()
+    -- The boss whose bar is up is THE target: no ban, pack rule or
+    -- stickiness gets in its way.
+    local bm = Mobs.barModel
+    if bm and CONFIG.PreferBoss then
+        for _, rec in ipairs(list) do
+            if rec.Model == bm then
+                banned[bm] = nil
+                rec.Pack, rec.PackN = rec.Aim, 1
+                Mobs.current = bm
+                return rec
+            end
+        end
+    end
     local open = {}
     for _, rec in ipairs(list) do
         if not Mobs.Banned(rec.Model) then open[#open + 1] = rec end
@@ -2155,6 +2211,28 @@ local function DeadOwner(o)
     return false
 end
 
+-- A part kept inside a creature that is NOT part of its body: a floor
+-- marker the creature is drawing. Anchored, not solid, not joined to
+-- the rig (a body part, a weapon, anything animated is welded or
+-- Motor6D'd to the root and shares its assembly), lying flat, and
+-- drawn like an effect - glowing, see-through, or a bright colour.
+-- The Ancient Lava Mage's orange floor lines live inside the boss, and
+-- "everything in a creature is its body" hid them: the bot stood on
+-- one until the laser it marked fired.
+local function CreatureEffect(o, model, hum)
+    if o.CanCollide or not o.Anchored then return false end
+    local root = hum.RootPart or model.PrimaryPart
+    if root and o.AssemblyRootPart == root.AssemblyRootPart then return false end
+    local cf, s = o.CFrame, PartSize(o)
+    local height = math.abs(cf.RightVector.Y) * s.X + math.abs(cf.UpVector.Y) * s.Y
+                 + math.abs(cf.LookVector.Y) * s.Z
+    if height > 3 then return false end
+    local c = o.Color
+    local _, sat, val = c:ToHSV()
+    return o.Material == Enum.Material.Neon or o.Transparency > 0.05
+        or (sat >= 0.5 and val >= 0.6)
+end
+
 local function IsMapPart(o)
     local known = mapMemo[o]
     if known ~= nil then return known end
@@ -2166,9 +2244,14 @@ local function IsMapPart(o)
     while n and n ~= workspace and depth < 10 do
         if mapLower[n.Name:lower()] then found = true break end
         -- A creature's own body and weapons are not attacks either
-        -- (Lord Varosh's greatsword read as a laser).
-        if n:IsA("Model") and n:FindFirstChildOfClass("Humanoid") then
-            found = true break
+        -- (Lord Varosh's greatsword read as a laser) - but a marker it
+        -- is drawing on the floor is.
+        if n:IsA("Model") then
+            local hum = n:FindFirstChildOfClass("Humanoid")
+            if hum then
+                found = not CreatureEffect(o, n, hum)
+                break
+            end
         end
         n, depth = n.Parent, depth + 1
     end
@@ -2476,7 +2559,7 @@ local function ZonesAround(pos, done)
     local want = CONFIG.SafeZone
     if not want or want == "" then return end
     local now, range = tick(), CONFIG.SafeZoneRange
-    if now - zoneSweepAt > 1 then
+    if now - zoneSweepAt > 0.4 then
         zoneSweepAt = now
         for _, o in ipairs(NearbyParts(pos, range)) do pcall(ZoneCheck, o) end
     end
@@ -2485,9 +2568,13 @@ local function ZonesAround(pos, done)
             zoneParts[o] = nil
         elseif not done[o] and FlatDist(o.Position, pos) <= range
         and math.abs(o.Position.Y - pos.Y) < 25 then
-            done[o] = true
+            -- Marked done only when it IS a zone: a green part that is
+            -- not one (a ball of poison) still gets its hazard check.
             local ok, z = pcall(SafeZoneOf, o)
-            if ok and z then Haz.safe[#Haz.safe + 1] = z end
+            if ok and z then
+                done[o] = true
+                Haz.safe[#Haz.safe + 1] = z
+            end
         end
     end
 end
@@ -2650,6 +2737,11 @@ function Haz.Scan(pos)
     table.clear(Haz.shapes)
     table.clear(Haz.safe)
     Haz.orphans = 0
+    local done = {}
+    -- Safe zones first, and even while hazards are muted: the mute is
+    -- for misread footprints, and it used to switch the Lava King's
+    -- green circle off along with them.
+    ZonesAround(pos, done)
     if not CONFIG.DodgeHazards or now < Haz.muteUntil then return end
 
     table.clear(chars)
@@ -2657,7 +2749,7 @@ function Haz.Scan(pos)
         if pl.Character then chars[#chars + 1] = pl.Character end
     end
 
-    local reach, done = CONFIG.DodgeRange, {}
+    local reach = CONFIG.DodgeRange
     -- Everything alive that could have cast a footprint near us, for
     -- telling live hazards from leftovers. A boss reaches twice as far.
     table.clear(owners)
@@ -2696,7 +2788,6 @@ function Haz.Scan(pos)
     end
     ScanBeams(pos, reach)
     ScanAdorns(pos, reach)
-    ZonesAround(pos, done)
     if CONFIG.HazardDebug then pcall(Haz.Draw) end
 end
 
@@ -2860,6 +2951,37 @@ function Haz.Diag()
         if i > 40 then break end
         print(("[Hazard] %s <- %s"):format(Describe(h),
             h.src and h.src:GetFullName() or "?"))
+    end
+    -- Brightly coloured parts near us that were NOT counted, and why:
+    -- when a telegraph is missed, this names it and the rule that let
+    -- it through.
+    local counted = {}
+    for _, h in ipairs(Haz.shapes) do if h.src then counted[h.src] = true end end
+    for _, z in ipairs(Haz.safe) do counted[z.src] = true end
+    local n = 0
+    for _, o in ipairs(NearbyParts(pos, CONFIG.DodgeRange)) do
+        if n >= 15 then break end
+        if o:IsA("BasePart") and not counted[o] and o.Transparency < 0.95 then
+            local warn = WarnColor(o.Color)
+            if warn then
+                n = n + 1
+                local why
+                if IsOurs(o) then why = "ours / on a player"
+                elseif NameHas(o, CONFIG.HazardNames) then
+                    why = DeadOwner(o) and "named attack, caster dead" or "named attack, left over"
+                elseif IsMapPart(o) and not recentParts[o] then
+                    why = streamed[o] and "map part that streamed in (not new)"
+                          or "map part or a creature's body"
+                else
+                    local _, a, b = Footprint(o)
+                    local active, what = LooksActive(o)
+                    why = ("failed the shape/activity tests (%dx%d footprint, %s)")
+                        :format(a, b, active and ("active: " .. tostring(what)) or "not moving")
+                end
+                print(("[Not a hazard] %s %s size=%s: %s"):format(warn, o:GetFullName(),
+                    tostring(PartSize(o)), why))
+            end
+        end
     end
     print("[DQR] === END HAZARD DIAG ===")
 end
@@ -4449,6 +4571,36 @@ local function RingPoint(pos, anchor, ring, model)
     return p, crosses
 end
 
+-- The walk toward a target, kept out of hazards. The straight line to
+-- `goal`, cut short just before it enters one; when a hazard is right
+-- in front of us, a way round it to either side; nil when there is
+-- none (stand and let it pass). Before this the bot walked straight
+-- into anything between it and a target it was not yet in range of -
+-- the Deity of the Volcano's red dome, the Lava King's floor beams.
+local function SafeApproach(pos, goal)
+    if #Haz.shapes == 0 or not Haz.OnPath(pos, goal) then return goal end
+    local d = Flat(goal - pos)
+    local len = d.Magnitude
+    if len < 1 then return goal end
+    local u = d / len
+    local last = nil
+    for s = 2, len, 2 do
+        local p = pos + u * s
+        if Haz.At(p) then break end
+        last = p
+    end
+    if last and FlatDist(last, pos) > 4 then return last end
+    local far = math.min(len, 24)
+    for _, deg in ipairs({35, -35, 60, -60, 85, -85}) do
+        local a = math.rad(deg)
+        local v = Vector3.new(u.X * math.cos(a) - u.Z * math.sin(a), 0,
+                              u.X * math.sin(a) + u.Z * math.cos(a))
+        local p = pos + v * far
+        if not Haz.OnPath(pos, p) and LineClear(pos, p) and HasGround(p) then return p end
+    end
+    return nil
+end
+
 -- Distances for this target: its entry in CONFIG.Bosses (the dungeon's
 -- per-boss tuning) where it has one, else the class distances.
 local function Tune(tgt)
@@ -4611,6 +4763,12 @@ function Brain.Tick(root)
                     prog.latch, prog.latchAt = "stranded", flat
                     prog.latchUntil = now + CONFIG.LatchTime
                     print(("[DQR] Cannot reach %s (%d studs) - casting at it from here.")
+                        :format(name, flat))
+                elseif tgt.Model == Mobs.barModel then
+                    -- The boss whose bar is up is never skipped: there is
+                    -- nothing else to do in its room. Keep trying.
+                    prog.since = now
+                    print(("[DQR] Still no way to %s (%d studs) - keeping at it.")
                         :format(name, flat))
                 else
                     Mobs.Ban(tgt.Model)
@@ -4783,8 +4941,16 @@ function Brain.Tick(root)
             if dist <= spellR and (crosses or now < settleUntil) then
                 state = "Fighting " .. name
             else
-                goal = pt
-                state = ("Approaching %s (%d studs)"):format(name, math.floor(dist / 5) * 5)
+                goal = SafeApproach(pos, pt)
+                if goal == pt then
+                    state = ("Approaching %s (%d studs)"):format(name, math.floor(dist / 5) * 5)
+                elseif goal then
+                    state = ("Approaching %s round a hazard"):format(name)
+                else
+                    state = ("Waiting for a hazard between us and %s to clear"):format(name)
+                end
+                -- Held up by a hazard is not failing to reach it.
+                if goal ~= pt and prog then prog.since = now end
             end
         else
             state = "Fighting " .. name
@@ -4857,7 +5023,6 @@ end
 function Brain.Loop()
     Brain.Reset()
     Nav.Start()
-    Brain.bootAt = Brain.bootAt or tick()   -- once per dungeon: survives respawns
     local lastLobby, lastStart, startVisible = 0, 0, false
     while Farm.Running do
         local now = tick()
@@ -4887,6 +5052,10 @@ function Brain.Loop()
         if startVisible then
             Nav.goal, Nav.face = nil, nil
             Brain.state = "Waiting for the run to start"
+            -- A new run: its first mob has not been seen yet. (These
+            -- used to be set once per script execution, so from the
+            -- second run on the bot never waited at the start.)
+            Brain.mobSeen, Brain.bootAt, Brain.saidNoMobs = false, nil, false
             S(0.5)
             continue
         end
@@ -4898,6 +5067,8 @@ function Brain.Loop()
             S(0.25)
             continue
         end
+        -- When this run began, for StartWait. Survives respawns.
+        Brain.bootAt = Brain.bootAt or now
         Brain.Tick(root)
         S(0.05)
     end
@@ -5808,7 +5979,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.5 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.6 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
