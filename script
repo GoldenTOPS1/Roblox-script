@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.11
+--  DQR AUTO FARM v12.12
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -20,9 +20,9 @@ local CONFIG = {
     -- The dungeon to run. This also picks the settings: whatever that
     -- dungeon's entry in MAP_PROFILES (further down) says is used for
     -- the run, on top of the defaults in this CONFIG block.
-    TargetDungeon  = "Northern Lands",
+    TargetDungeon  = "Volcanic Chambers",
     Difficulty     = "Nightmare",
-    Hardcore       = false,  -- true = also press HARDCORE MODE
+    Hardcore       = true,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
     -- CARRY MODE: after creating the lobby, wait on the party screen
@@ -293,7 +293,7 @@ local CONFIG = {
     StartWait      = 30,
     LoopStallTime  = 6,
     MaxQueryParts  = 2000,
-    HazardTTL      = 0.08,
+    HazardTTL      = 0.1,
     ThreatTTL      = 0.1,
 }
 
@@ -454,9 +454,16 @@ local MAP_PROFILES = {
         BossNames = {"Lava King"},
         -- The Lava King's closing red ring: stand in the green circle.
         SafeZone  = "green",
-        -- ...and fight him closer than the class distance (from the
-        -- edge of his body, not his middle).
-        Bosses    = {["Lava King"] = {CircleRadius = 16, MinRange = 8}},
+        -- Bosses are fought closer than the class distance, measured from
+        -- the edge of the body, and only cast at from inside AttackRange.
+        -- BossReach 0: the global +20 studs against bosses had the bot
+        -- casting from 65 studs away, where the spells never landed.
+        BossReach = 0,
+        Bosses    = {
+            ["Lava King"]            = {CircleRadius = 14, MinRange = 8,  AttackRange = 32},
+            ["Deity of the Volcano"] = {CircleRadius = 18, MinRange = 10, AttackRange = 32},
+            ["Ancient Lava Mage"]    = {CircleRadius = 18, MinRange = 10, AttackRange = 32},
+        },
         Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
         Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
         Mage      = {CircleRadius = 26, MinRange = 15, AttackRange = 45},
@@ -2620,7 +2627,10 @@ local function IsOurs(o)
     for _, c in ipairs(chars) do
         if o:IsDescendantOf(c) then return true end
     end
-    return FollowsPlayer(o)
+    -- Parts only: Beams and adornments come through here too, and have
+    -- no Position (v12.11 crashed the farm loop on Northern Lands'
+    -- aurora beams, over and over).
+    return o:IsA("BasePart") and FollowsPlayer(o)
 end
 
 -- This game's "about to be hit" colours, or nil. Being one does NOT
@@ -2770,16 +2780,22 @@ local function Ghost(h)
     else c = Vector3.new(h.x, h.y, h.z) end
     local e1 = h.kind == "box" and h.hx or h.r
     local e2 = h.kind == "box" and h.hz or h.r
+    -- One record per source, updated in place (a new table per shape per
+    -- sweep was garbage the collector had to chase ten times a second).
     local m = motion[h.src]
-    motion[h.src] = {c = c, e1 = e1, e2 = e2, t = now}
-    if not m then return nil end
+    if not m then
+        motion[h.src] = {c = c, e1 = e1, e2 = e2, t = now}
+        return nil
+    end
     local dt = now - m.t
+    local pc, p1, p2 = m.c, m.e1, m.e2
+    m.c, m.e1, m.e2, m.t = c, e1, e2, now
     if dt < 0.03 or dt > 0.5 then return nil end
-    local v = (c - m.c) / dt
+    local v = (c - pc) / dt
     local shift = Vector3.new(v.X, 0, v.Z) * L
     if shift.Magnitude > 25 then shift = shift.Unit * 25 end
-    local d1 = math.clamp((e1 - m.e1) / dt * L, 0, 20)
-    local d2 = math.clamp((e2 - m.e2) / dt * L, 0, 20)
+    local d1 = math.clamp((e1 - p1) / dt * L, 0, 20)
+    local d2 = math.clamp((e2 - p2) / dt * L, 0, 20)
     if shift.Magnitude < 1 and d1 < 1 and d2 < 1 then return nil end
     local g = {}
     for k, val in pairs(h) do g[k] = val end
@@ -2794,15 +2810,34 @@ local function Ghost(h)
     return g
 end
 
+-- A bounding circle for every footprint (flat: centre bx, bz and
+-- radius br), so a test at a point can skip any footprint whose circle
+-- is too far away to matter without working out its exact shape.
+local function Bound(h)
+    if h.kind == "box" then
+        local c = h.cf.Position
+        h.bx, h.bz, h.br = c.X, c.Z, math.sqrt(h.hx * h.hx + h.hz * h.hz)
+    elseif h.kind == "line" then
+        local m = (h.a + h.b) / 2
+        h.bx, h.bz, h.br = m.X, m.Z, (h.b - h.a).Magnitude / 2 + h.r
+    else
+        h.bx, h.bz, h.br = h.x, h.z, h.r
+    end
+end
+
 local function Add(h)
     if TooOld(h.src) then return end
     if h.src and CONFIG.IgnoreOrphans and Orphan(h) then
         Haz.orphans = Haz.orphans + 1
         return
     end
+    Bound(h)
     Haz.shapes[#Haz.shapes + 1] = h
     local g = Ghost(h)
-    if g then Haz.shapes[#Haz.shapes + 1] = g end
+    if g then
+        Bound(g)
+        Haz.shapes[#Haz.shapes + 1] = g
+    end
     if CONFIG.HazardDebug and h.src then
         local now = tick()
         if not censusAt[h.src] or now - censusAt[h.src] > 5 then
@@ -3028,7 +3063,13 @@ end)
 end
 
 local function Classify(o, pos, reach)
-    if not o:IsA("BasePart") or IsOurs(o) then return end
+    if not o:IsA("BasePart") then return end
+    -- Known map or a creature's body, not named, not a zone candidate, not
+    -- new: nothing below can make it a hazard (rule 2 would drop it), so
+    -- skip the costlier tests. Most parts in range each sweep are these.
+    if mapMemo[o] == true and not Haz.named[o] and not zoneParts[o]
+    and (not recentParts[o] or streamed[o]) then return end
+    if IsOurs(o) then return end
     -- 0. A safe zone is where to stand, never a hazard.
     local zone = SafeZoneOf(o)
     if zone then
@@ -3309,6 +3350,7 @@ function Haz.Scan(pos)
     if CONFIG.HazardDebug then pcall(Haz.Draw) end
 end
 
+do
 -- How far `p` is from shape `h`'s edge; negative = inside; nil when `p`
 -- is not at a height the shape reaches. Discs and boxes count within
 -- their own height plus a body; lasers within chest height; balls in
@@ -3340,13 +3382,28 @@ local function ShapeClear(h, p)
     return nil
 end
 
+-- A lower bound on ShapeClear anywhere within `R` of (x, z), from the
+-- bounding circle alone - or nil when the circle reaches that far (the
+-- exact test is needed). A box's edge distance is measured square, so
+-- its bound is scaled down (never above the true value).
+local function FarBound(h, x, z, R)
+    local dx, dz = x - h.bx, z - h.bz
+    local g = math.sqrt(dx * dx + dz * dz) - h.br - R
+    if g <= 0 then return nil end
+    if h.kind == "box" then g = g * 0.7 end
+    return g
+end
+
 -- How far `p` is from the nearest hazard edge; negative = inside.
 function Haz.Clear(p, ignoreHuge, list)
     local best = math.huge
     for _, h in ipairs(list or Haz.shapes) do
         if not (ignoreHuge and h.huge) then
-            local c = ShapeClear(h, p)
-            if c and c < best then best = c end
+            local g = FarBound(h, p.X, p.Z, 0)
+            if not g or g < best then
+                local c = ShapeClear(h, p)
+                if c and c < best then best = c end
+            end
         end
     end
     return best
@@ -3356,20 +3413,39 @@ end
 -- the character faces (Haz.look, kept up to date every frame by the box
 -- drawn on screen), sampled at its corners, edge middles and centre -
 -- closer together than the thinnest footprint (a laser is BeamPad * 2
--- wide at least), so nothing slips between them.
+-- wide at least), so nothing slips between them. The nine points go
+-- into one reused table: these tests run thousands of times a second
+-- in a busy fight, and fresh tables each time made the game stutter.
 Haz.look = Vector3.new(0, 0, -1)
+local PTS = {}
 local SIGNS = {-1, 0, 1}
-local function EachBoxPoint(p, fn)
+local function FillBox(p)
     local s, pad = CONFIG.HitboxSize, CONFIG.HitboxPad
     local hx, hz = s.X / 2 + pad, s.Z / 2 + pad
     local f = Haz.look
     local rx, rz = -f.Z * hx, f.X * hx
     local fx, fz = f.X * hz, f.Z * hz
+    local i = 0
     for _, sx in ipairs(SIGNS) do
         for _, sz in ipairs(SIGNS) do
-            fn(Vector3.new(p.X + sx * rx + sz * fx, p.Y, p.Z + sx * rz + sz * fz))
+            i = i + 1
+            PTS[i] = Vector3.new(p.X + sx * rx + sz * fx, p.Y, p.Z + sx * rz + sz * fz)
         end
     end
+    return math.sqrt(hx * hx + hz * hz)
+end
+
+-- The hitbox at the point FillBox last filled against one shape: its
+-- worst (lowest) clearance, or nil when out of reach or height.
+local function BoxVs(h, x, z, R, best)
+    local g = FarBound(h, x, z, R)
+    if g and g >= best then return nil end
+    local w = nil
+    for i = 1, 9 do
+        local c = ShapeClear(h, PTS[i])
+        if c and (w == nil or c < w) then w = c end
+    end
+    return w
 end
 
 -- How far the hitbox at `p` is from the nearest hazard edge; negative =
@@ -3377,60 +3453,81 @@ end
 function Haz.BoxClear(p, ignoreHuge, list)
     list = list or Haz.shapes
     if #list == 0 then return math.huge end
+    local R = FillBox(p)
     local best = math.huge
-    EachBoxPoint(p, function(q)
-        for _, h in ipairs(list) do
-            if not (ignoreHuge and h.huge) then
-                local c = ShapeClear(h, q)
-                if c and c < best then best = c end
-            end
+    for _, h in ipairs(list) do
+        if not (ignoreHuge and h.huge) then
+            local c = BoxVs(h, p.X, p.Z, R, best)
+            if c and c < best then best = c end
         end
-    end)
+    end
     return best
-end
-
--- Which hazards the hitbox at `p` touches, and how deep: shape -> its
--- worst (most negative) clearance.
-function Haz.BoxTouch(p)
-    local set = {}
-    EachBoxPoint(p, function(q)
-        for _, h in ipairs(Haz.shapes) do
-            if not h.huge then
-                local c = ShapeClear(h, q)
-                if c and c < 0 and (set[h] == nil or c < set[h]) then set[h] = c end
-            end
-        end
-    end)
-    return set
 end
 
 -- Does a hazard we could actually step out of touch the hitbox?
 function Haz.At(p) return Haz.BoxClear(p, true) < 0 end
 
--- Does walking a -> b take the hitbox into a hazard? Every 2 studs, and
--- tracking WHICH hazards: stepping into one it did not start in is a
--- crossing, and so is going more than a stud deeper into one it did.
--- The old check only asked "in a hazard or not" - with strips laid
--- close together the box never left "a hazard" as it walked from one
--- strip straight into the next, so the crossing went unseen, and the
--- bot left a perfectly good gap for another through a strip.
-function Haz.OnPath(a, b)
-    if #Haz.shapes == 0 then return false end
-    local start = Haz.BoxTouch(a)
+-- The footprints near a spot, for a search around it: everything whose
+-- circle comes within `radius` (plus the hitbox) of `p`. A search then
+-- tests a dozen footprints instead of every one on the map.
+function Haz.Near(p, radius)
+    local out = {}
+    local s, pad = CONFIG.HitboxSize, CONFIG.HitboxPad
+    local R = radius + math.sqrt((s.X / 2 + pad) ^ 2 + (s.Z / 2 + pad) ^ 2) + 1
+    for _, h in ipairs(Haz.shapes) do
+        if not h.huge then
+            local dx, dz = p.X - h.bx, p.Z - h.bz
+            if math.sqrt(dx * dx + dz * dz) - h.br < R then out[#out + 1] = h end
+        end
+    end
+    return out
+end
+
+-- Walking a -> b: how far along the hitbox first enters a hazard it was
+-- not touching at the start, or goes more than a stud deeper into one
+-- it was - nil when it never does. Every 2 studs. Tracking WHICH hazard
+-- matters: with strips laid close together the box goes straight from
+-- one into the next without ever leaving "a hazard".
+local startC = {}
+function Haz.FirstCrossing(a, b, list)
+    list = list or Haz.shapes
+    if #list == 0 then return nil end
     local d = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
     local len = d.Magnitude
+    -- Only footprints that come near the walk at all.
+    local near = {}
+    local s0, pad = CONFIG.HitboxSize, CONFIG.HitboxPad
+    local R = math.sqrt((s0.X / 2 + pad) ^ 2 + (s0.Z / 2 + pad) ^ 2)
+    for _, h in ipairs(list) do
+        if not h.huge and SegDistFlat(Vector3.new(h.bx, 0, h.bz), a, b) - h.br - R < 1 then
+            near[#near + 1] = h
+        end
+    end
+    if #near == 0 then return nil end
+    FillBox(a)
+    for i, h in ipairs(near) do
+        local c = BoxVs(h, a.X, a.Z, R, 0)
+        startC[i] = (c and c < 0) and c or false
+    end
     local u = len > 0.01 and d / len or Vector3.zero
     local s = math.min(2, len)
     while true do
         local p = s >= len and b or (a + u * s)
-        for h, c in pairs(Haz.BoxTouch(p)) do
-            local c0 = start[h]
-            if c0 == nil or c < c0 - 1 then return true end
+        FillBox(p)
+        for i, h in ipairs(near) do
+            local c = BoxVs(h, p.X, p.Z, R, 0)
+            if c and c < 0 then
+                local c0 = startC[i]
+                if not c0 or c < c0 - 1 then return s end
+            end
         end
         if s >= len then break end
         s = s + 2
     end
-    return false
+    return nil
+end
+
+function Haz.OnPath(a, b, list) return Haz.FirstCrossing(a, b, list) ~= nil end
 end
 
 -- Share of the ground within 30 studs that is covered.
@@ -3645,6 +3742,7 @@ do
 -- the floor. Grey, red while a hazard touches it.
 local box = nil
 local GREY, RED = Color3.fromRGB(120, 128, 138), Color3.fromRGB(235, 70, 70)
+local colorAt = 0
 function Look.Hitbox(show)
     local root, hum = GetRoot(), GetHuman()
     if root then
@@ -3675,7 +3773,12 @@ function Look.Hitbox(show)
     -- what is checked.
     local c = Vector3.new(p.X, p.Y - hip + s.Y / 2, p.Z)
     box.CFrame = CFrame.lookAt(c, c + Haz.look)
-    box.Color = Haz.At(p) and RED or GREY
+    -- The colour at ten a second is plenty (it is only a picture).
+    local now = tick()
+    if now - colorAt > 0.1 then
+        colorAt = now
+        box.Color = Haz.At(p) and RED or GREY
+    end
 end
 RunService.Heartbeat:Connect(function() pcall(Look.Hitbox, Farm.Running) end)
 
@@ -4242,6 +4345,7 @@ end
 
 function Look.ApplyMap()
     local mode = CONFIG.MapMode
+    Look.mapApplied = true
     if mode == "baseplate" then
         Look.mapMode = mode
         task.spawn(function()
@@ -4341,7 +4445,7 @@ end)
 
 -- Put the map back the way it was (DQR_Map("off") in the console).
 function Look.RestoreMap()
-    Look.mapMode = nil
+    Look.mapMode, Look.mapApplied = nil, false
     for o, v in pairs(orig) do
         if o.Parent then pcall(function()
             o.CanCollide = v.cc
@@ -5235,12 +5339,16 @@ local function PickExit(pos, aim, keepR, heading, maxD, fallback)
     local cands = {}
     maxD = maxD or CONFIG.EvadeMax
     local step = maxD > CONFIG.EvadeMax and 3 or 2
+    -- Only the footprints within reach of the search: with the whole
+    -- map's worth tested at every one of ~200 spots, a screen full of
+    -- strips made the game stutter.
+    local near = Haz.Near(pos, maxD)
     for i = 0, 15 do
         local a = i * math.pi / 8
         local u = Vector3.new(math.cos(a), 0, math.sin(a))
         for d = 2, maxD, step do
             local p = pos + u * d
-            if Haz.BoxClear(p, true) >= CONFIG.EvadeClear then
+            if Haz.BoxClear(p, true, near) >= CONFIG.EvadeClear then
                 local score = d
                 if heading then score = score - u:Dot(heading) * 10 end
                 if aim and keepR then
@@ -5255,7 +5363,7 @@ local function PickExit(pos, aim, keepR, heading, maxD, fallback)
     table.sort(cands, function(x, y) return x.s < y.s end)
     for i = 1, math.min(#cands, 5) do
         local p = cands[i].p
-        if not Haz.OnPath(pos, p) and LineClear(pos, p)
+        if not Haz.OnPath(pos, p, near) and LineClear(pos, p)
         and HasGround(p) and GroundOnPath(pos, p) then
             return p
         end
@@ -5266,14 +5374,14 @@ local function PickExit(pos, aim, keepR, heading, maxD, fallback)
     -- here, leaning away from `aim`: strips fanning out from a boss
     -- leave wider gaps further out.
     if not fallback then return nil end
-    local here = Haz.BoxClear(pos, true)
+    local here = Haz.BoxClear(pos, true, near)
     local cands2 = {}
     for i = 0, 15 do
         local a = i * math.pi / 8
         local u = Vector3.new(math.cos(a), 0, math.sin(a))
         for _, d in ipairs({2, 4, 7, 10, 14}) do
             local p = pos + u * d
-            local c = Haz.BoxClear(p, true)
+            local c = Haz.BoxClear(p, true, near)
             if c > here + 1 then
                 local s = c * 2 - d * 0.15
                 if aim then s = s + (FlatDist(p, aim) - FlatDist(pos, aim)) * 0.15 end
@@ -5286,7 +5394,7 @@ local function PickExit(pos, aim, keepR, heading, maxD, fallback)
     table.sort(cands2, function(x, y) return x.s > y.s end)
     for i = 1, math.min(#cands2, 8) do
         local p = cands2[i].p
-        if not Haz.OnPath(pos, p) and LineClear(pos, p) and HasGround(p) then return p end
+        if not Haz.OnPath(pos, p, near) and LineClear(pos, p) and HasGround(p) then return p end
     end
     return nil
 end
@@ -5407,8 +5515,22 @@ end
 -- none (stand and let it pass). Before this the bot walked straight
 -- into anything between it and a target it was not yet in range of -
 -- the Deity of the Volcano's red dome, the Lava King's floor beams.
+local approachMemo = {t = 0}
+local SafeApproachRaw
 local function SafeApproach(pos, goal)
     if #Haz.shapes == 0 then return goal end
+    -- The same question a moment later from nearly the same spot gets
+    -- the same answer: asked twenty times a second, the search below was
+    -- a big part of the stutter in a busy fight.
+    local m, now = approachMemo, tick()
+    if now - m.t < 0.2 and (pos - m.pos).Magnitude < 2 and (goal - m.goal).Magnitude < 3 then
+        return m.out
+    end
+    local out = SafeApproachRaw(pos, goal)
+    m.t, m.pos, m.goal, m.out = now, pos, goal, out
+    return out
+end
+function SafeApproachRaw(pos, goal)
     local d = Flat(goal - pos)
     local len = d.Magnitude
     if len < 1 then return goal end
@@ -5420,21 +5542,13 @@ local function SafeApproach(pos, goal)
     -- Midgardian Champion - out of spell range - "waiting for it to
     -- clear" for most of the fight.
     local span = math.min(len, 14)
-    if not Haz.OnPath(pos, pos + u * span) then return goal end
+    local near = Haz.Near(pos, 20)
+    local cross = Haz.FirstCrossing(pos, pos + u * span, near)
+    if not cross then return goal end
     -- As far along the straight line as the hitbox gets without touching
     -- a hazard it is not already touching, or going deeper into one.
-    local start = Haz.BoxTouch(pos)
-    local last = nil
-    for s = 2, span, 2 do
-        local p = pos + u * s
-        local bad = false
-        for h, c in pairs(Haz.BoxTouch(p)) do
-            if start[h] == nil or c < start[h] - 1 then bad = true break end
-        end
-        if bad then break end
-        last = p
-    end
-    if last and FlatDist(last, pos) > 4 then return last end
+    local last = cross > 4 and pos + u * (cross - 2) or nil
+    if last then return last end
     -- Blocked right in front: the clear spot, reachable without crossing
     -- anything, that brings us closest to the goal. Taken a leg at a
     -- time this finds the gaps - against a boss's radial strips every
@@ -5458,7 +5572,7 @@ local function SafeApproach(pos, goal)
     table.sort(cands, function(x, y) return x.d < y.d end)
     for i = 1, math.min(#cands, 24) do
         local p = cands[i].p
-        if not Haz.OnPath(pos, p) and LineClear(pos, p) and HasGround(p) then return p end
+        if not Haz.OnPath(pos, p, near) and LineClear(pos, p) and HasGround(p) then return p end
     end
     return nil
 end
@@ -5901,6 +6015,7 @@ function Brain.Loop()
             lastLobby = now
             if InLobby() then
                 print("[DQR] In the lobby (" .. tostring(LobbyMarker()) .. ") - stopping.")
+                Look.mapApplied, Look.y0 = false, nil
                 Farm.Running = false
                 break
             end
@@ -6713,15 +6828,36 @@ end -- of the loot block
 --  leave Farm.Running true with nothing running. Guarded reports what
 --  went wrong and restarts.
 -- ============================================================
+-- A crash that repeats is reported once, with a count, and the restart
+-- backs off (1s, 2s, 4s... up to 15s): the same error every tick used
+-- to flood the log and restart the farm ten times a second.
+local crash = {msg = nil, n = 0, at = 0}
 local function Guarded(name, fn)
     return function()
         local ok, err = pcall(fn)
-        if not ok then print("[DQR] " .. name .. " CRASHED: " .. tostring(err)) end
+        local wait = 0.5
+        if not ok then
+            local msg, now = tostring(err), tick()
+            if msg == crash.msg and now - crash.at < 30 then
+                crash.n = crash.n + 1
+                wait = math.min(15, 2 ^ math.min(crash.n - 1, 4))
+                if crash.n == 2 or crash.n % 10 == 0 then
+                    print(("[DQR] %s crashed again (x%d) - same error. Waiting %ds between "
+                        .. "restarts. Please send this log."):format(name, crash.n, wait))
+                end
+            else
+                crash.msg, crash.n = msg, 1
+                print("[DQR] " .. name .. " CRASHED: " .. msg)
+            end
+            crash.at = now
+        end
         if Farm.Running then
-            print("[DQR] " .. name .. " exited unexpectedly - restarting.")
+            if crash.n <= 1 then
+                print("[DQR] " .. name .. " exited unexpectedly - restarting.")
+            end
             Farm.Running = false
             Nav.Stop()
-            task.wait(0.5)
+            task.wait(wait)
             Farm.Start()
         end
     end
@@ -6745,7 +6881,9 @@ function Farm.Start()
     end
     -- This dungeon's settings, fresh: nothing left over from the last.
     Prof.Apply()
-    Look.ApplyMap()
+    -- The map pass walks the whole workspace: once per dungeon, not on
+    -- every farm restart (a restart after a death, or a crash, re-ran it).
+    if not Look.mapApplied then Look.ApplyMap() end
     Farm.Running, Farm.beat = true, tick()
     task.spawn(Guarded("Farm loop", Brain.Loop))
     print("[DQR] Farm started.")
@@ -6792,6 +6930,7 @@ local function DungeonWatcher()
         S(3)
         if Farm.Running and InLobby() then
             print("[DQR] Back in the lobby - run over, stopping farm.")
+            Look.mapApplied, Look.y0 = false, nil
             Farm.Stop()
         end
     end
@@ -6813,6 +6952,7 @@ local function Supervisor()
         if Farm.Running or lobbyFlowActive then continue end
 
         if InLobby() then
+            Look.mapApplied, Look.y0 = false, nil     -- the next dungeon gets a fresh map pass
             if not CONFIG.AutoRunDungeon then continue end
             local replay = PathVisible(UI.Replay)
             if replay then
@@ -6841,7 +6981,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.11 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.12 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
