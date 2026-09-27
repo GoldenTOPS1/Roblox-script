@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.15
+--  DQR AUTO FARM v12.16
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -138,7 +138,9 @@ local CONFIG = {
     BossRange      = 200,    -- a boss found by the sweep is only fought once
                              -- its body is this close (a final boss in a
                              -- later room must not pull the bot there)
-    BossReach      = 20,     -- extra spell range against a boss
+    BossReach      = 0,      -- extra spell range against a boss (was 20:
+                             -- the bot cast from 65 studs, where spells did
+                             -- not land)
     AimMaxDrop     = 25,     -- a root further above/below us than this is
                              -- a model quirk (the Ancient Enchanted Tree's
                              -- is 116 studs underground): aim at our level
@@ -442,7 +444,13 @@ local MAP_PROFILES = {
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
-        BossNames = {"Midgardian Champion"},
+        BossNames = {"Midgardian Champion", "Bob The Frost Giant"},
+        -- Bosses closer, and only cast at from inside AttackRange
+        -- (measured from the edge of the body).
+        Bosses    = {
+            ["Midgardian Champion"] = {CircleRadius = 18, MinRange = 10, AttackRange = 32},
+            ["Bob The Frost Giant"] = {CircleRadius = 18, MinRange = 10, AttackRange = 32},
+        },
         Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
         Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
         Mage      = {CircleRadius = 26, MinRange = 15, AttackRange = 45},
@@ -1335,7 +1343,7 @@ end)
 --  place each cast, so it is never "new". What gives it away is that
 --  it moves, grows, fades in or lights up - scenery does none of those.
 -- ============================================================
-local PartSize, LooksActive
+local PartSize, LooksActive, VisTrans
 do
 local seen   = setmetatable({}, {__mode = "k"})
 local meshOf = setmetatable({}, {__mode = "k"})
@@ -1352,14 +1360,47 @@ function PartSize(o)
     return o.Size
 end
 
+-- How see-through a part LOOKS: its own Transparency, unless it is
+-- invisible and a decal, texture or surface picture on it shows - a
+-- marker drawn as an image on an invisible part was rejected by every
+-- rule as "invisible". Re-read at most once a second per part.
+local visMemo = setmetatable({}, {__mode = "k"})
+function VisTrans(o)
+    local v = o.Transparency
+    if v <= 0.95 then return v end
+    local now, m = tick(), visMemo[o]
+    if m and now - m.t < 1 then return m.v end
+    for _, c in ipairs(o:GetChildren()) do
+        if (c:IsA("Decal") or c:IsA("Texture")) and c.Transparency < v then
+            v = c.Transparency
+        elseif c:IsA("SurfaceGui") and c.Enabled then
+            for _, g in ipairs(c:GetDescendants()) do
+                if g:IsA("GuiObject") and g.Visible then
+                    local t = g.BackgroundTransparency
+                    if g:IsA("ImageLabel") or g:IsA("ImageButton") then
+                        t = math.min(t, g.ImageTransparency)
+                    end
+                    if t < v then v = t end
+                end
+            end
+        end
+    end
+    visMemo[o] = {t = now, v = v}
+    return v
+end
+
 -- Returns active?, why ("new", "moved", "faded", "grew", "lit", "fresh").
 -- `fresh`: the caller saw it first well inside the scan radius, where
 -- scenery never enters (it always comes in at the edge as we walk).
-function LooksActive(o, fresh)
+-- `force` lets `fresh` count even with FreshSightRule off: the flat-
+-- marker rule passes it for non-solid parts, so a marker the game keeps
+-- and moves into place beside us (never "new", never seen moving) still
+-- counts the moment it shows up.
+function LooksActive(o, fresh, force)
     local now  = tick()
     local born = recentParts[o]
     local new  = born ~= nil and now - born < CONFIG.RecentWindow and not streamed[o]
-    fresh = fresh == true and CONFIG.FreshSightRule == true
+    fresh = fresh == true and (CONFIG.FreshSightRule == true or force == true)
 
     local rec = seen[o]
     -- Out of sight for a while and back: a pooled spoke fired at the
@@ -3048,7 +3089,7 @@ end
 -- 3. A ball of damage: round from above and tall enough to be a body
 -- rather than a painted marker. Any colour.
 local function IsBlob(o)
-    if o.CanCollide or o.Transparency > 0.9 then return false end
+    if o.CanCollide or VisTrans(o) > 0.9 then return false end
     local s = PartSize(o)
     local w, d = s.X, s.Z
     if math.max(w, d) < CONFIG.TelegraphMinLen or math.max(w, d) > CONFIG.RedMaxWide then
@@ -3074,8 +3115,8 @@ local function IsTelegraph(o, pos, reach)
     -- Asked before the visibility test, so a marker fading in from
     -- invisible has a parked reading on record to compare against.
     local fresh = NearDist(o, pos) < reach * 0.6
-    local active, why = LooksActive(o, fresh)
-    if o.Transparency > 0.95 then return false end
+    local active, why = LooksActive(o, fresh, not o.CanCollide)
+    if VisTrans(o) > 0.95 then return false end
     if warn == "red" then return true end
     if o.CanCollide then
         if why == "moved" or why == "faded" or why == "grew" or why == "lit" then
@@ -3176,7 +3217,7 @@ end
 -- allows an invisible one: the game's own hitBox for it.
 -- Returns height, width - or nil.
 local function ColumnShape(o, named)
-    if o.CanCollide or (o.Transparency > 0.95 and not named) then return nil end
+    if o.CanCollide or (VisTrans(o) > 0.95 and not named) then return nil end
     local height, a, b = Footprint(o)
     local w = math.max(a, b)
     if height >= 5 and height >= w * 0.6 and w >= 4 and w <= CONFIG.RedMaxWide
@@ -3303,7 +3344,7 @@ local function Classify(o, pos, reach)
         return
     end
     -- 5.
-    if BeamShaped(o) and not o.CanCollide and o.Transparency <= 0.9 then
+    if BeamShaped(o) and not o.CanCollide and VisTrans(o) <= 0.9 then
         if LooksActive(o) or (BeamColoured(o) and AtBodyHeight(o, pos)) then
             local a, b, thin = Segment(o)
             AddLine(a, b, thin / 2 + CONFIG.BeamPad, o)
@@ -3318,7 +3359,7 @@ local function Classify(o, pos, reach)
     -- bot's own ice fan must not send it running from itself.
     -- A creature's body (a mob that spawned a moment ago moves too).
     local inCreature = IsMapPart(o)
-    if not o.CanCollide and o.Transparency <= 0.9 and not playerBorn[o] and not inCreature then
+    if not o.CanCollide and VisTrans(o) <= 0.9 and not playerBorn[o] and not inCreature then
         local active, why = LooksActive(o)
         if active and why == "moved" then
             local s = PartSize(o)
@@ -3343,7 +3384,14 @@ local function ScanBeams(pos, reach)
         and not IsOurs(beam) then pcall(function()
             local a, b = beam.Attachment0.WorldPosition, beam.Attachment1.WorldPosition
             local w = math.max(beam.Width0, beam.Width1)
-            if w <= 0 or w > 16 then return end
+            -- Wide beams (up to 60) count too - a flat quad drawn as a
+            -- beam is a floor marker - except the map's own decoration
+            -- (the aurora), which never counts.
+            if w <= 0 or w > 60 then return end
+            if w > 16 then
+                local host = beam:FindFirstAncestorWhichIsA("BasePart")
+                if not host or (IsMapPart(host) and not recentParts[host]) then return end
+            end
             local len = (b - a).Magnitude
             if len < 1 or len > 300 or SegDistFlat(pos, a, b) > reach then return end
             local minT = 1
@@ -3897,6 +3945,11 @@ function Haz.Threat()
         if tti < 2.5 and tti < bestT then best, bestT, bestV, bestR = obj, tti, vel, rad end
     end
     for _, obj in ipairs(NearbyParts(me, CONFIG.DodgeRange)) do pcall(Consider, obj) end
+    -- And the air above: something dropped on us from high up is only
+    -- inside the 40-stud sphere for its last fraction of a second.
+    for _, obj in ipairs(NearbyParts(me + Vector3.new(0, CONFIG.DodgeRange, 0), CONFIG.DodgeRange)) do
+        pcall(Consider, obj)
+    end
     for p, born in pairs(recentParts) do
         if p.Parent and now - born < CONFIG.RecentWindow and not p.CanQuery
         and (p.Position - me).Magnitude < CONFIG.DodgeRange then
@@ -4315,6 +4368,7 @@ local function PlacePlane(y0)
     end
     local p = root.Position
     plane.CFrame = CFrame.new(p.X, y0 - 2, p.Z)
+    Look.planeY = y0
 end
 
 -- Keep the plane under us: a 2048 plane ends 1024 studs out.
@@ -4322,13 +4376,56 @@ task.spawn(function()
     while true do
         S(1)
         local root = GetRoot()
-        if plane and plane.Parent and root and Look.y0
+        if plane and plane.Parent and root and Look.planeY
         and FlatDist(plane.Position, root.Position) > 600 then
             local p = root.Position
-            plane.CFrame = CFrame.new(p.X, Look.y0 - 2, p.Z)
+            plane.CFrame = CFrame.new(p.X, Look.planeY - 2, p.Z)
         end
     end
 end)
+
+-- THE FLOOR FOLLOWS THE FIGHT. The plane is laid at the spawn's ground
+-- height, and mobs down a drop stand on the real ground below it - out
+-- of reach, the bot walking about on top of them. Mobs are the server's
+-- and stand on the real ground, so where the target's feet are is where
+-- the ground is: well below the plane, the plane drops to it at once
+-- (the bot drops down, as it would off the real edge); above it, near
+-- the target and with open air overhead, it rises in 3-stud steps.
+local planeStepAt, saidDrop = 0, 0
+local function SetPlane(y)
+    Look.planeY = y
+    local c = plane.Position
+    plane.CFrame = CFrame.new(c.X, y - 2, c.Z)
+end
+function Look.PlaneFollow(tgt, pos)
+    if Look.mapMode ~= "baseplate" or not (plane and plane.Parent) or not Look.planeY then return end
+    -- A boss's root can be anywhere (under the floor, in the sky).
+    if not tgt or tgt.Boss then return end
+    local r = tgt.Root
+    if not r or not r.Parent then return end
+    local hum = tgt.Humanoid
+    local hip = (typeof(hum) == "Instance" and hum:IsA("Humanoid")) and (hum.HipHeight + r.Size.Y / 2) or 3
+    local feet = r.Position.Y - hip
+    local top, now = Look.planeY, tick()
+    local flat = FlatDist(r.Position, pos)
+    if feet < top - 6 and flat < 250 then
+        SetPlane(feet)
+        if now - saidDrop > 10 then
+            saidDrop = now
+            print(("[DQR] %s is %d studs below the floor - lowering it so the bot can "
+                .. "drop down."):format(tgt.Model.Name, top - feet))
+        end
+    elseif feet > top + 4 and flat < 60 and now - planeStepAt > 0.2 then
+        local up = math.min(3, feet - top)
+        local rp = RaycastParams.new()
+        rp.FilterType = EXCLUDE
+        rp.FilterDescendantsInstances = {GetChar(), plane}
+        local hit = workspace:Raycast(pos, Vector3.new(0, up + 6, 0), rp)
+        if hit and hit.Instance.CanCollide then return end
+        planeStepAt = now
+        SetPlane(top + up)
+    end
+end
 
 local function StripBase(o, y0, streamed)
     if done[o] or o.Name:sub(1, 4) == "DQR_" then return end
@@ -4644,7 +4741,7 @@ function Look.RestoreMap()
     table.clear(stairs)
     newGround = {}
     if plane and plane.Parent then plane:Destroy() end
-    plane, Look.y0 = nil, nil
+    plane, Look.y0, Look.planeY = nil, nil, nil
     print("[DQR] Map restored (decals stay stripped; cleared terrain only comes back "
         .. "with the next dungeon).")
 end
@@ -5121,7 +5218,9 @@ local function Heartbeat(dt)
         return
     end
     if human.AutoRotate then human.AutoRotate = false end
-    if CONFIG.SetWalkSpeed and human.WalkSpeed ~= CONFIG.WalkSpeed then
+    -- A minimum, never a cap: forcing 19 every frame slowed down a
+    -- character the game (gear, buffs) had made faster.
+    if CONFIG.SetWalkSpeed and human.WalkSpeed < CONFIG.WalkSpeed then
         human.WalkSpeed = CONFIG.WalkSpeed
     end
 
@@ -5859,6 +5958,8 @@ function Brain.Tick(root)
     -- ---- target and attack ----------------------------------
     local tgt = Mobs.Target()
     Brain.target = tgt
+    -- Baseplate mode: bring the flat floor to the level of the fight.
+    if tgt then pcall(Look.PlaneFollow, tgt, pos) end
     -- aim: where to face and throw. anchor: what distance is measured
     -- from and the fighting ring is drawn around. reach: how far the
     -- surface is from the anchor.
@@ -7247,7 +7348,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.15 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.16 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
