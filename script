@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.20
+--  DQR AUTO FARM v12.21
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -68,10 +68,11 @@ local CONFIG = {
     ShowLog        = false,  -- log window starts hidden; F7 shows it
     ShowDest       = true,   -- green ball where the bot is heading
     -- The map itself, on your screen only:
-    --   "baseplate" - the whole world becomes one flat studded plane:
-    --            terrain cleared, every rock, wall, pillar and prop
-    --            gone. Only stairs, ramps and the upper floors they
-    --            lead to stay. Mobs and bosses stay where they are.
+    --   "baseplate" - walls, pillars and props vanish and turn walk-
+    --            through across the whole map, decoration is hidden,
+    --            floors are repainted grey and the terrain is greyed.
+    --            What you stand on stays the REAL floor, so the server
+    --            never sees you standing on nothing.
     --   "flat" - decor vanishes and walls turn invisible AND walk-
     --            through; everything you can stand on (floors, stairs,
     --            ramps, platforms) stays solid, repainted as a grey
@@ -80,6 +81,12 @@ local CONFIG = {
     --   "hide" - the same look, but walls keep their collision.
     --   "off"  - leave the map alone.
     MapMode        = "baseplate",
+    -- FakeFloor = true brings back the old baseplate: terrain deleted and
+    -- one flat floor laid at the spawn's height. Looks flatter, but
+    -- wherever the real ground is lower you walk on air as far as the
+    -- server can tell - that tripped the anti-cheat in Enchanted Forest.
+    -- Leave it off.
+    FakeFloor      = false,
     FloorColor     = Color3.fromRGB(96, 104, 116), -- nil = keep each floor's colour
     FloorStuds     = true,   -- baseplate stud texture on the floors
     -- Spell and attack animations, hidden. "weight" plays them at
@@ -4665,6 +4672,44 @@ end
 function Look.ApplyMap()
     local mode = CONFIG.MapMode
     Look.mapApplied = true
+    -- BASEPLATE, SAFE (the default). What we stand on stays exactly what
+    -- the server has: the terrain is kept (painted grey, grass off) and
+    -- every real floor stays solid (repainted as baseplate). Walls,
+    -- pillars and props go - hidden and walk-through - and decoration
+    -- is hidden, across the whole map, not just its Map folders.
+    -- The old version cleared the terrain and laid one flat floor at
+    -- the spawn's height: wherever the real ground was lower, we were
+    -- standing on nothing the server knows about, which is exactly what
+    -- an anti-cheat looks for. That version is FakeFloor = true.
+    if mode == "baseplate" and not CONFIG.FakeFloor then
+        Look.mapMode = mode
+        task.spawn(function()
+            local T = workspace:FindFirstChildOfClass("Terrain")
+            if T then
+                pcall(function() T.Decoration = false end)
+                local col = CONFIG.FloorColor or Color3.fromRGB(96, 104, 116)
+                for _, m in ipairs(Enum.Material:GetEnumItems()) do
+                    pcall(function() T:SetMaterialColor(m, col) end)
+                end
+            end
+            local n = 0
+            for _, o in ipairs(workspace:GetDescendants()) do
+                if o:IsA("BasePart") and not done[o]
+                and (not recentParts[o] or streamed[o] or LooksBuilt(o))
+                and not Haz.NameHas(o, CONFIG.HazardNames) and IsWorldScenery(o) then
+                    pcall(Strip, o, "flat", false)
+                    n = n + 1
+                    if n % 300 == 0 then task.wait() end
+                end
+            end
+            local count = {ground = 0, wall = 0, decor = 0, edge = 0}
+            for _, v in pairs(done) do count[v] = (count[v] or 0) + 1 end
+            print(("[DQR] Map look 'baseplate': terrain kept and greyed, %d floor part(s) "
+                .. "kept solid, %d wall(s) made walk-through, %d decoration(s) hidden, "
+                .. "%d map edge(s) kept."):format(count.ground, count.wall, count.decor, count.edge))
+        end)
+        return
+    end
     if mode == "baseplate" then
         Look.mapMode = mode
         task.spawn(function()
@@ -4736,6 +4781,19 @@ end
 -- has usually moved or gone by then), if they still look built.
 workspace.DescendantAdded:Connect(function(o)
     if not Look.mapMode or not o:IsA("BasePart") then return end
+    if Look.mapMode == "baseplate" and not CONFIG.FakeFloor then
+        -- Same test as the pass; a part that arrived near us only once it
+        -- has sat still a moment (an attack has usually moved or gone).
+        local at = o.Position
+        task.delay(1.0, function()
+            if not o.Parent or done[o] or Look.mapMode ~= "baseplate" then return end
+            if not IsWorldScenery(o) or Haz.NameHas(o, CONFIG.HazardNames) then return end
+            if streamed[o] or ((o.Position - at).Magnitude < 0.5 and LooksBuilt(o)) then
+                pcall(Strip, o, "flat", true)
+            end
+        end)
+        return
+    end
     if Look.mapMode == "baseplate" then
         -- Once the streaming check has run: a part that arrived far off
         -- is the map loading in; one that arrived near us goes only if
@@ -7546,7 +7604,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.20 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.21 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
