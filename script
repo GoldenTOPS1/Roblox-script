@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.21
+--  DQR AUTO FARM v12.22
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -103,6 +103,8 @@ local CONFIG = {
     MinRange       = 4,      -- back off when closer than this
     AttackRange    = 25,     -- cast when closer than this
     AttackRate     = 0.3,    -- seconds between spell key presses
+    CastSlack      = 5,      -- cast this far past AttackRange too
+    LowHpCaution   = 0.5,    -- under this share of HP, dodge with twice the room
     MeleeRate      = 0.2,
     -- "both" presses Q and E in the same instant - right when the two
     -- slots hold the same spell. "alternate" = Q, E, Q, E...
@@ -120,6 +122,10 @@ local CONFIG = {
     AimMode        = "off",
     CameraHeight   = 12,
     CameraBack     = 17,
+    -- Jumping: off. The anti-cheat flagged the bot's jumps (on stairs, and
+    -- when it was stuck). With it off the bot walks up ramps and stairs
+    -- only - a step taller than the character can walk onto is a wall.
+    AllowJump      = false,
     SetWalkSpeed   = true,
     WalkSpeed      = 19,
 
@@ -1255,15 +1261,19 @@ task.spawn(function()
                     -- after a player.
                     local spell = false
                     local m = o:FindFirstAncestorOfClass("Model")
-                    if m and spellModel[m] then spell = true end
-                    if not spell then
+                    -- An attack's warning is never our spell, however close
+                    -- to us it lands or whenever: aimed at us, it lands on
+                    -- us, often just as we cast.
+                    local tele = Haz.TelegraphLook and Haz.TelegraphLook(o)
+                    if not tele and m and spellModel[m] then spell = true end
+                    if not spell and not tele then
                         for _, pp in ipairs(people) do
                             if pp.cast and (o.Position - pp.p).Magnitude < CAST_RADIUS then
                                 spell = true break
                             end
                         end
                     end
-                    if not spell then
+                    if not spell and not tele then
                         local n = o.Name:lower() .. " " .. (o.Parent.Name:lower())
                         for _, nm in ipairs(names) do
                             if #nm >= 3 and n:find(nm, 1, true) then spell = true break end
@@ -1274,7 +1284,7 @@ task.spawn(function()
                         if m and not IsCreature(m) and not Players:GetPlayerFromCharacter(m) then
                             spellModel[m] = true
                         end
-                    else
+                    elseif not tele then
                         -- Near a player but no cast yet: the effect often
                         -- arrives a moment BEFORE the cast signal (the
                         -- server spawns it, the HUD and animation follow).
@@ -1306,12 +1316,28 @@ task.spawn(function()
         end
     end
 end)
--- Named attack volumes already in the game when the script starts.
+-- Named attack volumes already in the game when the script starts, and
+-- small loose parts already hanging around a player (a pet, an aura):
+-- theirs, as if they had been born beside them.
 task.spawn(function()
     S(1.5)
+    local roots = {}
+    for _, pl in ipairs(Players:GetPlayers()) do
+        local r = pl.Character and pl.Character:FindFirstChild("HumanoidRootPart")
+        if r then roots[#roots + 1] = r.Position end
+    end
     for _, o in ipairs(workspace:GetDescendants()) do
-        if o:IsA("BasePart") and Haz.NameHas and Haz.NameHas(o, CONFIG.HazardNames) then
-            Haz.named[o] = true
+        if o:IsA("BasePart") then
+            if Haz.NameHas and Haz.NameHas(o, CONFIG.HazardNames) then
+                Haz.named[o] = true
+            elseif not o.Anchored or not o.CanCollide then
+                local s = o.Size
+                if math.max(s.X, s.Y, s.Z) <= 8 then
+                    for _, rp in ipairs(roots) do
+                        if (o.Position - rp).Magnitude < 12 then playerBorn[o] = true break end
+                    end
+                end
+            end
         end
     end
 end)
@@ -1323,6 +1349,7 @@ end)
 workspace.DescendantRemoving:Connect(function(o)
     beamObjects[o], recentParts[o], hiddenParts[o], playerBorn[o] = nil, nil, nil, nil
     Haz.named[o], Haz.spell[o], spellModel[o] = nil, nil, nil
+    if Haz.followModel then Haz.followModel[o] = nil end
 end)
 end
 pcall(function()
@@ -2087,9 +2114,24 @@ Mobs.PartNamed = PartNamed
 local function RootOf(obj)
     local r = rootOf[obj]
     if r and r.Parent and r:IsDescendantOf(obj) then return r end
-    r = PartNamed(obj, "HumanoidRootPart") or obj.PrimaryPart
+    local hum = obj:FindFirstChildOfClass("Humanoid")
+    r = PartNamed(obj, "HumanoidRootPart") or (hum and hum.RootPart) or obj.PrimaryPart
         or PartNamed(obj, "Torso") or PartNamed(obj, "UpperTorso")
-        or obj:FindFirstChildWhichIsA("BasePart", true)
+    if not r then
+        -- No named root (the Enchanted Forest Dragon has none): the part
+        -- nearest the model's own centre. "The first part found" could be
+        -- a wing tip or an effect far off, which put the whole boss in the
+        -- wrong place - or past the scan radius, out of the list.
+        local ok, piv = pcall(function() return obj:GetPivot().Position end)
+        local best, bestD = nil, math.huge
+        for _, d in ipairs(obj:GetDescendants()) do
+            if d:IsA("BasePart") then
+                local dist = ok and (d.Position - piv).Magnitude or 0
+                if dist < bestD then best, bestD = d, dist end
+            end
+        end
+        r = best
+    end
     rootOf[obj] = r
     return r
 end
@@ -2361,7 +2403,9 @@ function Mobs.Scan(force)
                 end
                 rec = nil
             end
-            if rec and rec.Dist <= CONFIG.MobScanRadius then list[#list + 1] = rec end
+            -- The boss whose bar is up is always in the list, wherever its
+            -- root happens to be.
+            if rec and (rec.Dist <= CONFIG.MobScanRadius or obj == barHit) then list[#list + 1] = rec end
         end
     end
     -- Nothing at all: re-register from scratch now and then, in case a
@@ -2788,13 +2832,30 @@ local function NameHas(o, list)
     return false
 end
 
--- Stuck to a player: welded to one, or keeping the same offset from one
--- while that player walks - an aura or glow that goes where they go.
--- An attack aimed at us stays where it landed when we move away.
+-- Stuck to a player, or going wherever a player goes: never an attack.
+--   * welded to them, or keeping the same offset while they walk (an
+--     aura or a glow);
+--   * a COMPANION: small, and staying within 15 studs of the same player
+--     for 2.5 seconds while that player covers 12 studs, or for 4
+--     seconds while it drifts about - a pet orb. The green orb that
+--     follows the character was read as a moving ball of damage: the
+--     hitbox went red on open ground, the bot "dodged" it (it follows),
+--     sidestepped it as a projectile, and its predicted path blocked
+--     every way out of the dragon's circle. A homing attack never
+--     stays that long - it hits or it is gone.
+-- A part found to be one marks its whole model (Haz.followModel).
 local followRec = setmetatable({}, {__mode = "k"})
+Haz.followModel = {}
+local function MarkFollower(o)
+    Haz.spell[o] = true
+    local m = o:FindFirstAncestorOfClass("Model")
+    if m and not IsCreature(m) and not Players:GetPlayerFromCharacter(m) then
+        Haz.followModel[m] = true
+    end
+end
 local function FollowsPlayer(o)
     local p = o.Position
-    local best, bestD = nil, 6
+    local best, bestD = nil, 15
     for _, c in ipairs(chars) do
         local r = c:FindFirstChild("HumanoidRootPart")
         if r then
@@ -2804,22 +2865,33 @@ local function FollowsPlayer(o)
         end
     end
     if not best then followRec[o] = nil return false end
-    local off, rp = p - best.Position, best.Position
+    local now, rp = tick(), best.Position
+    local off = p - rp
     local rec = followRec[o]
-    if rec and rec.r == best then
-        if (rp - rec.rp).Magnitude > 1 then
-            -- The player moved: did the part come along?
-            if (off - rec.off).Magnitude < 0.8 then
-                rec.hits = rec.hits + 1
-                if rec.hits >= 2 then Haz.spell[o] = true return true end
-            else
-                rec.hits = 0
-            end
-            rec.off, rec.rp = off, rp
-        end
+    if not rec or rec.r ~= best then
+        followRec[o] = {r = best, since = now, rp = rp, pp = p, off = off,
+                        pMoved = 0, oMoved = 0, hits = 0}
         return false
     end
-    followRec[o] = {r = best, off = off, rp = rp, hits = 0}
+    local step = FlatDist(rp, rec.rp)
+    rec.pMoved = rec.pMoved + step
+    rec.oMoved = rec.oMoved + (p - rec.pp).Magnitude
+    if step > 1 then
+        -- The player moved: did the part keep its place beside them?
+        if (off - rec.off).Magnitude < 0.8 then rec.hits = rec.hits + 1 else rec.hits = 0 end
+    end
+    rec.rp, rec.pp, rec.off = rp, p, off
+    if rec.hits >= 2 then MarkFollower(o) return true end
+    local s = o.Size
+    local held = now - rec.since
+    if math.max(s.X, s.Y, s.Z) <= 8 and held >= 2.5
+    -- It must have come along: a marker lying still while we walk
+    -- about near it is not following anyone.
+    and ((rec.pMoved >= 12 and rec.oMoved >= rec.pMoved * 0.6)
+         or (held >= 4 and rec.oMoved >= 3)) then
+        MarkFollower(o)
+        return true
+    end
     return false
 end
 
@@ -2831,6 +2903,9 @@ local firstSight = setmetatable({}, {__mode = "k"})
 local firstNear = setmetatable({}, {__mode = "k"})  -- part -> nearest player then
 local function SpellOnSight(o)
     if firstSight[o] then return false end
+    -- A telegraph on the floor is the enemy's, even when it lands on us
+    -- the moment we cast: that is exactly where they aim.
+    if Haz.TelegraphLook and Haz.TelegraphLook(o) then firstSight[o] = tick() return false end
     local now = tick()
     firstSight[o] = now
     local near = math.huge
@@ -2861,6 +2936,18 @@ local function IsOurs(o)
     if NameHas(o, CONFIG.IgnoreNames) then return true end
     for _, c in ipairs(chars) do
         if o:IsDescendantOf(c) then return true end
+    end
+    -- A companion's model, or a pets folder.
+    local m = o:FindFirstAncestorOfClass("Model")
+    if m and Haz.followModel[m] then return true end
+    local n, depth = o.Parent, 0
+    while n and n ~= workspace and depth < 5 do
+        local l = n.Name:lower()
+        if l == "pet" or l == "pets" or l == "playerpets" or l:find("companion", 1, true)
+        or l:find("follower", 1, true) then
+            return true
+        end
+        n, depth = n.Parent, depth + 1
     end
     -- Parts only: Beams and adornments come through here too, and have
     -- no Position (v12.11 crashed the farm loop on Northern Lands'
@@ -3160,7 +3247,10 @@ local function IsTelegraph(o, pos, reach)
     -- Asked before the visibility test, so a marker fading in from
     -- invisible has a parked reading on record to compare against.
     local fresh = NearDist(o, pos) < reach * 0.6
-    local active, why = LooksActive(o, fresh, not o.CanCollide)
+    -- Not in the first seconds after a respawn or teleport: everything
+    -- near the new spot is "first seen close by" then.
+    local active, why = LooksActive(o, fresh,
+        not o.CanCollide and tick() - (Haz.jumpAt or 0) > 3)
     if VisTrans(o) > 0.95 then return false end
     if warn == "red" then return true end
     if o.CanCollide then
@@ -3547,6 +3637,14 @@ end
 Haz.IsOurs = IsOurs
 Haz.WarnColor = WarnColor
 Haz.NameHas = NameHas
+-- Shaped and coloured like an attack's warning: named as one, or flat
+-- and in a warning colour. Never taken for a player's own spell.
+function Haz.TelegraphLook(o)
+    if NameHas(o, CONFIG.HazardNames) then return true end
+    if not WarnColor(o.Color) then return false end
+    local height, a, b = Footprint(o)
+    return height <= 3 and math.max(a, b) >= CONFIG.TelegraphMinLen
+end
 
 -- Rebuild the shape list around `pos`. Cheap to call every tick.
 function Haz.Scan(pos)
@@ -4029,12 +4127,12 @@ function Look.Hitbox(show)
         local lv = Flat(root.CFrame.LookVector)
         if lv.Magnitude > 0.1 then Haz.look = lv.Unit end
     end
-    if not (show and CONFIG.ShowHitbox) then
+    -- Gone while dead too: it used to stay at the spot we died, red.
+    if not (show and CONFIG.ShowHitbox) or not root or not hum or hum.Health <= 0 then
         if box and box.Parent then box:Destroy() end
         box = nil
         return
     end
-    if not root or not hum or hum.Health <= 0 then return end
     if not box or not box.Parent then
         box = Instance.new("Part")
         box.Name = "DQR_Hitbox"
@@ -4589,7 +4687,8 @@ function Look.StairLead(pos, goal)
     end
     foot = Vector3.new(foot.X, pos.Y, foot.Z)
 
-    local WALK, JUMP = Enum.PathWaypointAction.Walk, Enum.PathWaypointAction.Jump
+    local WALK = Enum.PathWaypointAction.Walk
+    local JUMP = CONFIG.AllowJump and Enum.PathWaypointAction.Jump or WALK
     local wps = {{Position = foot, Action = WALK}}
     if bestRamp then
         local n = math.max(1, math.ceil((top.Y - foot.Y) / 3))
@@ -5077,7 +5176,7 @@ local function Route(from, to, tries)
     for _, try in ipairs(tries) do
         local path = PathfindingService:CreatePath({
             AgentRadius = try[1], AgentHeight = 5,
-            AgentCanJump = true, AgentMaxSlope = try[2],
+            AgentCanJump = CONFIG.AllowJump == true, AgentMaxSlope = try[2],
         })
         local ok = pcall(function() path:ComputeAsync(from, to) end)
         if ok and path.Status == Enum.PathStatus.Success then
@@ -5158,8 +5257,9 @@ local function ClimbLead(from, to)
             return r
         end
     end
-    -- The navmesh has none of them: hop onto the nearest step a jump away.
-    for _, c in ipairs(cands) do
+    -- The navmesh has none of them: hop onto the nearest step a jump away
+    -- (only when jumping is allowed).
+    for _, c in ipairs(CONFIG.AllowJump and cands or {}) do
         if c.d <= 12 and c.gain <= CONFIG.JumpMax - 1 and LineClear(from, c.p) then
             return {{Position = c.p, Action = Enum.PathWaypointAction.Jump}}
         end
@@ -5396,7 +5496,7 @@ local function Heartbeat(dt)
                 -- Taller than a jump: a wall the route misjudged.
                 table.remove(Nav.queue, 1)
                 Nav.force, wpStuck = true, 0
-            elseif wp.Action == Enum.PathWaypointAction.Jump or rise > 3 then
+            elseif CONFIG.AllowJump and (wp.Action == Enum.PathWaypointAction.Jump or rise > 3) then
                 human.Jump = true
             end
         end
@@ -5450,8 +5550,10 @@ local function Heartbeat(dt)
             stuckAt, stuckSince = pos, now
         elseif now - stuckSince > CONFIG.StuckTime then
             stuckAt, stuckSince, stuckCount = pos, now, stuckCount + 1
-            human.Jump = true
-            pcall(function() human:ChangeState(Enum.HumanoidStateType.Jumping) end)
+            if CONFIG.AllowJump then
+                human.Jump = true
+                pcall(function() human:ChangeState(Enum.HumanoidStateType.Jumping) end)
+            end
             ClearPath()
             Nav.force, Nav.direct = true, false
             -- Back away from where we were trying to GO. The body faces
@@ -5518,7 +5620,12 @@ function Nav.Start()
     if h then
         pcall(function() h.AutoRotate = false end)
         if CONFIG.SetWalkSpeed then pcall(function() h.WalkSpeed = CONFIG.WalkSpeed end) end
-        pcall(function() h:SetStateEnabled(Enum.HumanoidStateType.Jumping, true) end)
+        -- No jumping at all while farming unless AllowJump: the anti-cheat
+        -- flagged the bot's jumps. The state is switched off, so nothing -
+        -- not even the mobile auto-jump - can make the character jump.
+        local allow = CONFIG.AllowJump == true
+        pcall(function() h:SetStateEnabled(Enum.HumanoidStateType.Jumping, allow) end)
+        pcall(function() h.AutoJumpEnabled = allow end)
     end
     print("[DQR] Move start: " .. Nav.Diag())
     conn = RunService.Heartbeat:Connect(Heartbeat)
@@ -5533,6 +5640,7 @@ function Nav.Stop()
     Nav.goal, Nav.face = nil, nil
     local h = GetHuman()
     if h then pcall(function() h:Move(Vector3.zero, false) h.AutoRotate = true end) end
+    if h then pcall(function() h:SetStateEnabled(Enum.HumanoidStateType.Jumping, true) end) end
     wantDisabled = false
     SetControls(true)
     local cam = workspace.CurrentCamera
@@ -5725,6 +5833,8 @@ local lastPos, lastTarget = nil, nil
 local lastFight, backSince = nil, 0
 -- Going back and forth: where we were every half second for 6 seconds.
 local wob = {pts = {}, at = 0, detourUntil = 0, lastHit = 0}
+-- When a spell was last allowed at the target, for the boss safety net.
+local holdFire = {inRangeAt = 0, saidAt = 0}
 
 -- Forget everything decided about the last position: after a death, a
 -- respawn or any teleport. A "can't get closer" verdict reached beside
@@ -5732,6 +5842,7 @@ local wob = {pts = {}, at = 0, detourUntil = 0, lastHit = 0}
 -- the bot standing at spawn casting at a boss it could not possibly
 -- hit - forever, since standing still never changes the distance.
 function Brain.Reset()
+    Haz.jumpAt = tick()
     prog, evade, dodge, lastPos, lastTarget = nil, nil, nil, nil, nil
     settleUntil, lastPick = 0, 0
 end
@@ -5852,14 +5963,14 @@ end
 -- when every good spot's walk crosses something) and our own clearance.
 local weaveMemo = {t = 0}
 local WEAVE_R = {2.5, 5, 8, 12, 16}
-local function Weave(pos, desire, near, anchor, spellR, minR)
+local function Weave(pos, desire, near, anchor, spellR, minR, cap)
     local now, m = tick(), weaveMemo
     if now - m.t < 0.1 and m.pos and (pos - m.pos).Magnitude < 1.5
     and ((desire == nil) == (m.desire == nil))
     and (not desire or (desire - m.desire).Magnitude < 3) then
         return m.spot, m.here
     end
-    local cap = CONFIG.WeaveClear
+    cap = cap or CONFIG.WeaveClear
     local last = m.spot
     local function Score(c, move)
         local cl = Haz.BoxClear(c, true, near)
@@ -5867,10 +5978,21 @@ local function Weave(pos, desire, near, anchor, spellR, minR)
         if cl < 0 then s = -60 + cl * 6 else s = math.min(cl, cap) * 6 end
         if desire then s = s - FlatDist(c, desire) * 0.5 end
         s = s - move * 0.35
+        -- Being able to CAST matters more than extra clearance: a safe spot
+        -- out of range is a spot where the fight does not happen. At 1.5
+        -- a stud, four studs of clearance outweighed ten studs out of
+        -- range, and in every boss fight the bot hovered just outside its
+        -- spell range with both spells ready. Now a spot in range (with a
+        -- few studs to spare) earns a bonus, and every stud past it costs
+        -- more than all the clearance there is to gain.
         if anchor then
             local d = FlatDist(c, anchor)
-            if spellR and d > spellR then s = s - (d - spellR) * 1.5 end
-            if minR and d < minR then s = s - (minR - d) * 1.5 end
+            if spellR then
+                local inner = spellR - 4
+                if d <= inner then s = s + 8
+                else s = s - (d - inner) * 7 end
+            end
+            if minR and d < minR then s = s - (minR - d) * 2 end
         end
         -- A little loyalty to the spot picked last time: re-deciding from
         -- scratch every tenth of a second would dither between two.
@@ -6150,6 +6272,7 @@ function Brain.Tick(root)
     if lastPos and (pos - lastPos).Magnitude > 50 then
         print("[DQR] Position jumped - respawn or teleport. Starting fresh.")
         Brain.Reset()
+        Haz.jumpAt = now
     end
     lastPos = pos
     Nav.ExploreSeen(pos)
@@ -6282,7 +6405,31 @@ function Brain.Tick(root)
         stranded = prog ~= nil and prog.latch == "stranded"
 
         if dist <= CONFIG.MeleeRange + reach then DoMelee(aim) end
-        DoSpell(dist, stranded and math.max(spellR, dist + 5) or spellR, aim)
+        -- CastSlack: a spell flies on a little past the nominal range, and
+        -- holding a ready spell loses more than a throw that falls short.
+        local castR = (stranded and math.max(spellR, dist + 5) or spellR) + CONFIG.CastSlack
+        DoSpell(dist, castR, aim)
+        if dist <= castR or tgt.Model ~= holdFire.model then
+            holdFire.inRangeAt, holdFire.model = now, tgt.Model
+        end
+        -- SAFETY NET: a boss with its bar up, near, and our spells held
+        -- for three seconds - throw anyway. The range worked out from a
+        -- boss rig can be wrong (the dragon stood in front of the bot for
+        -- twenty seconds, both spells ready, never a cast); a throw that
+        -- falls short costs a cooldown, holding fire in a boss fight
+        -- costs the fight. Says so, with the numbers.
+        if tgt.Boss and tgt.Model == Mobs.barModel and now - holdFire.inRangeAt > 3
+        and dist <= castR + 30 then
+            DoSpell(0, 1, aim)
+            if now - holdFire.saidAt > 10 then
+                holdFire.saidAt = now
+                print(("[DQR] Throwing at %s anyway: %d studs by its body, casting range %d "
+                    .. "(root %d across, %d %s).")
+                    :format(name, dist, castR, FlatDist(tgt.Root.Position, pos),
+                        math.abs(tgt.Root.Position.Y - pos.Y),
+                        tgt.Root.Position.Y < pos.Y and "below" or "above"))
+            end
+        end
         Nav.face = aim
         -- The target is out of range, but something else is in it: turn
         -- and throw at that instead of holding fire. It used to cast only
@@ -6294,7 +6441,7 @@ function Brain.Tick(root)
                 if rec.Model ~= tgt.Model and not Mobs.Banned(rec.Model)
                 and math.abs(rec.Aim.Y - pos.Y) <= CONFIG.AimMaxDrop then
                     local d = FlatDist(rec.Aim, pos) - rec.Radius
-                    if d <= CONFIG.AttackRange and d < bestD then best, bestD = rec, d end
+                    if d <= CONFIG.AttackRange + CONFIG.CastSlack and d < bestD then best, bestD = rec, d end
                 end
             end
             if best then
@@ -6517,8 +6664,12 @@ function Brain.Tick(root)
     -- hitbox, or on the way to where we are going. Otherwise the plan
     -- above stands (routes, stairs, approaches).
     local weaving = false
+    -- Low on health: keep twice the room from every edge.
+    local hum0 = GetHuman()
+    local lowHp = hum0 and hum0.MaxHealth > 0 and hum0.Health / hum0.MaxHealth < CONFIG.LowHpCaution
+    local cap = CONFIG.WeaveClear * (lowHp and 2 or 1)
     if CONFIG.Weave and not dodge and #Haz.shapes > 0 then
-        local near = Haz.Near(pos, 16 + CONFIG.WeaveClear + 2)
+        local near = Haz.Near(pos, 16 + cap + 2)
         if #near > 0 then
             local here0 = Haz.BoxClear(pos, true, near)
             local ahead = false
@@ -6528,10 +6679,10 @@ function Brain.Tick(root)
                 if d.Magnitude > 16 then g = pos + d.Unit * 16 end
                 ahead = d.Magnitude > 0.5 and Haz.OnPath(pos, g, near)
             end
-            if here0 < CONFIG.WeaveClear + 3 or ahead then
+            if here0 < cap + 3 or ahead then
                 weaving = true
                 local spot, here = Weave(pos, desire or goal, near, tgt and anchor or nil,
-                    tgt and spellR or nil, tgt and minR or nil)
+                    tgt and spellR or nil, tgt and minR or nil, cap)
                 if spot and FlatDist(spot, pos) > 0.8 then
                     if here < 0 and Blink(root, spot) then
                         Nav.goal, Nav.direct, Brain.state = nil, false, "Blinked out of a hazard"
@@ -6541,7 +6692,7 @@ function Brain.Tick(root)
                     goal, direct = spot, true
                     if here < 0 then
                         state = "Stepping out of a hazard"
-                    elseif here < CONFIG.WeaveClear or ahead then
+                    elseif here < cap or ahead then
                         state = tgt and ("Weaving between hazards - " .. name) or "Weaving between hazards"
                     end
                 elseif spot then
@@ -7604,7 +7755,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.21 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.22 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
