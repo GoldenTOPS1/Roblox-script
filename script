@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.8
+--  DQR AUTO FARM v12.9
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -68,6 +68,10 @@ local CONFIG = {
     ShowLog        = false,  -- log window starts hidden; F7 shows it
     ShowDest       = true,   -- green ball where the bot is heading
     -- The map itself, on your screen only:
+    --   "baseplate" - the whole world becomes one flat studded plane:
+    --            terrain cleared, every rock, wall, pillar and prop
+    --            gone. Only stairs, ramps and the upper floors they
+    --            lead to stay. Mobs and bosses stay where they are.
     --   "flat" - decor vanishes and walls turn invisible AND walk-
     --            through; everything you can stand on (floors, stairs,
     --            ramps, platforms) stays solid, repainted as a grey
@@ -75,7 +79,7 @@ local CONFIG = {
     --            out of the way the bot walks straight at things.
     --   "hide" - the same look, but walls keep their collision.
     --   "off"  - leave the map alone.
-    MapMode        = "flat",
+    MapMode        = "baseplate",
     FloorColor     = Color3.fromRGB(96, 104, 116), -- nil = keep each floor's colour
     FloorStuds     = true,   -- baseplate stud texture on the floors
     -- Spell and attack animations, hidden. "weight" plays them at
@@ -182,7 +186,7 @@ local CONFIG = {
     -- Detection. Dungeon Quest names its attack volumes
     -- "<attack>.precast" / "<attack>.hitBox" in every dungeon, so a
     -- part named like that is a hazard, no questions asked.
-    HazardNames    = {"precast", "hitbox"},
+    HazardNames    = {"precast", "hitbox", "tornado", "whirlpool", "vortex", "cyclone"},
     -- Our own spells, by part or parent name (lowercase). Nothing a
     -- player casts can hurt the party. If the bot ever eats damage
     -- while standing still, take "groundaura" out first.
@@ -315,7 +319,7 @@ local CLASS_RANGES = {
 -- ============================================================
 local MAP_PROFILES = {
     ["Desert Temple"] = {
-        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        MapMode   = "baseplate", -- "baseplate" / "flat" / "hide" / "off"
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
@@ -326,7 +330,7 @@ local MAP_PROFILES = {
         Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
     },
     ["Winter Outpost"] = {
-        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        MapMode   = "baseplate", -- "baseplate" / "flat" / "hide" / "off"
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
@@ -337,7 +341,7 @@ local MAP_PROFILES = {
         Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
     },
     ["Pirate Island"] = {
-        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        MapMode   = "baseplate", -- "baseplate" / "flat" / "hide" / "off"
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
@@ -348,7 +352,7 @@ local MAP_PROFILES = {
         Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
     },
     ["King's Castle"] = {
-        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        MapMode   = "baseplate", -- "baseplate" / "flat" / "hide" / "off"
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
@@ -359,7 +363,7 @@ local MAP_PROFILES = {
         Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
     },
     ["The Underworld"] = {
-        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        MapMode   = "baseplate", -- "baseplate" / "flat" / "hide" / "off"
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
@@ -370,7 +374,7 @@ local MAP_PROFILES = {
         Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
     },
     ["Samurai Palace"] = {
-        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        MapMode   = "baseplate", -- "baseplate" / "flat" / "hide" / "off"
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
@@ -381,7 +385,7 @@ local MAP_PROFILES = {
         Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
     },
     ["The Canals"] = {
-        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        MapMode   = "baseplate", -- "baseplate" / "flat" / "hide" / "off"
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
@@ -392,7 +396,7 @@ local MAP_PROFILES = {
         Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
     },
     ["Ghastly Harbor"] = {
-        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        MapMode   = "baseplate", -- "baseplate" / "flat" / "hide" / "off"
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
@@ -403,7 +407,7 @@ local MAP_PROFILES = {
         Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
     },
     ["Steampunk Sewers"] = {
-        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        MapMode   = "baseplate", -- "baseplate" / "flat" / "hide" / "off"
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
@@ -414,7 +418,7 @@ local MAP_PROFILES = {
         Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
     },
     ["Orbital Outpost"] = {
-        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        MapMode   = "baseplate", -- "baseplate" / "flat" / "hide" / "off"
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
@@ -425,18 +429,18 @@ local MAP_PROFILES = {
         Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
     },
     ["Northern Lands"] = {
-        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        MapMode   = "baseplate", -- "baseplate" / "flat" / "hide" / "off"
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
-        BossNames = {},
+        BossNames = {"Midgardian Champion"},
         Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
         Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
         Mage      = {CircleRadius = 26, MinRange = 15, AttackRange = 45},
         Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
     },
     ["Volcanic Chambers"] = {
-        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        MapMode   = "flat",  -- spiral stairs and raised platforms: "flat" is proven here
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
@@ -454,7 +458,7 @@ local MAP_PROFILES = {
     ["Aquatic Temple"] = {
         -- Tuned from the reference video: the caster holds ~30-35 studs
         -- back and throws the ice fan into each pack of three.
-        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        MapMode   = "baseplate", -- "baseplate" / "flat" / "hide" / "off"
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
@@ -465,7 +469,7 @@ local MAP_PROFILES = {
         Healer    = {CircleRadius = 30, MinRange = 20, AttackRange = 48},
     },
     ["Enchanted Forest"] = {
-        MapMode   = "flat",   -- "flat" / "hide" / "off" (use "hide" if doors matter here)
+        MapMode   = "baseplate", -- "baseplate" / "flat" / "hide" / "off"
         DodgeMove = "walk",   -- "walk" / "blink"
         EvadeMax  = 26,       -- furthest a hazard exit may be
         HitboxPad = 1.5,      -- bigger = dodges earlier and wider
@@ -2766,6 +2770,23 @@ local function Classify(o, pos, reach)
     end
     -- 2. The built map, unless it was added mid-run.
     if IsMapPart(o) and not recentParts[o] then return end
+    -- 3a. A column: taller than it is wide, round from above, not solid,
+    -- and moving or in a warning colour - the Midgardian Champion's
+    -- whirlpools. The danger is its footprint, sized from its WIDTH.
+    -- Every rule below rejected these as "too thick", and a tall round
+    -- one that did get through was sized from its height as a ball.
+    do
+        local height, a, b = Footprint(o)
+        local w = math.max(a, b)
+        if height > 8 and height > w * 1.2 and not o.CanCollide and o.Transparency <= 0.95
+        and w >= 4 and w <= CONFIG.RedMaxWide and math.abs(a - b) <= w * 0.35
+        and (LooksActive(o) or WarnColor(o.Color) ~= nil) then
+            if math.abs(o.Position.Y - pos.Y) < 10 + height / 2 then
+                AddDisc(o.Position, w / 2 + CONFIG.TelegraphPad, height / 2, o)
+            end
+            return
+        end
+    end
     -- 3.
     if IsBlob(o) then
         local s = PartSize(o)
@@ -3435,15 +3456,18 @@ local function UpFace(cf)
     return face
 end
 
--- A way up by itself: a wedge, a truss, or any part tilted so that no
--- face points up (a sloped plank, a ramp) and tall enough to climb.
+-- A way up by itself: a wedge, a truss, or a plain block tilted so that
+-- no face points up (a sloped plank, a ramp) and tall enough to climb.
+-- Only a plain block: a rock mesh sits at any angle, and every tumbled
+-- boulder read as a ramp.
 local function StairLike(o)
     if o:IsA("WedgePart") or o:IsA("CornerWedgePart") or o:IsA("TrussPart") then return true end
     if o:IsA("Part") and (o.Shape == Enum.PartType.Wedge
                           or o.Shape == Enum.PartType.CornerWedge) then
         return true
     end
-    return UpFace(o.CFrame) == nil and Extents(o) >= 2
+    return o.ClassName == "Part" and o.Shape == Enum.PartType.Block
+        and UpFace(o.CFrame) == nil and Extents(o) >= 2
 end
 
 -- Grey baseplate look. Lava, glowing panels and anything else in a
@@ -3505,6 +3529,153 @@ local function Strip(o, mode, streamed)
         -- Look.StairLead.
         if wall or StairLike(o) then stairs[o] = true end
         if streamed then newGround[#newGround + 1] = o.Position end
+    end
+end
+
+-- ---- baseplate mode ----------------------------------------------
+-- The reference bot's world: one flat studded plane, the mobs, and
+-- nothing else. The terrain is cleared (on our screen only) and a
+-- 2048-stud baseplate laid at the dungeon's floor level; every map part
+-- goes, except what leads UP from that floor - stairs, ramps, step
+-- blocks, and the slabs and platforms they reach - so a dungeon with
+-- a second storey still has one. Rocks, walls, pillars, props, the
+-- floor itself: hidden, non-solid, invisible to rays. The flat-map
+-- pass only ever looked inside folders named Map/borders, and
+-- Northern Lands keeps its rooms in Workspace.dungeon.roomN and its
+-- ground in Terrain, so it was left exactly as it was.
+Look.y0 = nil                                   -- the floor level in use
+local plane = nil
+
+-- Part of the built world: not a creature, a character, an enemy
+-- folder, an effect, a tool, or ours.
+local SKIP_WORDS = {"enem", "mob", "effect", "fx", "debris", "projectile",
+                    "attack", "spell", "drop", "loot", "ignore"}
+local function IsWorldScenery(o)
+    if o.Name:sub(1, 4) == "DQR_" then return false end
+    local n, depth = o.Parent, 0
+    while n and n ~= workspace do
+        if n:IsA("Camera") or n:IsA("Tool") or n:IsA("Accessory") or n:IsA("Terrain") then
+            return false
+        end
+        if n:IsA("Model") and (IsCreature(n) or Players:GetPlayerFromCharacter(n)) then
+            return false
+        end
+        local l = n.Name:lower()
+        for _, w in ipairs(SKIP_WORDS) do
+            if l:find(w, 1, true) then return false end
+        end
+        n, depth = n.Parent, depth + 1
+        if depth > 24 then return false end
+    end
+    return n == workspace
+end
+
+-- The dungeon's floor level: the most common ground height around us
+-- (terrain included), not just the spot under our feet - the spawn pad
+-- is often raised.
+local function FloorLevel()
+    local root = GetRoot()
+    if not root then return nil end
+    local rp = RaycastParams.new()
+    rp.FilterType = EXCLUDE
+    rp.FilterDescendantsInstances = {GetChar()}
+    rp.IgnoreWater = true
+    local c, ys = root.Position, {}
+    for _, d in ipairs({0, 20, 40, 70}) do
+        for i = 0, 7 do
+            local a = i * math.pi / 4
+            local p = c + Vector3.new(math.cos(a) * d, 0, math.sin(a) * d)
+            local hit = workspace:Raycast(p + Vector3.new(0, 20, 0), Vector3.new(0, -60, 0), rp)
+            if hit and (hit.Instance:IsA("Terrain") or hit.Instance.CanCollide) then
+                ys[#ys + 1] = math.floor(hit.Position.Y + 0.5)
+            end
+            if d == 0 then break end
+        end
+    end
+    if #ys == 0 then return c.Y - 3 end
+    local count, best, bestN = {}, ys[1], 0
+    for _, y in ipairs(ys) do
+        count[y] = (count[y] or 0) + 1
+        if count[y] > bestN then best, bestN = y, count[y] end
+    end
+    return best
+end
+
+local function PlacePlane(y0)
+    local root = GetRoot()
+    if not root then return end
+    if not (plane and plane.Parent) then
+        plane = Instance.new("Part")
+        plane.Name = "DQR_Baseplate"
+        plane.Size = Vector3.new(2048, 4, 2048)
+        plane.Anchored, plane.CanCollide, plane.CanQuery, plane.CanTouch = true, true, true, false
+        plane.CastShadow, plane.Material = false, Enum.Material.SmoothPlastic
+        plane.Color = CONFIG.FloorColor or Color3.fromRGB(96, 104, 116)
+        plane.TopSurface = Enum.SurfaceType.Smooth
+        local tx = Instance.new("Texture")
+        tx.Name, tx.Texture, tx.Face = "DQR_Studs", STUDS, Enum.NormalId.Top
+        tx.StudsPerTileU, tx.StudsPerTileV = 8, 8
+        tx.Color3, tx.Transparency = Color3.new(0, 0, 0), 0.8
+        tx.Parent = plane
+        plane.Parent = workspace
+    end
+    local p = root.Position
+    plane.CFrame = CFrame.new(p.X, y0 - 2, p.Z)
+end
+
+-- Keep the plane under us: a 2048 plane ends 1024 studs out.
+task.spawn(function()
+    while true do
+        S(1)
+        local root = GetRoot()
+        if plane and plane.Parent and root and Look.y0
+        and FlatDist(plane.Position, root.Position) > 600 then
+            local p = root.Position
+            plane.CFrame = CFrame.new(p.X, Look.y0 - 2, p.Z)
+        end
+    end
+end)
+
+local function StripBase(o, y0, streamed)
+    if done[o] or o.Name:sub(1, 4) == "DQR_" then return end
+    -- Invisible and solid: a map edge, kept. Invisible and not: a
+    -- trigger or a pooled effect - left alone, never touched.
+    if o.Transparency >= 0.95 then
+        if o.CanCollide then done[o] = "edge" end
+        return
+    end
+    orig[o] = {cc = o.CanCollide, cq = o.CanQuery, ltm = o.LocalTransparencyModifier,
+               mat = o.Material, col = o.Color}
+    if not o.CanCollide then
+        done[o] = "decor"
+        Vanish(o)
+        return
+    end
+    local height, lo = Extents(o)
+    local top = o.Position.Y + height / 2
+    local wall = WallLike(o)
+    local keep = false
+    if StairLike(o) or (wall and TopConnected(o)) then
+        keep = "stair"
+    elseif UpFace(o.CFrame) and lo >= 4 then
+        local block = o.ClassName == "Part" and o.Shape == Enum.PartType.Block
+        if top > y0 + 1.5 and height <= 3 then
+            keep = "floor"             -- a thin slab above the floor: a step, an upper floor
+        elseif top > y0 + CONFIG.JumpMax and block and (height <= 6 or (lo >= 8 and height <= lo)) then
+            keep = "floor"             -- a raised platform, wider than it is tall
+        end
+    end
+    if keep then
+        done[o] = "ground"
+        Repaint(o)
+        if keep == "stair" or height <= 3 then stairs[o] = true end
+        if streamed then newGround[#newGround + 1] = o.Position end
+    else
+        done[o] = "wall"
+        if wall then walls[o] = true end
+        Vanish(o)
+        o.CanCollide = false
+        o.CanQuery = false
     end
 end
 
@@ -3662,6 +3833,38 @@ end
 
 function Look.ApplyMap()
     local mode = CONFIG.MapMode
+    if mode == "baseplate" then
+        Look.mapMode = mode
+        task.spawn(function()
+            local y0 = Look.y0 or FloorLevel()
+            if not y0 then return end
+            Look.y0 = y0
+            -- The plane first, THEN the terrain goes: the other way round
+            -- we would drop through the world.
+            PlacePlane(y0)
+            local T = workspace:FindFirstChildOfClass("Terrain")
+            if T then pcall(function()
+                T.Decoration = false
+                T:Clear()
+            end) end
+            local n = 0
+            for _, o in ipairs(workspace:GetDescendants()) do
+                if o:IsA("BasePart") and not done[o] and not recentParts[o]
+                and not Haz.NameHas(o, CONFIG.HazardNames) and IsWorldScenery(o) then
+                    pcall(StripBase, o, y0, false)
+                    n = n + 1
+                    if n % 300 == 0 then task.wait() end
+                end
+            end
+            local count = {ground = 0, wall = 0, decor = 0, edge = 0}
+            for _, v in pairs(done) do count[v] = (count[v] or 0) + 1 end
+            print(("[DQR] Map look 'baseplate': flat floor at height %d, terrain cleared; "
+                .. "%d stair/upper-floor part(s) kept, %d part(s) removed, %d decoration(s) "
+                .. "hidden, %d map edge(s) kept."):format(y0, count.ground, count.wall,
+                    count.decor, count.edge))
+        end)
+        return
+    end
     if mode ~= "flat" and mode ~= "hide" then return end
     Look.mapMode = mode
     task.spawn(function()
@@ -3697,6 +3900,19 @@ end
 -- has usually moved or gone by then), if they still look built.
 workspace.DescendantAdded:Connect(function(o)
     if not Look.mapMode or not o:IsA("BasePart") then return end
+    if Look.mapMode == "baseplate" then
+        -- Once the streaming check has run: a part that arrived far off
+        -- is the map loading in; one that arrived near us goes only if
+        -- it is solid (attacks almost never are).
+        task.delay(0.4, function()
+            if not o.Parent or done[o] or Look.mapMode ~= "baseplate" or not Look.y0 then return end
+            if not IsWorldScenery(o) or Haz.NameHas(o, CONFIG.HazardNames) then return end
+            if streamed[o] or (o.Anchored and o.CanCollide) then
+                pcall(StripBase, o, Look.y0, true)
+            end
+        end)
+        return
+    end
     if not IsScenery(o, FolderSet()) then return end
     local at = o.Position
     task.delay(1.5, function()
@@ -3732,7 +3948,10 @@ function Look.RestoreMap()
     table.clear(walls)
     table.clear(stairs)
     newGround = {}
-    print("[DQR] Map restored (decals stay stripped).")
+    if plane and plane.Parent then plane:Destroy() end
+    plane, Look.y0 = nil, nil
+    print("[DQR] Map restored (decals stay stripped; cleared terrain only comes back "
+        .. "with the next dungeon).")
 end
 end
 
@@ -4603,7 +4822,7 @@ end
 -- still within casting range. The walk there must not enter a second
 -- hazard, hit a wall, or go off a ledge. "Clear" means the whole
 -- HITBOX clears every footprint by EvadeClear, not just our centre.
-local function PickExit(pos, aim, keepR, heading, maxD)
+local function PickExit(pos, aim, keepR, heading, maxD, fallback)
     local cands = {}
     maxD = maxD or CONFIG.EvadeMax
     local step = maxD > CONFIG.EvadeMax and 3 or 2
@@ -4632,7 +4851,28 @@ local function PickExit(pos, aim, keepR, heading, maxD)
             return p
         end
     end
-    return nil
+    -- No clean exit. Standing still is the worst answer - that is how
+    -- the Midgardian Champion's strips killed it - so go where the
+    -- hazards overlap the hitbox least, if that is clearly better than
+    -- here, leaning away from `aim`: strips fanning out from a boss
+    -- leave wider gaps further out.
+    if not fallback then return nil end
+    local here = Haz.BoxClear(pos, true)
+    local best, bestS = nil, -math.huge
+    for i = 0, 15 do
+        local a = i * math.pi / 8
+        local u = Vector3.new(math.cos(a), 0, math.sin(a))
+        for _, d in ipairs({4, 8, 12, 16}) do
+            local p = pos + u * d
+            local c = Haz.BoxClear(p, true)
+            if c > here + 1 then
+                local s = c * 2 - d * 0.1
+                if aim then s = s + (FlatDist(p, aim) - FlatDist(pos, aim)) * 0.15 end
+                if s > bestS and LineClear(pos, p) and HasGround(p) then best, bestS = p, s end
+            end
+        end
+    end
+    return best
 end
 
 -- Out of a projectile's line: to the side it is NOT drifting toward.
@@ -4764,15 +5004,25 @@ local function SafeApproach(pos, goal)
         last = p
     end
     if last and FlatDist(last, pos) > 4 then return last end
-    local far = math.min(len, 24)
-    for _, deg in ipairs({35, -35, 60, -60, 85, -85}) do
-        local a = math.rad(deg)
-        local v = Vector3.new(u.X * math.cos(a) - u.Z * math.sin(a), 0,
-                              u.X * math.sin(a) + u.Z * math.cos(a))
-        local p = pos + v * far
-        if not Haz.OnPath(pos, p) and LineClear(pos, p) and HasGround(p) then return p end
+    -- Blocked right in front: the clear spot, reachable without crossing
+    -- anything, that brings us closest to the goal. Taken a leg at a
+    -- time this finds the gaps - against a boss's radial strips every
+    -- straight line to it crosses one, and the bot used to stand and
+    -- "wait for it to clear" while the next volley came down; the gaps
+    -- between the strips lead straight to the boss.
+    local best, bestD = nil, FlatDist(pos, goal) - 1
+    for i = 0, 15 do
+        local a = i * math.pi / 8
+        local v = Vector3.new(math.cos(a), 0, math.sin(a))
+        for _, s in ipairs({6, 10, 16, 24}) do
+            local p = pos + v * s
+            local d = FlatDist(p, goal)
+            if d < bestD and not Haz.At(p) and not Haz.OnPath(pos, p) then
+                if LineClear(pos, p) and HasGround(p) then best, bestD = p, d end
+            end
+        end
     end
-    return nil
+    return best
 end
 
 -- Distances for this target: its entry in CONFIG.Bosses (the dungeon's
@@ -5082,7 +5332,7 @@ function Brain.Tick(root)
         -- Close exits first; a big ring or a room-wide pattern gets a
         -- second, wider look before giving up and trading hits.
         local p = PickExit(pos, anchor, spellR, heading)
-                  or PickExit(pos, anchor, spellR, heading, CONFIG.EvadeFar)
+                  or PickExit(pos, anchor, spellR, heading, CONFIG.EvadeFar, true)
         if p and Blink(root, p) then
             settleUntil = now + 1.5
             Nav.goal, Brain.state = nil, "Blinked out of a hazard"
@@ -6153,7 +6403,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.8 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.9 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
