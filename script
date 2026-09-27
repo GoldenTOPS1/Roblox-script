@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.16
+--  DQR AUTO FARM v12.17
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -20,9 +20,9 @@ local CONFIG = {
     -- The dungeon to run. This also picks the settings: whatever that
     -- dungeon's entry in MAP_PROFILES (further down) says is used for
     -- the run, on top of the defaults in this CONFIG block.
-    TargetDungeon  = "Northern Lands",
-    Difficulty     = "Insane",
-    Hardcore       = false,  -- true = also press HARDCORE MODE
+    TargetDungeon  = "Enchanted Forest",
+    Difficulty     = "Nightmare",
+    Hardcore       = true,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
     -- CARRY MODE: after creating the lobby, wait on the party screen
@@ -448,8 +448,8 @@ local MAP_PROFILES = {
         -- Bosses closer, and only cast at from inside AttackRange
         -- (measured from the edge of the body).
         Bosses    = {
-            ["Midgardian Champion"] = {CircleRadius = 18, MinRange = 10, AttackRange = 32},
-            ["Bob The Frost Giant"] = {CircleRadius = 18, MinRange = 10, AttackRange = 32},
+            ["Midgardian Champion"] = {CircleRadius = 18, MinRange = 10, AttackRange = 45},
+            ["Bob The Frost Giant"] = {CircleRadius = 18, MinRange = 10, AttackRange = 45},
         },
         Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
         Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
@@ -470,9 +470,9 @@ local MAP_PROFILES = {
         -- casting from 65 studs away, where the spells never landed.
         BossReach = 0,
         Bosses    = {
-            ["Lava King"]            = {CircleRadius = 14, MinRange = 8,  AttackRange = 32},
-            ["Deity of the Volcano"] = {CircleRadius = 18, MinRange = 10, AttackRange = 32},
-            ["Ancient Lava Mage"]    = {CircleRadius = 18, MinRange = 10, AttackRange = 32},
+            ["Lava King"]            = {CircleRadius = 14, MinRange = 8,  AttackRange = 40},
+            ["Deity of the Volcano"] = {CircleRadius = 18, MinRange = 10, AttackRange = 40},
+            ["Ancient Lava Mage"]    = {CircleRadius = 18, MinRange = 10, AttackRange = 40},
         },
         Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
         Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
@@ -5981,9 +5981,13 @@ function Brain.Tick(root)
             local absurd = math.abs(q.Y - pos.Y) > CONFIG.AimMaxDrop
             anchor = Vector3.new(q.X, absurd and pos.Y or q.Y, q.Z)
             flat = FlatDist(q, pos)
-            -- Still far above or below even at its nearest: the height
-            -- is the rig's quirk, not a real gap. Judge range flat.
-            dist = absurd and flat or d
+            -- Range is judged ACROSS the ground: spells fly level, and a
+            -- big boss's nearest body point is often well above our head
+            -- (the Midgardian Champion's), which made a boss 25 studs
+            -- away read as out of range. Only a real height gap - within
+            -- AimMaxDrop, beyond a jump - is added on top.
+            local dy = absurd and 0 or math.max(0, math.abs(q.Y - pos.Y) - CONFIG.JumpMax)
+            dist = math.sqrt(flat * flat + dy * dy)
         else
             reach  = tgt.Radius
             aim    = AimOf(tgt, pos)
@@ -7348,7 +7352,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.16 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.17 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
