@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.19
+--  DQR AUTO FARM v12.20
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -17,7 +17,7 @@ local CONFIG = {
     -- Class to "" to tune those by hand instead.
     Class          = "Mage",
 
-    -- The dungeon to run. This also picks thet settings: whatever that
+    -- The dungeon to run. This also picks the settings: whatever that
     -- dungeon's entry in MAP_PROFILES (further down) says is used for
     -- the run, on top of the defaults in this CONFIG block.
     TargetDungeon  = "Enchanted Forest",
@@ -2069,11 +2069,19 @@ end)
 -- The part a model is measured from. Big boss rigs rarely have a
 -- HumanoidRootPart and keep their parts in sub-models, so fall back
 -- through PrimaryPart and a torso to any part at all.
+-- A child by name, only if it is a part: the Enchanted Forest Dragon
+-- keeps a MODEL called "UpperTorso", and taking it for a part crashed
+-- the farm loop the moment the dragon spawned.
+local function PartNamed(obj, name)
+    local c = obj:FindFirstChild(name)
+    return (c and c:IsA("BasePart")) and c or nil
+end
+Mobs.PartNamed = PartNamed
 local function RootOf(obj)
     local r = rootOf[obj]
     if r and r.Parent and r:IsDescendantOf(obj) then return r end
-    r = obj:FindFirstChild("HumanoidRootPart") or obj.PrimaryPart
-        or obj:FindFirstChild("Torso") or obj:FindFirstChild("UpperTorso")
+    r = PartNamed(obj, "HumanoidRootPart") or obj.PrimaryPart
+        or PartNamed(obj, "Torso") or PartNamed(obj, "UpperTorso")
         or obj:FindFirstChildWhichIsA("BasePart", true)
     rootOf[obj] = r
     return r
@@ -2335,7 +2343,17 @@ function Mobs.Scan(force)
         if not obj.Parent or hum.Parent ~= obj then
             models[obj] = nil
         elseif not IsPlayerChar(obj) then
-            local rec = Record(obj, hum, me, barHit)
+            -- One oddly built mob must never stop the whole scan (and
+            -- with it the farm loop): it is skipped, and named once.
+            local ok, rec = pcall(Record, obj, hum, me, barHit)
+            if not ok then
+                if not Mobs.badSaid then Mobs.badSaid = {} end
+                if not Mobs.badSaid[obj] then
+                    Mobs.badSaid[obj] = true
+                    print(("[DQR] Could not read mob %s: %s"):format(obj:GetFullName(), tostring(rec)))
+                end
+                rec = nil
+            end
             if rec and rec.Dist <= CONFIG.MobScanRadius then list[#list + 1] = rec end
         end
     end
@@ -2696,7 +2714,7 @@ end
 local DETACHED_AT = 40
 local function CreatureRoot(model, hum)
     return (typeof(hum) == "Instance" and hum.RootPart) or model.PrimaryPart
-        or model:FindFirstChild("HumanoidRootPart")
+        or (Mobs.PartNamed and Mobs.PartNamed(model, "HumanoidRootPart"))
 end
 local function CreatureEffect(o, model, hum)
     if o.CanCollide then return false end
@@ -7398,7 +7416,12 @@ local function Guarded(name, fn)
             end
             Farm.Running = false
             Nav.Stop()
+            -- Nobody else may start the farm during the wait (the
+            -- supervisor did, every 4 seconds, and each start that
+            -- crashed began another restart chain of its own).
+            Farm.restartAt = tick() + wait
             task.wait(wait)
+            Farm.restartAt = nil
             Farm.Start()
         end
     end
@@ -7406,6 +7429,7 @@ end
 
 function Farm.Start()
     if Farm.Running then return end
+    if Farm.restartAt and tick() < Farm.restartAt then return end
     if InLobby() then
         print("[DQR] Refusing to farm - lobby marker '" .. tostring(LobbyMarker())
             .. "' is on screen.")
@@ -7522,7 +7546,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.19 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.20 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
