@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.23
+--  DQR AUTO FARM v12.24
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -32,6 +32,23 @@ local CONFIG = {
     CarryMode      = false,
     CarryFor       = {"24MINZ"},
     CarryWait      = 0,
+
+    -- ---- AUTO SELL ---------------------------------------------
+    -- true = every time the bot is back in the lobby, before it queues
+    -- (or replays) the next run: walk to the sell area, click EVERY item
+    -- whose name is in SellNames, then press Sell once for all of them.
+    -- Names are matched ignoring case and spaces. Nothing that is not on
+    -- the list is ever clicked, and a "Sell All" button is never pressed.
+    AutoSell       = false,
+    SellNames      = {},        -- e.g. {"Rusty Sword", "Bone Armor"}
+    SellMatch      = "exact",   -- "exact" = the whole name, "contains" = part of it
+    -- SellDryRun = true: walks there, opens the shop and clicks the items,
+    -- but does NOT press Sell - the log lists what it would have sold.
+    -- Run it like that once and check the list before switching it off.
+    SellDryRun     = true,
+    -- Where the sell area is, if it is not found by itself (the log will
+    -- say): a Vector3, e.g. Vector3.new(120, 5, -40). nil = find it.
+    SellSpot       = nil,
 
     -- ---- DISCORD -----------------------------------------------
     -- Loot: each finished run posts its drops here. "" = off.
@@ -126,7 +143,7 @@ local CONFIG = {
     -- when it was stuck). With it off the bot walks up ramps and stairs
     -- only - a step taller than the character can walk onto is a wall.
     AllowJump      = false,
-    SetWalkSpeed   = true,
+    SetWalkSpeed   = false,
     WalkSpeed      = 19,
 
     -- ---- TARGETING ---------------------------------------------
@@ -546,6 +563,7 @@ local Hud   = {}
 local UI    = {}
 local Prof  = {}   -- map profiles
 local Look  = {}   -- hitbox box, flat map, hidden animations
+local Sell  = {}   -- auto sell, in the lobby
 
 -- ============================================================
 --  EXECUTOR GLOBALS
@@ -1830,6 +1848,11 @@ local function RunLobbyFlow()
         repeat S(0.5) w = w + 0.5 until PathVisible(UI.LobbyPlay) or w > 15
     end
 
+    -- AUTO SELL: after the title's Play, before queueing - the lobby's
+    -- own Play button opens the queue screen, which the walk would not
+    -- survive. Does nothing unless CONFIG.AutoSell is on.
+    Sell.Run()
+    if not InLobby() then return Abort() end
     if not Step(1, "Lobby Play", UI.LobbyPlay, 10) then return Abort() end
     S(1.0)
     if not Step(2, "Create Dungeon", UI.CreateGame, 8) then return Abort() end
@@ -7581,6 +7604,379 @@ end
 end -- of the loot block
 
 -- ============================================================
+--  AUTO SELL  (lobby)
+--  Walk to the sell area, open the shop, click every item whose name
+--  is on CONFIG.SellNames, press Sell once. Built to find the pieces by
+--  themselves - the sell area by a prompt or part with "sell" in it,
+--  the item slots by their icons, the names from the slot's own name,
+--  attributes, values or labels - because the shop's layout was never
+--  dumped. DQR_SellDump() with the shop open prints what it sees, so
+--  anything it cannot find can be pinned down.
+-- ============================================================
+do
+local GENERIC = {imagebutton = true, textbutton = true, frame = true, template = true,
+                 slot = true, item = true, button = true, itemslot = true, holder = true}
+local CONTROL = {x = true, close = true, exit = true, back = true, cancel = true, no = true,
+                 yes = true, ok = true, confirm = true, sell = true, sellall = true,
+                 sellselected = true, selectall = true, next = true, prev = true}
+
+-- Does a name match the list?
+function Sell.Match(name)
+    local n = Norm(name)
+    if n == "" then return false end
+    for _, want in ipairs(CONFIG.SellNames or {}) do
+        local w = Norm(want)
+        if w ~= "" then
+            if n == w then return true end
+            if CONFIG.SellMatch == "contains" and n:find(w, 1, true) then return true end
+        end
+    end
+    return false
+end
+
+-- Every name a slot could be carrying: string attributes and string
+-- values on it or its frame, its labels, and its own name unless that is
+-- a generic one ("ImageButton", "Slot", "12").
+local function Candidates(slot)
+    local out, seen = {}, {}
+    local function Add(s)
+        s = tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        local letters = #s:gsub("[^%a]", "")
+        if letters >= 3 and not seen[s] then
+            seen[s] = true
+            out[#out + 1] = s
+        end
+    end
+    for _, holder in ipairs({slot, slot.Parent}) do
+        if holder then
+            for _, v in pairs(holder:GetAttributes()) do
+                if type(v) == "string" then Add(v) end
+            end
+            for _, c in ipairs(holder:GetChildren()) do
+                if c:IsA("StringValue") then Add(c.Value) end
+            end
+        end
+    end
+    for _, d in ipairs(slot:GetDescendants()) do
+        if d:IsA("TextLabel") or d:IsA("TextButton") then Add(d.Text) end
+    end
+    if slot:IsA("TextButton") then Add(slot.Text) end
+    for _, nm in ipairs({slot.Name, slot.Parent and slot.Parent.Name or ""}) do
+        local l = Norm(nm)
+        if not GENERIC[l] and not l:match("^%d+$") then Add(nm) end
+    end
+    return out
+end
+Sell.Candidates = Candidates
+
+-- Item names the game keeps in a data folder, if it keeps them where we
+-- can read them (an "Inventory" folder on the player or in
+-- ReplicatedStorage). nil when there is none - then only the shop's own
+-- screen can tell.
+function Sell.InventoryNames()
+    local RS = game:GetService("ReplicatedStorage")
+    local roots = {LP, RS:FindFirstChild(LP.Name), RS:FindFirstChild(tostring(LP.UserId))}
+    local pd = RS:FindFirstChild("PlayerData") or RS:FindFirstChild("Data")
+    if pd then
+        roots[#roots + 1] = pd:FindFirstChild(LP.Name)
+        roots[#roots + 1] = pd:FindFirstChild(tostring(LP.UserId))
+    end
+    local function Find(node, depth)
+        for _, c in ipairs(node:GetChildren()) do
+            if (c:IsA("Folder") or c:IsA("Configuration")) and c.Name:lower():find("inventor", 1, true) then
+                return c
+            end
+        end
+        if depth <= 0 then return nil end
+        for _, c in ipairs(node:GetChildren()) do
+            if c:IsA("Folder") or c:IsA("Configuration") then
+                local f = Find(c, depth - 1)
+                if f then return f end
+            end
+        end
+        return nil
+    end
+    for _, r in ipairs(roots) do
+        local f = r and Find(r, 3)
+        if f then
+            local names = {}
+            for _, c in ipairs(f:GetChildren()) do
+                names[#names + 1] = c:IsA("StringValue") and c.Value ~= "" and c.Value or c.Name
+            end
+            return names, f
+        end
+    end
+    return nil
+end
+
+-- The sell area: CONFIG.SellSpot, else a ProximityPrompt that talks about
+-- selling, else the nearest part or model with "sell" in its name.
+function Sell.FindArea()
+    if typeof(CONFIG.SellSpot) == "Vector3" then return CONFIG.SellSpot, nil, "CONFIG.SellSpot" end
+    local root = GetRoot()
+    local me = root and root.Position or Vector3.zero
+    local function PosOf(o)
+        if o:IsA("BasePart") then return o.Position end
+        if o:IsA("Attachment") then return o.WorldPosition end
+        if o:IsA("Model") then
+            local ok, p = pcall(function() return o:GetPivot().Position end)
+            if ok then return p end
+        end
+        return nil
+    end
+    local best, bestD, prompt, what = nil, math.huge, nil, nil
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            local t = (d.ActionText .. " " .. d.ObjectText .. " " .. (d.Parent and d.Parent.Name or "")):lower()
+            if t:find("sell", 1, true) then
+                local p = d.Parent and PosOf(d.Parent)
+                if p then
+                    local dist = (p - me).Magnitude
+                    -- A prompt always beats a mere name.
+                    if not prompt or dist < bestD then best, bestD, prompt, what = p, dist, d, d:GetFullName() end
+                end
+            end
+        end
+    end
+    if prompt then return best, prompt, what end
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if (d:IsA("BasePart") or d:IsA("Model")) and d.Name:lower():find("sell", 1, true)
+        and not (d:IsA("Model") and IsCreature(d)) then
+            local p = PosOf(d)
+            if p and (p - me).Magnitude < bestD then best, bestD, what = p, (p - me).Magnitude, d:GetFullName() end
+        end
+    end
+    return best, nil, what
+end
+
+-- Walk there with the farm's own mover. True when we got within 6 studs.
+function Sell.WalkTo(pos)
+    Nav.Start()
+    Nav.goal = pos
+    local t0, reached = tick(), false
+    while tick() - t0 < 40 do
+        local root = GetRoot()
+        if root and FlatDist(root.Position, pos) < 6 then reached = true break end
+        S(0.2)
+    end
+    Nav.goal = nil
+    S(0.3)
+    Nav.Stop()
+    return reached
+end
+
+-- The shop's Sell button, when its screen is up. Never a "Sell All".
+function Sell.FindButton()
+    for _, b in ipairs(FindButtons({{text = "sell"}, {text = "sellselected"},
+                                    {text = "sellitems"}, {name = "sellbutton"}})) do
+        local txt = ButtonText(b)
+        if VisibleOnScreen(b) and not txt:find("sellall", 1, true) then return b end
+    end
+    return nil
+end
+
+-- Open the shop: already open, or use the prompt (fired directly when
+-- the executor can, else its key held down), then wait for the screen.
+function Sell.Open(prompt)
+    local b = Sell.FindButton()
+    if b then return b end
+    if prompt then
+        local fire = Env("fireproximityprompt")
+        if typeof(fire) == "function" then
+            pcall(fire, prompt)
+        else
+            pcall(function()
+                VIM:SendKeyEvent(true, prompt.KeyboardKeyCode, false, game)
+                S(prompt.HoldDuration + 0.2)
+                VIM:SendKeyEvent(false, prompt.KeyboardKeyCode, false, game)
+            end)
+        end
+    end
+    local t0 = tick()
+    while tick() - t0 < 6 do
+        b = Sell.FindButton()
+        if b then return b end
+        S(0.25)
+    end
+    return nil
+end
+
+-- The item slots on the shop's screen: buttons with an icon (an image,
+-- or a 3D preview), not the shop's own controls.
+function Sell.Slots(gui, sellBtn)
+    local out = {}
+    for _, d in ipairs(gui:GetDescendants()) do
+        if (d:IsA("ImageButton") or d:IsA("TextButton")) and d ~= sellBtn
+        and not d:IsDescendantOf(sellBtn) and VisibleOnScreen(d) then
+            local ctrl = false
+            for _, tok in ipairs(ButtonTokens(d)) do
+                if CONTROL[tok] then ctrl = true break end
+            end
+            if not ctrl and CONTROL[Norm(d.Name)] then ctrl = true end
+            local icon = (d:IsA("ImageButton") and d.Image ~= "")
+            if not icon then
+                for _, c in ipairs(d:GetDescendants()) do
+                    if c:IsA("ViewportFrame") or (c:IsA("ImageLabel") and c.Image ~= "") then icon = true break end
+                end
+            end
+            if not ctrl and icon then out[#out + 1] = d end
+        end
+    end
+    return out
+end
+
+-- Close the shop: its X / Close / Back button, if it has one.
+function Sell.Close(gui)
+    for _, d in ipairs(gui and gui:GetDescendants() or {}) do
+        if (d:IsA("TextButton") or d:IsA("ImageButton")) and VisibleOnScreen(d) then
+            local n = Norm(d.Name)
+            local txt = ButtonText(d)
+            if n:find("close", 1, true) or n:find("exit", 1, true) or txt == "x" or txt == "close"
+            or txt == "back" or txt == "exit" then
+                ClickButton(d)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function Sell.Flow(force)
+    if #(CONFIG.SellNames or {}) == 0 then
+        print("[DQR] Sell: SellNames is empty - nothing to look for.")
+        return
+    end
+    -- The title splash first: the lobby is behind it.
+    local intro = PathVisible(UI.IntroPlay)
+    if intro then
+        ClickButton(intro)
+        local w = 0
+        repeat S(0.5) w = w + 0.5 until PathVisible(UI.LobbyPlay) or w > 15
+    end
+    -- Nothing to sell? Say so and save the walk.
+    local have = Sell.InventoryNames()
+    if have then
+        local want = {}
+        for _, n in ipairs(have) do if Sell.Match(n) then want[#want + 1] = n end end
+        if #want == 0 then
+            print(("[DQR] Sell: none of the %d item(s) in the inventory is on SellNames."):format(#have))
+            return
+        end
+        print(("[DQR] Sell: %d item(s) to sell: %s"):format(#want, table.concat(want, ", ")))
+    end
+    local spot, prompt, what = Sell.FindArea()
+    if not spot then
+        print("[DQR] Sell: could not find the sell area - stand in it, and put your position "
+            .. "in CONFIG.SellSpot (DQR_SellDump() prints it).")
+        return
+    end
+    print(("[DQR] Sell: heading to the sell area (%s)."):format(tostring(what)))
+    if not Sell.WalkTo(spot) then
+        print("[DQR] Sell: could not reach the sell area.")
+        return
+    end
+    local btn = Sell.Open(prompt)
+    if not btn then
+        print("[DQR] Sell: the shop screen did not open (no Sell button on screen). Open it by "
+            .. "hand and run DQR_SellDump(), then send the output.")
+        return
+    end
+    local gui = btn:FindFirstAncestorWhichIsA("ScreenGui") or btn.Parent
+    S(0.5)                                  -- let the item list fill in
+    local slots = Sell.Slots(gui, btn)
+    local picked, named = {}, 0
+    for _, s in ipairs(slots) do
+        local cands = Candidates(s)
+        if #cands > 0 then named = named + 1 end
+        for _, c in ipairs(cands) do
+            if Sell.Match(c) then picked[#picked + 1] = {slot = s, name = c} break end
+        end
+    end
+    if #picked == 0 then
+        if #slots > 0 and named == 0 then
+            print(("[DQR] Sell: %d item slot(s) on the shop screen, but none carries a name I "
+                .. "can read. Run DQR_SellDump() with the shop open and send the output."):format(#slots))
+        else
+            print(("[DQR] Sell: nothing on the shop screen is on SellNames (%d slot(s) looked at)."):format(#slots))
+        end
+        Sell.Close(gui)
+        return
+    end
+    -- Click them all first...
+    local list = {}
+    for _, p in ipairs(picked) do
+        pcall(ScrollIntoView, p.slot)
+        ClickButton(p.slot)
+        list[#list + 1] = p.name
+        S(0.25)
+    end
+    print(("[DQR] Sell: selected %d item(s): %s"):format(#picked, table.concat(list, ", ")))
+    if CONFIG.SellDryRun then
+        print("[DQR] Sell: SellDryRun is on - NOT pressing Sell. Check the list above, then set "
+            .. "SellDryRun = false.")
+        Sell.Close(gui)
+        return
+    end
+    -- ...then sell them all at once, and answer a confirmation if one
+    -- comes up (never the Sell button itself a second time).
+    ClickButton(btn)
+    local t0 = tick()
+    while tick() - t0 < 2.5 do
+        S(0.3)
+        local conf = nil
+        for _, b in ipairs(FindButtons({{text = "yes"}, {text = "confirm"}, {text = "ok"}})) do
+            if VisibleOnScreen(b) and b ~= btn then conf = b break end
+        end
+        if conf then ClickButton(conf) break end
+    end
+    print(("[DQR] Sell: sold %d item(s)."):format(#picked))
+    S(0.5)
+    Sell.Close(gui)
+end
+
+-- Once per lobby visit (and never twice within 30 seconds). `force` runs
+-- it even with AutoSell off - that is for DQR_Sell() from the console.
+-- SellDryRun is obeyed either way.
+function Sell.Run(force)
+    if Sell.busy then return end
+    if not force and (not CONFIG.AutoSell or tick() - (Sell.lastRun or 0) < 30) then return end
+    Sell.busy, Sell.lastRun = true, tick()
+    local ok, err = pcall(Sell.Flow, force)
+    if not ok then print("[DQR] Sell: failed - " .. tostring(err)) end
+    pcall(function() if not Farm.Running then Nav.Stop() end end)
+    Sell.busy = false
+end
+
+-- DQR_SellDump(): with the shop open, everything it would look at.
+function Sell.Dump()
+    local root = GetRoot()
+    if root then
+        local p = root.Position
+        print(("[DQR] Your position: Vector3.new(%d, %d, %d)  (for CONFIG.SellSpot)"):format(p.X, p.Y, p.Z))
+    end
+    local spot, prompt, what = Sell.FindArea()
+    print("[DQR] Sell area found: " .. tostring(what) .. (prompt and " (a prompt)" or ""))
+    local have, folder = Sell.InventoryNames()
+    print("[DQR] Inventory data: " .. (have and (folder:GetFullName() .. " - " .. #have .. " item(s)") or "none readable"))
+    local btn = Sell.FindButton()
+    print("[DQR] Sell button: " .. (btn and btn:GetFullName() or "not on screen"))
+    local gui = btn and (btn:FindFirstAncestorWhichIsA("ScreenGui") or btn.Parent)
+    if not gui then return end
+    local slots = Sell.Slots(gui, btn)
+    print(("[DQR] === %d ITEM SLOT(S) ==="):format(#slots))
+    for i, s in ipairs(slots) do
+        if i > 60 then break end
+        local cands = Candidates(s)
+        local m = false
+        for _, c in ipairs(cands) do if Sell.Match(c) then m = true break end end
+        print(("%s | names: %s | on SellNames: %s"):format(s:GetFullName(),
+            #cands > 0 and table.concat(cands, " / ") or "(none)", tostring(m)))
+    end
+    print("[DQR] === END ===")
+end
+end
+
+-- ============================================================
 --  START / STOP
 --  task.spawn swallows errors, so a crash inside the loop used to
 --  leave Farm.Running true with nothing running. Guarded reports what
@@ -7718,6 +8114,9 @@ local function Supervisor()
         if InLobby() then
             Look.mapApplied, Look.y0 = false, nil     -- the next dungeon gets a fresh map pass
             if not CONFIG.AutoRunDungeon then continue end
+            -- Sell first, whichever way the next run starts (Replay skips
+            -- the queue screen, and with it the sell step there).
+            if PathVisible(UI.Replay) then Sell.Run() end
             local replay = PathVisible(UI.Replay)
             if replay then
                 print("[DQR] Replay Dungeon available - clicking it.")
@@ -7745,7 +8144,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.23 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.24 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -7849,6 +8248,10 @@ getgenv().DQR_LootDump   = LootDump
 getgenv().DQR_LootTest   = function() return ReportLoot(nil) end
 getgenv().DQR_StatusDump = Farm.StatusDump
 getgenv().DQR_State      = function() return Brain.state end
+-- DQR_SellDump(): what the auto sell sees (open the shop first).
+-- DQR_Sell(): run the sell now, even with AutoSell off (SellDryRun obeyed).
+getgenv().DQR_SellDump   = function() Sell.Dump() end
+getgenv().DQR_Sell       = function() task.spawn(Sell.Run, true) end
 getgenv().DQR_BossBar    = function() return Mobs.BossBar() end
 getgenv().DQR_Profile    = function() Prof.Apply() return Prof.name end
 -- DQR_Map("off") puts the map back; DQR_Map("flat") / ("hide") applies it.
