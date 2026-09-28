@@ -20,9 +20,9 @@ local CONFIG = {
     -- The dungeon to run. This also picks the settings: whatever that
     -- dungeon's entry in MAP_PROFILES (further down) says is used for
     -- the run, on top of the defaults in this CONFIG block.
-    TargetDungeon  = "Volcanic Chambers",
-    Difficulty     = "Nightmare",
-    Hardcore       = true,  -- true = also press HARDCORE MODE
+    TargetDungeon  = "Desert Temple",
+    Difficulty     = "Easy",
+    Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
     -- CARRY MODE: after creating the lobby, wait on the party screen
@@ -143,7 +143,7 @@ local CONFIG = {
     -- when it was stuck). With it off the bot walks up ramps and stairs
     -- only - a step taller than the character can walk onto is a wall.
     AllowJump      = false,
-    SetWalkSpeed   = false,
+    SetWalkSpeed   = true,
     WalkSpeed      = 19,
 
     -- ---- TARGETING ---------------------------------------------
