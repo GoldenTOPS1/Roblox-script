@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v12.24
+--  DQR AUTO FARM v12.27
 --  Change version number every time you update the script.
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
@@ -20,8 +20,8 @@ local CONFIG = {
     -- The dungeon to run. This also picks the settings: whatever that
     -- dungeon's entry in MAP_PROFILES (further down) says is used for
     -- the run, on top of the defaults in this CONFIG block.
-    TargetDungeon  = "Desert Temple",
-    Difficulty     = "Easy",
+    TargetDungeon  = "Volcanic Chambers",
+    Difficulty     = "Insane",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
@@ -143,8 +143,8 @@ local CONFIG = {
     -- when it was stuck). With it off the bot walks up ramps and stairs
     -- only - a step taller than the character can walk onto is a wall.
     AllowJump      = false,
-    SetWalkSpeed   = false,
-    WalkSpeed      = 19,
+    SetWalkSpeed   = true,
+    WalkSpeed      = 18,
 
     -- ---- TARGETING ---------------------------------------------
     PreferBoss     = true,   -- a boss outranks the adds it summons
@@ -3360,7 +3360,14 @@ Haz.columns = {}                                   -- source -> {h, w, t}
 local function AddColumn(o, height, w)
     AddDisc(o.Position, w / 2 + CONFIG.TelegraphPad, math.max(height, 12) / 2, o)
     height = math.max(height, 12)
-    Haz.columns[o] = {h = height, w = w + CONFIG.TelegraphPad * 2, t = tick()}
+    local now, info = tick(), Haz.columns[o]
+    if not info then
+        info = {lastP = o.Position, movedAt = 0}
+        Haz.columns[o] = info
+    elseif (o.Position - info.lastP).Magnitude > 0.5 then
+        info.lastP, info.movedAt = o.Position, now
+    end
+    info.h, info.w, info.t = height, w + CONFIG.TelegraphPad * 2, now
 end
 
 -- THE PILLARS. Each column seen gets a solid grey cylinder of its own
@@ -3372,11 +3379,17 @@ end
 -- walks us out instead.
 do
 local pillars = {}                                  -- source -> part
+Haz.pillars = pillars
 RunService.Heartbeat:Connect(function()
     local now, root = tick(), GetRoot()
     for src, info in pairs(Haz.columns) do
-        if not CONFIG.ColumnWalls or not src.Parent or now - info.t > 1 then
-            Haz.columns[src] = nil
+        -- Only for a column on the move (a whirlpool travelling): one that
+        -- stands still - a torch, a brazier, a glowing pillar - is a
+        -- hazard to keep away from, not a wall. Walls round still
+        -- decorations had the bot walking in place against them.
+        local moving = now - (info.movedAt or 0) < 1.5
+        if not CONFIG.ColumnWalls or not src.Parent or now - info.t > 1 or not moving then
+            if not src.Parent or now - info.t > 1 then Haz.columns[src] = nil end
             if pillars[src] then pillars[src]:Destroy() pillars[src] = nil end
         else
             local p = pillars[src]
@@ -5141,6 +5154,85 @@ function Nav.Diag()
                 tostring(h.Sit), tostring(h.FloorMaterial), tostring(controlsOff))
 end
 
+-- WALKING IN PLACE: what is holding us. Anchored or held by the game (a
+-- freeze, a cutscene, an anti-cheat hold), a mover or constraint on the
+-- body, or something solid right in front - and if that is one of our
+-- own parts, it is made walk-through on the spot.
+function Nav.WhyStuck(dir)
+    local r, h = GetRoot(), GetHuman()
+    if not r or not h then return "no character" end
+    local why = {}
+    if r.Anchored then why[#why + 1] = "the character is ANCHORED (frozen by the game)" end
+    local ok, grounded = pcall(function() return r:IsGrounded() end)
+    if ok and grounded and not r.Anchored then
+        why[#why + 1] = "the character is welded to something anchored (held by the game)"
+    end
+    if h.PlatformStand then why[#why + 1] = "PlatformStand is on" end
+    -- Who runs our physics. When the server has taken it (an anti-cheat
+    -- hold, a cutscene), nothing the client does can move the body.
+    local owner = Env("isnetworkowner")
+    local mine = nil
+    if typeof(owner) == "function" then
+        local okO, v = pcall(owner, r)
+        if okO then mine = v and true or false end
+    end
+    if mine == nil then
+        local okA, age = pcall(function() return r.ReceiveAge end)
+        if okA and age and age > 0.5 then mine = false end
+    end
+    if mine == false then
+        why[#why + 1] = "the SERVER has taken over the character's physics (we cannot move it - "
+            .. "an anti-cheat hold? rejoin)"
+    end
+    -- Our own whirlpool pillars (rays pass through them).
+    for _, p in pairs(Haz.pillars or {}) do
+        if p.Parent and p.CanCollide and FlatDist(p.Position, r.Position) < p.Size.Y / 2 + 3 then
+            p.CanCollide = false
+            why[#why + 1] = "one of our own whirlpool pillars was against us - made walk-through"
+        end
+    end
+    -- Anything solid overlapping the body (a ray started inside a part
+    -- never hits it).
+    local op = OverlapParams.new()
+    op.FilterType = EXCLUDE
+    op.FilterDescendantsInstances = {GetChar()}
+    local okP, parts = pcall(function()
+        return workspace:GetPartBoundsInBox(r.CFrame, Vector3.new(3, 4.5, 2), op)
+    end)
+    for _, o in ipairs(okP and parts or {}) do
+        if o.CanCollide and o.Name:sub(1, 4) ~= "DQR_" then
+            why[#why + 1] = ("inside solid %s"):format(o:GetFullName())
+            break
+        end
+    end
+    if h.WalkSpeed <= 0.1 then why[#why + 1] = "WalkSpeed is 0 (the game stopped it)" end
+    local char = GetChar()
+    for _, d in ipairs(char and char:GetDescendants() or {}) do
+        if d:IsA("BodyMover") or d:IsA("AlignPosition") or d:IsA("LinearVelocity")
+        or d:IsA("VectorForce") or d:IsA("BodyPosition") then
+            why[#why + 1] = ("a %s (%s) on %s"):format(d.ClassName, d.Name, d.Parent and d.Parent.Name or "?")
+        end
+    end
+    if dir and dir.Magnitude > 0.1 then
+        local rp = RayParams(true)
+        for _, hgt in ipairs({-1.5, 0.5}) do
+            local hit = workspace:Raycast(r.Position + Vector3.new(0, hgt, 0), dir.Unit * 3.5, rp)
+            if hit and hit.Instance.CanCollide then
+                local o = hit.Instance
+                if o.Name:sub(1, 4) == "DQR_" then
+                    pcall(function() o.CanCollide = false end)
+                    why[#why + 1] = ("our own %s was in the way - made walk-through"):format(o.Name)
+                else
+                    why[#why + 1] = ("solid %s in front (%s, %s)"):format(o:GetFullName(),
+                        o.ClassName, o.Transparency >= 0.95 and "invisible" or "visible")
+                end
+                break
+            end
+        end
+    end
+    return #why > 0 and table.concat(why, "; ") or "nothing found holding it"
+end
+
 local function ClearPath() Nav.queue, Nav.qGoal = {}, nil end
 Nav.ClearPath = ClearPath
 
@@ -5285,6 +5377,8 @@ end
 -- It is hill-climbing on the navmesh, one leg at a time. The strictest
 -- agent goes first (it keeps the bot off mountainsides); 70 degrees is
 -- the loosest - 89 is a wall, and Roblox will route straight up one.
+Nav.Route = Route
+
 local function ComputePath(from, to)
     local direct = Route(from, to, {{3, CONFIG.AgentMaxSlope}, {2, 60}, {1.5, 70}})
     if direct then
@@ -5526,6 +5620,7 @@ local function Heartbeat(dt)
     end
     if dir then
         if cmdSince == 0 then cmdSince = now end
+        Nav.moveDir = dir
         if mode == "humanoid" then
             human:Move(dir, false)
             -- Commanding for a second with no MoveDirection: something
@@ -5536,9 +5631,10 @@ local function Heartbeat(dt)
                 print("[DQR] Humanoid:Move is being overridden - velocity mode. " .. Nav.Diag())
             end
         else
-            if human.MoveDirection.Magnitude > 0.1 then
+            -- Back to walking once the forced spell (Nav.velUntil) is over.
+            if now > (Nav.velUntil or 0) and human.MoveDirection.Magnitude > 0.1 then
                 mode, cmdSince = "humanoid", now
-                print("[DQR] Humanoid responding again - back to walk mode.")
+                print("[DQR] Back to walk mode.")
             end
             local spd = human.WalkSpeed > 0 and human.WalkSpeed or 16
             local v = root.AssemblyLinearVelocity
@@ -5547,6 +5643,7 @@ local function Heartbeat(dt)
         end
     else
         cmdSince = 0
+        Nav.moveDir = Vector3.zero
         if mode == "humanoid" then
             human:Move(Vector3.zero, false)
         else
@@ -5583,12 +5680,17 @@ local function Heartbeat(dt)
             local spot = Nav.SafeStep(pos, (back * 0.7 + side).Unit, CONFIG.UnstickDist)
             Nav.unstick = spot and Flat(spot - pos).Unit or back
             Nav.unstickUntil = now + CONFIG.UnstickTime
-            if diagCount < 3 then
-                diagCount = diagCount + 1
-                print("[DQR] Stuck - backing out. " .. Nav.Diag())
-            elseif diagCount == 3 then
-                diagCount = 4
-                print("[DQR] Stuck (further diagnostics suppressed).")
+            local why = Nav.WhyStuck(dir or Flat((step or goal) - pos))
+            -- Walking in place with the command on and nothing in the way:
+            -- push the body itself for a few seconds.
+            if stuckCount >= 2 and human.MoveDirection.Magnitude > 0.5
+            and not why:find("in front", 1, true) and now > (Nav.velUntil or 0) then
+                mode, Nav.velUntil = "velocity", now + 4
+                why = why .. " - driving the body's velocity directly for 4s"
+            end
+            if diagCount < 3 or now - (Nav.whyAt or 0) > 15 then
+                diagCount, Nav.whyAt = diagCount + 1, now
+                print(("[DQR] Stuck - %s. %s"):format(why, Nav.Diag()))
             end
         end
     else
@@ -5642,12 +5744,27 @@ function Nav.Start()
     end
     print("[DQR] Move start: " .. Nav.Diag())
     conn = RunService.Heartbeat:Connect(Heartbeat)
+    -- The move command again, every frame, right AFTER Roblox's own
+    -- controls (they run at Input priority and set it to zero whenever no
+    -- key is held) and right before physics. Set only in Heartbeat -
+    -- after physics - a control module that was not fully switched off
+    -- zeroed it first every frame: walking in place, speed 0, on PC.
+    Nav.moveDir, Nav.velUntil = nil, 0
+    pcall(function() RunService:UnbindFromRenderStep("DQR_Move") end)
+    pcall(function()
+        RunService:BindToRenderStep("DQR_Move", Enum.RenderPriority.Character.Value + 1, function()
+            local h = GetHuman()
+            if h and Nav.moveDir and h.Health > 0 then h:Move(Nav.moveDir, false) end
+        end)
+    end)
     gen = gen + 1
     task.spawn(Worker, gen)
 end
 
 function Nav.Stop()
     if conn then conn:Disconnect() conn = nil end
+    pcall(function() RunService:UnbindFromRenderStep("DQR_Move") end)
+    Nav.moveDir = nil
     ClearPath()
     ClearDest()
     Nav.goal, Nav.face = nil, nil
@@ -5706,26 +5823,51 @@ function Nav.Explore(pos)
     and now - pickAt < CONFIG.ExploreEvery then
         return pick
     end
-    if now - pickAt < 1.5 then return pick end     -- 48 raycasts: not at 20Hz
+    if now - pickAt < 1.5 then return pick end     -- probes and routes: not at 20Hz
     pickAt = now
-    local best, bestScore = nil, -1e9
+    -- Floor near OUR level, found from just above our head: indoors a
+    -- probe from high up hits the ceiling or the top of a wall first,
+    -- and the bot set off for "open ground" on the roof or in the room
+    -- behind the wall - circling in a dead-end alcove with the door
+    -- right beside it. Needs headroom too (not under a low slab).
+    local rp = RayParams(true)
+    local function Floor(x, z)
+        local hit = workspace:Raycast(Vector3.new(x, pos.Y + 6, z), Vector3.new(0, -30, 0), rp)
+        if not hit or not hit.Instance.CanCollide or hit.Normal.Y < 0.6 then return nil end
+        local up = workspace:Raycast(hit.Position + Vector3.new(0, 0.2, 0), Vector3.new(0, 5, 0), rp)
+        if up and up.Instance.CanCollide then return nil end
+        return hit.Position + Vector3.new(0, 3, 0)
+    end
+    local cands = {}
     for deg = 0, 345, 15 do
         local a = math.rad(deg)
         local u = Vector3.new(math.cos(a), 0, math.sin(a))
-        for _, d in ipairs({35, 70}) do
-            local p = GroundAt(pos + u * d)
-            if p and math.abs(p.Y - pos.Y) < 40 and not Haz.At(p) then
+        for _, d in ipairs({20, 40, 70}) do
+            local q = pos + u * d
+            local p = Floor(q.X, q.Z)
+            if p and math.abs(p.Y - pos.Y) < 12 and not Haz.At(p) then
                 local score = d * 0.3
                 if dir then score = score + u:Dot(dir) * 45 end
                 if not visited[Cell(p)] then score = score + 40 end
-                if score > bestScore then best, bestScore = p, score end
+                cands[#cands + 1] = {p = p, s = score}
             end
         end
     end
+    table.sort(cands, function(x, y) return x.s > y.s end)
+    -- The best one we can actually walk to (a route exists - through a
+    -- door, round a corner). Only the first few are asked: routes cost.
+    local best, via = nil, 0
+    for i = 1, math.min(#cands, 8) do
+        local c = cands[i]
+        local r = Nav.Route and Nav.Route(pos, c.p, {{2, 60}, {1.5, 70}})
+        if r then best, via = c.p, #r break end
+    end
     pick = best
     if best then
-        print(("[DQR] Nothing to fight - walking on, %d studs %s.")
-            :format((best - pos).Magnitude, dir and "ahead" or "to open ground"))
+        print(("[DQR] Nothing to fight - walking on, %d studs %s (a %d-step route).")
+            :format((best - pos).Magnitude, dir and "ahead" or "to open ground", via))
+    elseif #cands > 0 then
+        print("[DQR] Nothing to fight, and no reachable open ground found around here.")
     end
     return pick
 end
@@ -6750,9 +6892,16 @@ function Brain.Tick(root)
             local c = Vector3.new(sx / 12, 0, sz / 12)
             local maxR = 0
             for _, e in ipairs(pts) do maxR = math.max(maxR, FlatDist(e.p, c)) end
-            if moving >= 10 and dodging <= 4 and maxR < 6 and pathLen > 14 then
+            -- Wide enough to catch a loop round an alcove, not just a wobble.
+            if moving >= 10 and dodging <= 4 and maxR < 9 and pathLen > 18 then
                 table.clear(pts)
-                if tgt and now - wob.lastHit < 20 then
+                if not tgt then
+                    -- Exploring in circles: drop that destination and choose
+                    -- again (only reachable ground now).
+                    Nav.ExploreReset()
+                    Nav.force = true
+                    print("[DQR] Going round in circles while exploring - choosing somewhere else.")
+                elseif now - wob.lastHit < 20 then
                     Mobs.Ban(tgt.Model, CONFIG.UnreachableFor)
                     print(("[DQR] Still going back and forth - leaving %s for %ds.")
                         :format(tgt.Model.Name, CONFIG.UnreachableFor))
@@ -8144,7 +8293,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.24 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v12.27 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
