@@ -1,6 +1,10 @@
 -- ============================================================
---  DQR AUTO FARM v12.27
+--  DQR AUTO FARM v13.0
 --  Change version number every time you update the script.
+--  v13: Q held up as an always-on buff (BuffQ), E cast only with a
+--  mob in range; green cast-range circle on the floor; smart A*
+--  pathing that routes round hazards and mobs; hazard debug as text
+--  labels (ATTACK / not an attack, and why).
 --  One brain decides where to stand, spells never wait on movement.
 --  v12: per-dungeon profiles, boss detection from the on-screen boss
 --  bar, hitbox box for hazards, flat "baseplate" map, spell
@@ -126,6 +130,26 @@ local CONFIG = {
     -- "both" presses Q and E in the same instant - right when the two
     -- slots hold the same spell. "alternate" = Q, E, Q, E...
     SpellMode      = "both",
+    -- BUFF Q: true = Q is a self-buff (extra damage + a little speed
+    -- while active). It is pressed every BuffRate seconds the whole time
+    -- you are in a run - target or not - so it is always up, and the
+    -- attack spell is E ALONE, cast only once a mob / pack / boss is
+    -- inside the green range circle. SpellMode is ignored while this is
+    -- on. false = the old Q+E behaviour above.
+    BuffQ          = true,
+    BuffKey        = Enum.KeyCode.Q,
+    AttackKey      = Enum.KeyCode.E,
+    BuffRate       = 1,      -- seconds between Q presses (the game ignores
+                             -- a press while it is cooling down)
+    -- RANGE CIRCLE: a flat green ring on the floor round your character
+    -- at the distance E starts casting from (AttackRange + CastSlack).
+    -- Anything whose edge is inside the ring gets hit with E. It turns
+    -- brighter yellow-green while E is firing at something.
+    ShowRange      = true,
+    RangeColor     = Color3.fromRGB(60, 230, 80),
+    RangeFireColor = Color3.fromRGB(200, 255, 60),
+    RangeThick     = 0.35,   -- studs wide the line is drawn
+    RangeSegments  = 72,     -- more = smoother circle
     -- Face the middle of the pack instead of the one mob targeted, so
     -- a fan or cone spell lands on all of them.
     AimAtPack      = true,
@@ -214,7 +238,17 @@ local CONFIG = {
     -- walking in, like the reference script's.
     ColumnWalls    = true,
     DodgeCooldown  = 0.8,
-    HazardDebug    = false,  -- log each hazard's source and draw it red
+    -- true = a floating text label over every hazard the bot sees:
+    --   red "ATTACK"        - counted, the bot dodges it. Says what kind
+    --                         (named hitBox, floor telegraph, laser...),
+    --                         the part's name and its footprint size.
+    --   grey "NOT ATTACK"   - looked at and ignored, and why (your own
+    --                         spell, a leftover, decoration, spent...).
+    --   green "SAFE ZONE"   - a place to stand.
+    -- Also logs each hazard's source, as before.
+    HazardDebug    = false,
+    HazardLabelMax = 40,     -- most labels on screen at once
+    HazardLabelRange = 80,   -- labels further from you than this are hidden
 
     -- HITBOX: a box around your character, drawn grey (red while a
     -- hazard touches it). A hazard counts the moment its footprint
@@ -298,6 +332,24 @@ local CONFIG = {
     Bosses         = {},
 
     -- ---- MOVEMENT ----------------------------------------------
+    -- SMART PATHING: the bot plans its own route on a grid round you
+    -- (A* search), the way game AI does: each cell's cost is raised for
+    -- standing in or near a hazard, near a mob that is not the target,
+    -- and for climbing; walls, gaps and ledges are off limits. The
+    -- route is then smoothed into a few straight legs. Used whenever
+    -- the Roblox pathfinder's route would walk through a hazard or it
+    -- finds none, and the route in hand is re-planned the moment a new
+    -- hazard lands on it. false = Roblox pathfinder only (v12).
+    SmartPath      = true,
+    SmartCell      = 4,      -- grid cell size, studs
+    SmartRadius    = 90,     -- how far from you the grid reaches
+    SmartBudget    = 1500,   -- most cells searched per plan
+    SmartHazCost   = 40,     -- extra cost of a cell a hazard touches
+    SmartNearHaz   = 6,      -- ...and of one within this many studs of one
+    SmartMobCost   = 8,      -- extra cost of a cell beside a non-target mob
+    SmartMobRadius = 10,
+    SmartClimbCost = 1.5,    -- extra cost per stud climbed
+    ShowPath       = true,   -- small dots along the planned route
     PathMinDist    = 12,
     RepathDist     = 8,
     WaypointReach  = 4,
@@ -3005,6 +3057,7 @@ end
 
 local function WarnReject(o, warn, why)
     if warn and CONFIG.HazardDebug then
+        if Haz.Note then Haz.Note(o, "not", ("%s marker - %s"):format(warn, why)) end
         local now = tick()
         if not warnAt[o] or now - warnAt[o] > 5 then
             warnAt[o] = now
@@ -3158,12 +3211,31 @@ local function Bound(h)
     end
 end
 
+-- HazardDebug labels. Haz.why is what kind of attack the rule that is
+-- about to call Add took it for; Note records a part looked at and
+-- turned down, with the reason, for a grey "NOT ATTACK" label.
+-- (Kept in the Haz table, not locals: this chunk is close to Luau's
+-- 200-locals limit.)
+Haz.why, Haz.notes = "hazard", {}
+function Haz.Note(o, kind, why)
+    if not CONFIG.HazardDebug or not o then return end
+    if #Haz.notes >= (CONFIG.HazardLabelMax or 40) * 2 then return end
+    local ok, p = pcall(function() return o.Position end)
+    if not ok or typeof(p) ~= "Vector3" then return end
+    Haz.notes[#Haz.notes + 1] = {p = p, kind = kind, why = why, src = o}
+end
+
 local function Add(h)
-    if TooOld(h.src) then return end
-    if h.src and CONFIG.IgnoreOrphans and Orphan(h) then
-        Haz.orphans = Haz.orphans + 1
+    if TooOld(h.src) then
+        Haz.Note(h.src, "not", "decoration - there too long")
         return
     end
+    if h.src and CONFIG.IgnoreOrphans and Orphan(h) then
+        Haz.orphans = Haz.orphans + 1
+        Haz.Note(h.src, "not", "leftover - caster gone")
+        return
+    end
+    h.why = Haz.why
     Bound(h)
     Haz.shapes[#Haz.shapes + 1] = h
     Haz.real[#Haz.real + 1] = h
@@ -3430,8 +3502,10 @@ local function Classify(o, pos, reach)
     -- parented, and however big or invisible (a hitBox is often both) -
     -- unless whatever cast it is already dead.
     if NameHas(o, CONFIG.HazardNames) then
+        Haz.why = "named by the game as an attack"
         if CONFIG.IgnoreOrphans and DeadOwner(o) then
             Haz.orphans = Haz.orphans + 1
+            Haz.Note(o, "not", "named attack, but its caster is dead")
             return
         end
         -- SPENT: invisible, and not moved or resized for 2.5 seconds. A
@@ -3446,6 +3520,7 @@ local function Classify(o, pos, reach)
                 namedSeen[o] = {p = o.Position, s = sz, t = now}
             elseif now - rec.t > 2.5 then
                 Haz.spent = Haz.spent + 1
+                Haz.Note(o, "not", "spent hitBox - invisible and still")
                 return
             end
         else
@@ -3456,9 +3531,14 @@ local function Classify(o, pos, reach)
         local height, w = ColumnShape(o, true)
         if height and (firstNear[o] or math.huge) < 6 then
             Haz.spell[o] = true                     -- ours: see rule 3a
+            Haz.Note(o, "not", "a player's spell (appeared on a player)")
             return
         end
-        if height then AddColumn(o, height, w) return end
+        if height then
+            Haz.why = "whirlpool / tornado"
+            AddColumn(o, height, w)
+            return
+        end
         AddFootprint(o, CONFIG.TelegraphPad)
         return
     end
@@ -3478,11 +3558,15 @@ local function Classify(o, pos, reach)
         -- and travel; they are first seen well away from us.
         if height and (firstNear[o] or math.huge) < 6 then
             Haz.spell[o] = true
+            Haz.Note(o, "not", "a player's spell (appeared on a player)")
             return
         end
         if height and (LooksActive(o) or WarnColor(o.Color) ~= nil) then
             if math.abs(o.Position.Y - pos.Y) < 10 + height / 2 then
+                Haz.why = "whirlpool / column"
                 AddColumn(o, height, w)
+            else
+                Haz.Note(o, "not", "column on another floor")
             end
             return
         end
@@ -3491,22 +3575,29 @@ local function Classify(o, pos, reach)
     if IsBlob(o) then
         local s = PartSize(o)
         if math.abs(o.Position.Y - pos.Y) < 20 + s.Y / 2 then
+            Haz.why = "ball of damage"
             AddBall(o.Position, math.max(s.X, s.Y, s.Z) / 2 + CONFIG.TelegraphPad, o)
+        else
+            Haz.Note(o, "not", "damage ball on another floor")
         end
         return
     end
     -- 4.
     if IsTelegraph(o, pos, reach) then
+        local wc = WarnColor(o.Color)
+        Haz.why = "floor telegraph" .. (wc and (" (" .. wc .. ")") or "")
         AddFootprint(o, CONFIG.TelegraphPad)
         return
     end
     -- 5.
     if BeamShaped(o) and not o.CanCollide and VisTrans(o) <= 0.9 then
         if LooksActive(o) or (BeamColoured(o) and AtBodyHeight(o, pos)) then
+            Haz.why = "laser / beam"
             local a, b, thin = Segment(o)
             AddLine(a, b, thin / 2 + CONFIG.BeamPad, o)
             return
         end
+        Haz.Note(o, "not", "beam-shaped but idle")
     end
     -- 6. Anything else moving through: Bob the Frost Giant's white bars
     -- with a ball on each end passed every test above - wrong colour for
@@ -3522,6 +3613,7 @@ local function Classify(o, pos, reach)
             local s = PartSize(o)
             local mx, mn = math.max(s.X, s.Y, s.Z), math.min(s.X, s.Y, s.Z)
             if mx >= 1.5 and mx <= CONFIG.ThreatMaxSize then
+                Haz.why = "moving projectile"
                 if mx >= mn * 3 then
                     local a, b, thin = Segment(o)
                     AddLine(a, b, thin / 2 + CONFIG.BeamPad, o)
@@ -3555,7 +3647,10 @@ local function ScanBeams(pos, reach)
             for _, k in ipairs(beam.Transparency.Keypoints) do
                 if k.Value < minT then minT = k.Value end
             end
-            if minT < 0.9 then AddLine(a, b, w / 2 + CONFIG.BeamPad, beam) end
+            if minT < 0.9 then
+                Haz.why = "laser beam"
+                AddLine(a, b, w / 2 + CONFIG.BeamPad, beam)
+            end
         end) end
     end
 end
@@ -3571,6 +3666,7 @@ local function ScanAdorns(pos, reach)
         end
         local cf = (adornee:IsA("Model") and adornee:GetPivot() or adornee.CFrame) * ad.CFrame
         local c = cf.Position
+        Haz.why = "telegraph marker (" .. ad.ClassName:gsub("HandleAdornment", "") .. ")"
         if ad:IsA("LineHandleAdornment") then
             local b = c + cf.LookVector * ad.Length
             if ad.Length >= CONFIG.BeamMinLen and SegDistFlat(pos, c, b) < reach then
@@ -3676,13 +3772,17 @@ function Haz.Scan(pos)
     table.clear(Haz.shapes)
     table.clear(Haz.real)
     table.clear(Haz.safe)
+    table.clear(Haz.notes)
     Haz.orphans, Haz.spent = 0, 0
     local done = {}
     -- Safe zones first, and even while hazards are muted: the mute is
     -- for misread footprints, and it used to switch the Lava King's
     -- green circle off along with them.
     ZonesAround(pos, done)
-    if not CONFIG.DodgeHazards or now < Haz.muteUntil then return end
+    if not CONFIG.DodgeHazards or now < Haz.muteUntil then
+        if CONFIG.HazardDebug then pcall(Haz.Draw, pos) end
+        return
+    end
 
     table.clear(chars)
     for _, pl in ipairs(Players:GetPlayers()) do
@@ -3742,7 +3842,7 @@ function Haz.Scan(pos)
     end
     ScanBeams(pos, reach)
     ScanAdorns(pos, reach)
-    if CONFIG.HazardDebug then pcall(Haz.Draw) end
+    if CONFIG.HazardDebug then pcall(Haz.Draw, pos) end
 end
 
 do
@@ -3940,46 +4040,129 @@ function Haz.Coverage(pos)
     return hit / total
 end
 
--- HazardDebug: every footprint drawn as a translucent red shape.
+-- HazardDebug: a floating text label over everything the scan looked
+-- at - red ATTACK (dodged), grey NOT ATTACK (ignored, and why), green
+-- SAFE ZONE. Each label is a BillboardGui on an invisible anchor part,
+-- pooled and moved, never rebuilt.
+do
 local pool = {}
-function Haz.Draw()
-    local n = 0
-    for _, h in ipairs(Haz.shapes) do
-        if n >= 40 then break end
-        n = n + 1
-        local p = pool[n]
-        if not p or not p.Parent then
-            p = Instance.new("Part")
-            p.Name = "DQR_Hz"
-            p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
-            p.CastShadow, p.Material = false, Enum.Material.Neon
-            p.Color, p.Transparency = Color3.fromRGB(255, 60, 60), 0.55
-            p.Parent = workspace
-            pool[n] = p
+local FAR = CFrame.new(0, -500, 0)
+local TAG_COL = {
+    attack = Color3.fromRGB(255, 70, 70),
+    ["not"] = Color3.fromRGB(185, 190, 200),
+    safe   = Color3.fromRGB(80, 235, 110),
+}
+local TAG_TITLE = {attack = "ATTACK", ["not"] = "NOT ATTACK", safe = "SAFE ZONE"}
+
+local function Tag(i)
+    local t = pool[i]
+    if t and t.part.Parent and t.gui.Parent then return t end
+    if t and t.part.Parent then t.part:Destroy() end
+    local p = Instance.new("Part")
+    p.Name = "DQR_HzTag"
+    p.Size = Vector3.new(0.2, 0.2, 0.2)
+    p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+    p.CastShadow, p.Transparency = false, 1
+    p.CFrame = FAR
+    local g = Instance.new("BillboardGui")
+    g.Name = "DQR_HzTagGui"
+    g.AlwaysOnTop, g.LightInfluence = true, 0
+    g.Size = UDim2.fromOffset(230, 58)
+    g.StudsOffset = Vector3.new(0, 2.5, 0)
+    g.MaxDistance = 1000
+    g.Adornee = p
+    g.Parent = p
+    local function Line(y, h, size, bold)
+        local l = Instance.new("TextLabel")
+        l.BackgroundTransparency = 1
+        l.Position, l.Size = UDim2.new(0, 0, 0, y), UDim2.new(1, 0, 0, h)
+        l.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+        l.TextSize = size
+        l.TextStrokeTransparency = 0.2
+        l.TextColor3 = Color3.new(1, 1, 1)
+        l.TextTruncate = Enum.TextTruncate.AtEnd
+        l.Parent = g
+        return l
+    end
+    t = {part = p, gui = g, title = Line(0, 18, 15, true),
+         what = Line(18, 16, 12, false), name = Line(34, 14, 11, false)}
+    t.name.TextColor3 = Color3.fromRGB(200, 200, 200)
+    p.Parent = workspace
+    pool[i] = t
+    return t
+end
+
+local function ShortName(o)
+    if not o then return "?" end
+    local ok, s = pcall(function()
+        local par = o.Parent
+        return (par and par ~= workspace and (par.Name .. ".") or "") .. o.Name
+    end)
+    return ok and s or "?"
+end
+
+local function ShapeCentre(h)
+    if h.kind == "box" then return h.cf.Position end
+    if h.kind == "line" then return (h.a + h.b) / 2 end
+    return Vector3.new(h.x, h.y, h.z)
+end
+
+function Haz.Draw(pos)
+    local items, seen = {}, {}
+    for _, h in ipairs(Haz.real) do
+        local key = h.src or h
+        if not seen[key] then
+            seen[key] = true
+            items[#items + 1] = {p = ShapeCentre(h), kind = "attack",
+                why = h.why or "hazard", src = h.src, size = Describe(h)}
         end
-        local shapeWant = h.kind == "ball" and Enum.PartType.Ball or Enum.PartType.Block
-        if p.Shape ~= shapeWant then p.Shape = shapeWant end
-        if h.kind == "line" then
-            local d = (h.b - h.a).Magnitude
-            if d > 0.1 then
-                p.Size = Vector3.new(h.r * 2, 0.3, d)
-                p.CFrame = CFrame.lookAt((h.a + h.b) / 2 + Vector3.new(0, 0.3, 0), h.b)
-            end
-        elseif h.kind == "disc" then
-            p.Size = Vector3.new(h.r * 2, 0.3, h.r * 2)
-            p.CFrame = CFrame.new(h.x, h.y + 0.3, h.z)
-        elseif h.kind == "ball" then
-            p.Size = Vector3.new(h.r * 2, h.r * 2, h.r * 2)
-            p.CFrame = CFrame.new(h.x, h.y, h.z)
-        else
-            p.Size = Vector3.new(h.hx * 2, 0.3, h.hz * 2)
-            p.CFrame = h.cf + Vector3.new(0, 0.3, 0)
+    end
+    for _, z in ipairs(Haz.safe) do
+        if not seen[z.src or z] then
+            seen[z.src or z] = true
+            items[#items + 1] = {p = z.c, kind = "safe", why = "stand in here",
+                src = z.src, size = ("zone r=%d"):format(math.floor(z.r))}
         end
+    end
+    for _, nt in ipairs(Haz.notes) do
+        if not seen[nt.src] then
+            seen[nt.src] = true
+            items[#items + 1] = {p = nt.p, kind = nt.kind, why = nt.why, src = nt.src}
+        end
+    end
+    -- Nearest first, and only within HazardLabelRange.
+    local maxR = CONFIG.HazardLabelRange or 80
+    local shown = {}
+    for _, it in ipairs(items) do
+        it.d = pos and FlatDist(it.p, pos) or 0
+        if it.d <= maxR then shown[#shown + 1] = it end
+    end
+    table.sort(shown, function(a, b)
+        if (a.kind == "attack") ~= (b.kind == "attack") then return a.kind == "attack" end
+        return a.d < b.d
+    end)
+    local n = math.min(#shown, CONFIG.HazardLabelMax or 40)
+    for i = 1, n do
+        local it, t = shown[i], Tag(i)
+        local col = TAG_COL[it.kind] or TAG_COL["not"]
+        t.title.Text = TAG_TITLE[it.kind] or "?"
+        t.title.TextColor3 = col
+        t.what.Text = it.size and (it.why .. "  |  " .. it.size) or it.why
+        t.name.Text = ShortName(it.src)
+        t.part.CFrame = CFrame.new(it.p)
     end
     for i = n + 1, #pool do
-        local p = pool[i]
-        if p and p.Parent and p.Position.Y > -400 then p.CFrame = CFrame.new(0, -500, 0) end
+        local t = pool[i]
+        if t and t.part.Parent and t.part.Position.Y > -400 then t.part.CFrame = FAR end
     end
+end
+
+-- Put every label away (farm stopped, or HazardDebug switched off).
+function Haz.HideTags()
+    for _, t in ipairs(pool) do
+        if t.part.Parent then t.part.CFrame = FAR end
+    end
+end
 end
 
 function Haz.Diag()
@@ -4185,6 +4368,76 @@ function Look.Hitbox(show)
     end
 end
 RunService.Heartbeat:Connect(function() pcall(Look.Hitbox, Farm.Running) end)
+
+-- ---- range circle -------------------------------------------
+-- A flat ring of thin neon segments on the floor round the character,
+-- at the distance E is cast from. Radius: what the brain is using
+-- against the current target (Brain.rangeR), else the plain
+-- AttackRange + CastSlack. Brighter while E is firing.
+do
+local ring, ringR, ringN = nil, -1, 0
+local ringParts, ringCFs = {}, {}
+local function RingClear()
+    if ring and ring.Parent then ring:Destroy() end
+    ring, ringR, ringN = nil, -1, 0
+    table.clear(ringParts)
+    table.clear(ringCFs)
+end
+function Look.Range(show)
+    local root, hum = GetRoot(), GetHuman()
+    if not (show and CONFIG.ShowRange) or not root or not hum or hum.Health <= 0 then
+        if ring then RingClear() end
+        return
+    end
+    local n = math.clamp(math.floor(CONFIG.RangeSegments or 72), 16, 180)
+    if not ring or not ring.Parent or ringN ~= n then
+        RingClear()
+        ring = Instance.new("Folder")
+        ring.Name = "DQR_Range"
+        for i = 1, n do
+            local p = Instance.new("Part")
+            p.Name = "DQR_RangeSeg"
+            p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+            p.CastShadow, p.Material = false, Enum.Material.Neon
+            p.Transparency = 0.15
+            p.Parent = ring
+            ringParts[i] = p
+        end
+        ring.Parent = workspace
+        ringN = n
+    end
+    local R = Brain.rangeR or (CONFIG.AttackRange + CONFIG.CastSlack)
+    R = math.max(R, 2)
+    local firing = Brain.castAt and tick() - Brain.castAt < 0.35
+    local col = firing and (CONFIG.RangeFireColor or CONFIG.RangeColor) or CONFIG.RangeColor
+    local thick = CONFIG.RangeThick or 0.35
+    if math.abs(R - ringR) > 0.05 then
+        ringR = R
+        local len = 2 * math.pi * R / n * 1.04          -- a hair long: no gaps
+        local size = Vector3.new(thick, 0.08, len)
+        for _, p in ipairs(ringParts) do p.Size = size end
+    end
+    if ringParts[1].Color ~= col then
+        for _, p in ipairs(ringParts) do p.Color = col end
+    end
+    local hip = hum.RigType == Enum.HumanoidRigType.R6 and 3
+                or (hum.HipHeight + root.Size.Y / 2)
+    local p = root.Position
+    local y = p.Y - hip + 0.12
+    for i = 1, n do
+        local a = (i - 0.5) / n * math.pi * 2
+        local cx, cz = math.cos(a), math.sin(a)
+        local c = Vector3.new(p.X + cx * R, y, p.Z + cz * R)
+        -- Long side along the tangent.
+        ringCFs[i] = CFrame.lookAt(c, c + Vector3.new(-cz, 0, cx))
+    end
+    local ok = pcall(function() workspace:BulkMoveTo(ringParts, ringCFs, Enum.BulkMoveMode.FireCFrameChanged) end)
+    if not ok then
+        for i, part in ipairs(ringParts) do part.CFrame = ringCFs[i] end
+    end
+end
+RunService.Heartbeat:Connect(function() pcall(Look.Range, Farm.Running) end)
+end
 
 -- ---- spell animations ---------------------------------------
 -- A track is left alone if it is one of the Animate script's moves
@@ -5379,14 +5632,307 @@ end
 -- the loosest - 89 is a wall, and Roblox will route straight up one.
 Nav.Route = Route
 
+-- ---- smart pathing (A*) ----------------------------------------
+-- The bot's own planner, used on top of Roblox's. A grid of
+-- SmartCell-stud cells round us, explored outward by A* (cheapest
+-- first, pulled toward the goal). Every cell is probed for floor: a
+-- step up taller than a walk-on step, a drop past DropMax or a wall
+-- between two cells is off limits. Cost = distance walked, plus
+-- SmartHazCost for a cell a hazard touches (fading out to SmartNearHaz
+-- studs away), SmartMobCost beside a mob that is not the target, and
+-- SmartClimbCost per stud climbed. A hazard is a cost, not a wall, so
+-- with no way round, the plan still walks through the thinnest part.
+-- The cell chain is then pulled straight (string-pulling): each leg
+-- runs as far as it can while the line stays clear, floored and out
+-- of hazards. Everything here is a Nav field, not a local: this chunk
+-- is near Luau's 200-locals limit.
+Nav.smartSaid, Nav.dots, Nav.dotsAt = 0, {}, 0
+
+-- Floor under (x, z), looked for from just above `fromY` (the cell we
+-- come from): a stairway's next step, not the platform overhead. Walk-
+-- through parts (baseplate-mode walls, effects) and creatures are
+-- passed through. Returns the standing (root) height, or nil.
+function Nav.Probe(x, z, fromY, rp)
+    local top = fromY + CONFIG.JumpMax + 1
+    local depth = CONFIG.JumpMax + 1 + CONFIG.DropMax + 3
+    for _ = 1, 4 do
+        local hit = workspace:Raycast(Vector3.new(x, top, z), Vector3.new(0, -depth, 0), rp)
+        if not hit then return nil end
+        local o = hit.Instance
+        local m = o:FindFirstAncestorOfClass("Model")
+        if o.CanCollide and hit.Normal.Y >= 0.55 and not (m and IsCreature(m)) then
+            return hit.Position.Y + 3
+        end
+        if o.CanCollide and hit.Normal.Y < 0.55 and not (m and IsCreature(m)) then
+            return nil                                  -- a wall top / steep face
+        end
+        depth = depth - (top - hit.Position.Y) - 0.1
+        top = hit.Position.Y - 0.1
+        if depth <= 0 then return nil end
+    end
+    return nil
+end
+
+-- Two body-height rays and two shoulder rays: a cheaper LineClear for
+-- the thousands of short hops a search makes.
+function Nav.HopClear(a, b, rp)
+    local d = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+    if d.Magnitude < 0.5 then return true end
+    local side = Vector3.new(-d.Unit.Z, 0, d.Unit.X) * (CONFIG.AgentWidth * 0.7)
+    local full = Vector3.new(d.X, b.Y - a.Y, d.Z)
+    -- Heights are from the root (about 3 above the floor): knee, head.
+    for _, ray in ipairs({{0, -1}, {0, 1.5}, {1, 0}, {-1, 0}}) do
+        local o = a + side * ray[1] + Vector3.new(0, ray[2], 0)
+        local hit = workspace:Raycast(o, full, rp)
+        if hit and hit.Instance.CanCollide then return false end
+    end
+    return true
+end
+
+-- A straight leg the smoothing may keep.
+function Nav.LegOK(a, b, hazList)
+    if math.abs(a.Y - b.Y) > CONFIG.JumpMax then return false end
+    if not LineClear(a, b) or not GroundOnPath(a, b) then return false end
+    if hazList and #hazList > 0 and Haz.OnPath(a, b, hazList) then return false end
+    return true
+end
+
+-- Does walking `wps` from `from` (the first `n` legs) step into a
+-- hazard we are not already in?
+function Nav.RouteCrosses(from, wps, n)
+    if #Haz.shapes == 0 or not wps then return false end
+    local a = from
+    for i = 1, math.min(#wps, n or #wps) do
+        local b = wps[i].Position
+        if FlatDist(a, from) > CONFIG.DodgeRange + 10 then break end
+        if Haz.OnPath(a, b) then return true end
+        a = b
+    end
+    return false
+end
+
+-- Plan from `from` to `to`. Returns waypoints ({Position, Action},
+-- like the Roblox pathfinder's) and whether they reach the goal (false
+-- = the cheapest spot found toward it, for when nothing reaches).
+function Nav.SmartPlan(from, to)
+    local cell = math.max(2, CONFIG.SmartCell or 4)
+    local maxI = math.floor((CONFIG.SmartRadius or 90) / cell)
+    local budget = CONFIG.SmartBudget or 1500
+    local rp = RayParams(true)
+    local hazList = #Haz.shapes > 0 and Haz.Near(from, (CONFIG.SmartRadius or 90)) or nil
+    if hazList and #hazList == 0 then hazList = nil end
+    local hs, hp = CONFIG.HitboxSize, CONFIG.HitboxPad
+    local hitR = math.sqrt((hs.X / 2 + hp) ^ 2 + (hs.Z / 2 + hp) ^ 2)
+    local nearHaz, hazCost = CONFIG.SmartNearHaz or 6, CONFIG.SmartHazCost or 40
+    local mobs, tgt = {}, Brain.target and Brain.target.Model
+    for _, rec in ipairs(Mobs.list or {}) do
+        pcall(function()
+            if rec.Model ~= tgt and rec.Humanoid.Health > 0 then
+                mobs[#mobs + 1] = {p = rec.Root.Position,
+                    r = (rec.Radius or 2) + (CONFIG.SmartMobRadius or 10)}
+            end
+        end)
+    end
+    local maxUp = CONFIG.AllowJump and CONFIG.JumpMax or math.min(CONFIG.JumpMax, cell + 1)
+
+    local function Cost(p)
+        local c = 0
+        if hazList then
+            local clear = Haz.Clear(p, true, hazList) - hitR
+            if clear < 0 then
+                c = c + hazCost
+            elseif clear < nearHaz then
+                c = c + hazCost * 0.5 * (1 - clear / nearHaz)
+            end
+        end
+        for _, m in ipairs(mobs) do
+            if FlatDist(p, m.p) < m.r and math.abs(p.Y - m.p.Y) < 15 then
+                c = c + (CONFIG.SmartMobCost or 8)
+            end
+        end
+        return c
+    end
+
+    local function Key(ix, iz) return (ix + 1024) * 2048 + (iz + 1024) end
+    local gx = math.clamp(math.floor((to.X - from.X) / cell + 0.5), -maxI, maxI)
+    local gz = math.clamp(math.floor((to.Z - from.Z) / cell + 0.5), -maxI, maxI)
+    local goalInGrid = math.abs((to.X - from.X) / cell) <= maxI and math.abs((to.Z - from.Z) / cell) <= maxI
+    local goalK = Key(gx, gz)
+
+    local g, pos, parent, closed, ix_, iz_, cellCost = {}, {}, {}, {}, {}, {}, {}
+    local heapK, heapF, hn = {}, {}, 0
+    local function Push(k, f)
+        hn = hn + 1
+        local i = hn
+        while i > 1 do
+            local pi = math.floor(i / 2)
+            if heapF[pi] <= f then break end
+            heapK[i], heapF[i] = heapK[pi], heapF[pi]
+            i = pi
+        end
+        heapK[i], heapF[i] = k, f
+    end
+    local function Pop()
+        local k = heapK[1]
+        local lk, lf = heapK[hn], heapF[hn]
+        heapK[hn], heapF[hn] = nil, nil
+        hn = hn - 1
+        if hn > 0 then
+            local i = 1
+            while true do
+                local c = i * 2
+                if c > hn then break end
+                if c < hn and heapF[c + 1] < heapF[c] then c = c + 1 end
+                if heapF[c] >= lf then break end
+                heapK[i], heapF[i] = heapK[c], heapF[c]
+                i = c
+            end
+            heapK[i], heapF[i] = lk, lf
+        end
+        return k
+    end
+    local function H(p) return FlatDist(p, to) * 1.15 end   -- a little greedy: faster
+
+    local sk = Key(0, 0)
+    g[sk], pos[sk], ix_[sk], iz_[sk] = 0, from, 0, 0
+    Push(sk, H(from))
+    local bestK, bestH = sk, FlatDist(from, to)
+    local reached, expanded = nil, 0
+    local DIRS = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}}
+
+    while hn > 0 and expanded < budget do
+        local k = Pop()
+        if not closed[k] then
+            closed[k] = true
+            expanded = expanded + 1
+            if expanded % 60 == 0 then task.wait() end
+            local p = pos[k]
+            local hd = FlatDist(p, to)
+            if hd < bestH then bestK, bestH = k, hd end
+            if k == goalK and goalInGrid and math.abs(p.Y - to.Y) <= CONFIG.WaypointReachY + 2 then
+                reached = k
+                break
+            end
+            if goalInGrid and hd <= cell * 0.75 and math.abs(p.Y - to.Y) <= CONFIG.WaypointReachY then
+                reached = k
+                break
+            end
+            local x0, z0 = ix_[k], iz_[k]
+            for _, d in ipairs(DIRS) do
+                local nx, nz = x0 + d[1], z0 + d[2]
+                if math.abs(nx) <= maxI and math.abs(nz) <= maxI then
+                    local nk = Key(nx, nz)
+                    if not closed[nk] then
+                        local y = Nav.Probe(from.X + nx * cell, from.Z + nz * cell, p.Y - 3, rp)
+                        if y and y - p.Y <= maxUp and p.Y - y <= CONFIG.DropMax then
+                            local q = Vector3.new(from.X + nx * cell, y, from.Z + nz * cell)
+                            if Nav.HopClear(p, q, rp) then
+                                local cc = cellCost[nk]
+                                if cc == nil then cc = Cost(q) cellCost[nk] = cc end
+                                local step = (d[1] ~= 0 and d[2] ~= 0) and cell * 1.4142 or cell
+                                local ng = g[k] + step + cc
+                                    + math.max(0, y - p.Y) * (CONFIG.SmartClimbCost or 1.5)
+                                if g[nk] == nil or ng < g[nk] then
+                                    g[nk], pos[nk], parent[nk], ix_[nk], iz_[nk] = ng, q, k, nx, nz
+                                    Push(nk, ng + H(q))
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local endK = reached or bestK
+    local full = reached ~= nil
+    if endK == sk then return nil, false, expanded end
+    -- Partial: only worth walking if it actually gets us somewhere.
+    if not full and bestH > FlatDist(from, to) - cell * 2 then return nil, false, expanded end
+
+    local chain = {}
+    local k = endK
+    while k and k ~= sk do
+        table.insert(chain, 1, pos[k])
+        k = parent[k]
+    end
+    if full and FlatDist(chain[#chain], to) > 1 and Nav.LegOK(chain[#chain], to, hazList) then
+        chain[#chain + 1] = to
+    end
+    -- String-pull: from each point, the furthest later point a straight
+    -- leg reaches cleanly (up to 10 ahead).
+    local pts = {from}
+    for _, v in ipairs(chain) do pts[#pts + 1] = v end
+    local out, i = {}, 1
+    local WALK = Enum.PathWaypointAction.Walk
+    while i < #pts do
+        local j = math.min(#pts, i + 10)
+        while j > i + 1 and not Nav.LegOK(pts[i], pts[j], hazList) do j = j - 1 end
+        out[#out + 1] = {Position = pts[j], Action = WALK}
+        i = j
+    end
+    local now = tick()
+    if now - Nav.smartSaid > 4 then
+        Nav.smartSaid = now
+        print(("[DQR] Smart path: %d legs, %d cells searched%s%s."):format(#out, expanded,
+            full and "" or " (partial - closest reachable)",
+            hazList and (", round %d hazard(s)"):format(#hazList) or ""))
+    end
+    return out, full, expanded
+end
+
+-- ShowPath: small dots on each waypoint of the route in hand.
+function Nav.DrawPath(show)
+    local dots, n = Nav.dots, 0
+    if show and CONFIG.ShowPath then
+        for _, wp in ipairs(Nav.queue) do
+            if n >= 30 then break end
+            n = n + 1
+            local d = dots[n]
+            if not d or not d.Parent then
+                d = Instance.new("Part")
+                d.Name, d.Shape = "DQR_PathDot", Enum.PartType.Ball
+                d.Size = Vector3.new(1, 1, 1)
+                d.Anchored, d.CanCollide, d.CanQuery, d.CanTouch = true, false, false, false
+                d.CastShadow, d.Material = false, Enum.Material.Neon
+                d.Color, d.Transparency = Color3.fromRGB(90, 200, 255), 0.3
+                d.Parent = workspace
+                dots[n] = d
+            end
+            d.CFrame = CFrame.new(wp.Position - Vector3.new(0, 2, 0))
+        end
+    end
+    for i = n + 1, #dots do
+        local d = dots[i]
+        if d and d.Parent and d.Position.Y > -400 then d.CFrame = CFrame.new(0, -500, 0) end
+    end
+end
+
 local function ComputePath(from, to)
     local direct = Route(from, to, {{3, CONFIG.AgentMaxSlope}, {2, 60}, {1.5, 70}})
     if direct then
         pathFails, detourTo = 0, nil
+        -- The Roblox route knows walls, not attacks: if it walks into a
+        -- hazard, plan our own way round.
+        if CONFIG.SmartPath and Nav.RouteCrosses(from, direct) then
+            local smart, full = Nav.SmartPlan(from, to)
+            if smart and full then return smart end
+        end
         return direct
     end
     pathFails = pathFails + 1
     local now = tick()
+    -- No Roblox route: our own planner, which also knows walk-through
+    -- (baseplate-mode) walls and every step it probed.
+    local partial = nil
+    if CONFIG.SmartPath then
+        local smart, full = Nav.SmartPlan(from, to)
+        if smart and full then
+            pathFails, detourTo = 0, nil
+            return smart
+        end
+        partial = smart
+    end
     -- The goal is up a level and there is no route: take the stairs,
     -- straight away, instead of steering at the goal or searching the
     -- whole area first - that is what had the bot walking at the
@@ -5407,7 +5953,7 @@ local function ComputePath(from, to)
             return lead
         end
     end
-    if pathFails < 2 then return nil end
+    if pathFails < 2 then return partial end
 
     -- On a detour already: re-aim at the same spot rather than search
     -- again, or each search from a slightly different position picks a
@@ -5417,7 +5963,7 @@ local function ComputePath(from, to)
         if r then return r end
         detourTo = nil
     end
-    if now < nextDetour then return nil end
+    if now < nextDetour then return partial end
     nextDetour = now + 1.2
 
     local mid, soft = {{2, 60}}, {{1.5, 70}}
@@ -5475,7 +6021,8 @@ local function ComputePath(from, to)
             return r
         end
     end
-    return nil
+    -- Nothing else: the closest reachable spot our planner found.
+    return partial
 end
 
 -- Runs on its own thread: ComputeAsync yields.
@@ -5498,8 +6045,21 @@ local function Worker(myGen)
         -- A dodge (Nav.direct) is a short step picked because the way is
         -- clear: walk it now, never stop to route it - computing a path
         -- yields, and the bot stood in the hazard while it did.
+        -- SmartPath: a hazard on the straight line is as much a reason
+        -- to plan as a wall is. And the route in hand is checked once a
+        -- second: an attack that lands across it gets it re-planned now,
+        -- not after the bot has walked in.
+        local hazLine = false
+        if CONFIG.SmartPath and not Nav.direct and #Haz.shapes > 0 then
+            local now = tick()
+            if #Nav.queue > 0 and now - (Nav.hazReplanAt or 0) > 1
+            and Nav.RouteCrosses(pos, Nav.queue, 4) then
+                Nav.hazReplanAt, Nav.force = now, true
+            end
+            hazLine = flat > CONFIG.PathMinDist and Haz.OnPath(pos, goal)
+        end
         local need = not Nav.direct and (Nav.force or (flat > CONFIG.PathMinDist
-                     and (rise > CONFIG.JumpMax or not LineClear(pos, goal))))
+                     and (rise > CONFIG.JumpMax or hazLine or not LineClear(pos, goal))))
         if need then
             local moved = Nav.qGoal and (goal - Nav.qGoal).Magnitude or 1e9
             if Nav.force or moved > CONFIG.RepathDist or #Nav.queue == 0 then
@@ -5612,6 +6172,10 @@ local function Heartbeat(dt)
     end
 
     ShowDest(goal, step)
+    if now - Nav.dotsAt > 0.2 then
+        Nav.dotsAt = now
+        pcall(Nav.DrawPath, true)
+    end
 
     local dir = nil
     if step then
@@ -5767,6 +6331,8 @@ function Nav.Stop()
     Nav.moveDir = nil
     ClearPath()
     ClearDest()
+    pcall(Nav.DrawPath, false)
+    if Haz.HideTags then pcall(Haz.HideTags) end
     Nav.goal, Nav.face = nil, nil
     local h = GetHuman()
     if h then pcall(function() h:Move(Vector3.zero, false) h.AutoRotate = true end) end
@@ -5881,7 +6447,7 @@ end
 -- ============================================================
 local DoMelee, DoSpell
 do
-local spellSlot, lastSpell, lastMelee = false, 0, 0
+local spellSlot, lastSpell, lastMelee, lastBuff = false, 0, 0, 0
 
 local function FireKey(kc)
     pcall(function() VIM:SendKeyEvent(true, kc, false, game) end)
@@ -5937,12 +6503,16 @@ function DoSpell(dist, range, aimAt)
     local now = tick()
     if now - lastSpell < CONFIG.AttackRate then return end
     lastSpell, spellSlot = now, not spellSlot
+    Brain.castAt = now                  -- for the range circle's colour
     task.spawn(function()
         if CONFIG.AimMode == "mouse" and aimAt then pcall(function()
             local x, y = AimPoint(aimAt)
             if not ButtonsAtPoint(x, y)[1] then VIM:SendMouseMoveEvent(x, y, game) end
         end) end
-        if CONFIG.SpellMode == "both" then
+        if CONFIG.BuffQ then
+            -- Q is the buff (DoBuff keeps it up); E is the only attack.
+            FireKey(CONFIG.AttackKey or Enum.KeyCode.E)
+        elseif CONFIG.SpellMode == "both" then
             pcall(function()
                 VIM:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
                 VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
@@ -5956,6 +6526,18 @@ function DoSpell(dist, range, aimAt)
             FireKey(spellSlot and Enum.KeyCode.Q or Enum.KeyCode.E)
         end
     end)
+end
+
+-- BuffQ: the buff key every BuffRate seconds, target or not, so the
+-- damage / speed boost is always running. Pressed on its own thread
+-- and a little apart from an E press, so the two never share a frame.
+function Brain.Buff()
+    if not CONFIG.BuffQ then return end
+    local now = tick()
+    if now - lastBuff < (CONFIG.BuffRate or 1) then return end
+    if now - lastSpell < 0.06 then return end
+    lastBuff = now
+    task.spawn(FireKey, CONFIG.BuffKey or Enum.KeyCode.Q)
 end
 end
 
@@ -6431,6 +7013,8 @@ function Brain.Tick(root)
     end
     lastPos = pos
     Nav.ExploreSeen(pos)
+    -- The buff (Q) is kept up all run, fighting or walking.
+    Brain.Buff()
     -- Mobs first: the hazard scan tells live footprints from leftovers
     -- by what is still alive around them.
     Mobs.Scan()
@@ -6563,6 +7147,10 @@ function Brain.Tick(root)
         -- CastSlack: a spell flies on a little past the nominal range, and
         -- holding a ready spell loses more than a throw that falls short.
         local castR = (stranded and math.max(spellR, dist + 5) or spellR) + CONFIG.CastSlack
+        -- The range circle: castR is measured to the target's middle,
+        -- so take its own size back off - the ring then shows where its
+        -- EDGE has to be for E to fire.
+        Brain.rangeR = castR - reach
         DoSpell(dist, castR, aim)
         if dist <= castR or tgt.Model ~= holdFire.model then
             holdFire.inRangeAt, holdFire.model = now, tgt.Model
@@ -6611,6 +7199,7 @@ function Brain.Tick(root)
     else
         Nav.face = nil
         prog = nil
+        Brain.rangeR = nil
     end
 
     -- ---- where to stand ---------------------------------------
@@ -8293,7 +8882,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v12.27 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.0 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
