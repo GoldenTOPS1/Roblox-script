@@ -20,8 +20,8 @@ local CONFIG = {
     -- The dungeon to run. This also picks the settings: whatever that
     -- dungeon's entry in MAP_PROFILES (further down) says is used for
     -- the run, on top of the defaults in this CONFIG block.
-    TargetDungeon  = "Volcanic Chambers",
-    Difficulty     = "Nightmare",
+    TargetDungeon  = "Northern Lands",
+    Difficulty     = "Insane",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
@@ -143,7 +143,7 @@ local CONFIG = {
     -- when it was stuck). With it off the bot walks up ramps and stairs
     -- only - a step taller than the character can walk onto is a wall.
     AllowJump      = false,
-    SetWalkSpeed   = true,
+    SetWalkSpeed   = false,
     WalkSpeed      = 18,
 
     -- ---- TARGETING ---------------------------------------------
