@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.0
+--  DQR AUTO FARM v13.2
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -141,6 +141,17 @@ local CONFIG = {
     AttackKey      = Enum.KeyCode.E,
     BuffRate       = 1,      -- seconds between Q presses (the game ignores
                              -- a press while it is cooling down)
+    -- Q ALWAYS GOES FIRST: every E volley presses Q, waits BuffLead
+    -- seconds for it to land, then presses E - so E never lands
+    -- without the buff when Q is ready. The Q slot's cooldown number on
+    -- the HUD is read to know when Q is ready.
+    BuffLead       = 0.25,
+    -- BuffHoldE = true: while Q is cooling down AND more than
+    -- BuffDuration seconds have passed since Q was cast (the buff has
+    -- worn off), E waits for Q instead of firing unbuffed. Set
+    -- BuffDuration to how long your buff lasts. 0 = never hold E.
+    BuffHoldE      = true,
+    BuffDuration   = 0,
     -- RANGE CIRCLE: a flat green ring on the floor round your character
     -- at the distance E starts casting from (AttackRange + CastSlack).
     -- Anything whose edge is inside the ring gets hit with E. It turns
@@ -230,6 +241,14 @@ local CONFIG = {
     -- (beyond HitboxPad) it likes the box to stay from any edge.
     Weave          = true,
     WeaveClear     = 4,
+    -- Parts that make up ONE attack (a purple beam is several layered
+    -- parts) are merged into one hazard when their footprints match
+    -- within this many studs. 0 = off.
+    HazardMerge    = 2.5,
+    -- Inside a hazard (or where two overlap): pick the SHORTEST way out
+    -- and keep walking it until out - no re-deciding every tick, which
+    -- walked the bot back and forth inside overlaps.
+    EscapeMax      = 24,     -- furthest exit looked at
     DodgeLead      = 0.6,    -- a moving or growing hazard also counts where
                              -- it will be this many seconds from now, so
                              -- the bot moves before it arrives (0 = off)
@@ -272,12 +291,21 @@ local CONFIG = {
     -- Our own spells, by part or parent name (lowercase). Nothing a
     -- player casts can hurt the party. If the bot ever eats damage
     -- while standing still, take "groundaura" out first.
-    IgnoreNames    = {"geyser", "groundaura"},
+    -- Your own Q buff's ring ("Enhanced Aura Ring") is red, which made
+    -- it read as an enemy telegraph half the time - so it is named here.
+    -- Spells are also LEARNED by name at runtime (see OUR SPELLS).
+    IgnoreNames    = {"geyser", "groundaura", "enhanced aura"},
     -- Built scenery, never an attack. Case-insensitive: Enchanted
     -- Forest calls it `map`, everything else `Map`. A part added under
     -- one of these mid-run is still checked - some attacks live there.
     MapFolders     = {Map = true, Terrain = true, Camera = true,
                       Lighting = true, borders = true},
+    -- ...and folders whose NAME matches one of these Lua patterns
+    -- (lowercase). Desert Temple builds each room as "room1", "room2"...
+    -- outside any Map folder, so its painted red trim read as attacks.
+    -- A part ADDED to one of these mid-run is still checked, and named
+    -- hitBoxes / precasts always count wherever they are.
+    MapPatterns    = {"^room%d+$"},
     DodgeRange     = 40,     -- how far out to look for hazards
     TelegraphPad   = 1,      -- danger extends this far past the paint
                              -- (the hitbox supplies the rest of the margin)
@@ -1140,6 +1168,53 @@ Haz.named = {}
 -- Marked parts, and everything later added under the same model, are
 -- never hazards (see IsOurs).
 Haz.spell = {}                                   -- part -> true
+-- LEARNED SPELL NAMES. A spell is the same effect every cast, so once a
+-- part NAME has been ours three separate times it is ours for good -
+-- every part of it, every cast, even the red ones that look like a
+-- telegraph (the Q buff's ring flickered ATTACK / NOT ATTACK because
+-- only some of its parts were recognised). A name that has ever been
+-- seen appearing far from every player is a mob's, and is never learned.
+-- Generic names (Part, Ring, hitBox...) are never learned.
+Haz.spellNames, Haz.spellCount, Haz.spellFar = {}, {}, {}
+Haz.spellCounted = setmetatable({}, {__mode = "k"})
+Haz.GENERIC = {part = true, meshpart = true, union = true, unionoperation = true,
+    effect = true, effects = true, fx = true, vfx = true, ring = true, circle = true,
+    model = true, folder = true, attachment = true, handle = true, base = true,
+    main = true, center = true, centre = true, root = true, core = true,
+    hitbox = true, precast = true, debris = true, projectile = true, ball = true,
+    sphere = true, beam = true, wedge = true, cylinder = true, block = true}
+function Haz.LearnableName(n)
+    if not n or #n < 5 then return false end
+    local l = n:lower()
+    if Haz.GENERIC[(l:gsub("%d", ""))] then return false end
+    for _, frag in ipairs(CONFIG.HazardNames) do
+        if l:find(frag, 1, true) then return false end
+    end
+    return true
+end
+function Haz.LearnSpell(o)
+    if not o then return end
+    local n = o.Name
+    if Haz.spellNames[n] or Haz.spellFar[n] or not Haz.LearnableName(n) then return end
+    if Haz.spellCounted[o] then return end            -- this part already counted
+    Haz.spellCounted[o] = true
+    Haz.spellCount[n] = (Haz.spellCount[n] or 0) + 1
+    if Haz.spellCount[n] >= 3 then
+        Haz.spellNames[n] = true
+        print(("[DQR] Learned '%s' as a player's spell - never a hazard from now on."):format(n))
+    end
+end
+-- A part born far from every player: its name is never a spell's.
+function Haz.SeenFar(o)
+    local n = o.Name
+    if Haz.LearnableName(n) and not Haz.spellFar[n] then
+        Haz.spellFar[n] = true
+        if Haz.spellNames[n] then
+            Haz.spellNames[n] = nil
+            print(("[DQR] '%s' appeared far from every player - not a spell after all."):format(n))
+        end
+    end
+end
 local spellModel = {}                            -- model -> true
 local castAt = {}                                -- player -> last spell cast
 local pending = {}                               -- parts to ask again: {o, pl, t, m}
@@ -1295,6 +1370,7 @@ task.spawn(function()
                         local c = castAt[e.pl]
                         if c and c > e.t - 0.5 and c < e.t + 1.0 then
                             Haz.spell[e.o] = true
+                            Haz.LearnSpell(e.o)
                             if e.m and e.m.Parent and not IsCreature(e.m)
                             and not Players:GetPlayerFromCharacter(e.m) then
                                 spellModel[e.m] = true
@@ -1351,6 +1427,7 @@ task.spawn(function()
                     end
                     if spell then
                         Haz.spell[o] = true
+                        Haz.LearnSpell(o)
                         if m and not IsCreature(m) and not Players:GetPlayerFromCharacter(m) then
                             spellModel[m] = true
                         end
@@ -1366,9 +1443,14 @@ task.spawn(function()
                             end
                         end
                     end
+                    local nearest = math.huge
                     for _, pp in ipairs(people) do
-                        if (o.Position - pp.p).Magnitude < 8 then playerBorn[o] = true break end
+                        local d = (o.Position - pp.p).Magnitude
+                        if d < nearest then nearest = d end
+                        if d < 8 then playerBorn[o] = true end
                     end
+                    -- Born well away from everyone: a mob's, never a spell.
+                    if nearest > 30 and nearest < math.huge then Haz.SeenFar(o) end
                     -- Streaming: arrived far away. Kept in the recent list
                     -- (effects with CanQuery off are found through it), but
                     -- never counted as "new".
@@ -2850,6 +2932,17 @@ end
 -- remembered, except for loose parts inside a creature, which are asked
 -- again every time - a whirlpool born beside the boss is part of it
 -- until it moves away, and remembering "body" hid it for good.
+-- A container name that means built map: a MapFolders name, or one
+-- matching a MapPatterns pattern. (Needs mapLower filled first.)
+function Haz.MapName(name)
+    local l = name:lower()
+    if mapLower[l] then return true end
+    for _, pat in ipairs(CONFIG.MapPatterns or {}) do
+        if l:match(pat) then return true end
+    end
+    return false
+end
+
 local function IsMapPart(o)
     local known = mapMemo[o]
     if known == true or known == false then return known end
@@ -2863,7 +2956,7 @@ local function IsMapPart(o)
     end
     local n, depth = o.Parent, 0
     while n and n ~= workspace and depth < 10 do
-        if mapLower[n.Name:lower()] then mapMemo[o] = true return true end
+        if Haz.MapName(n.Name) then mapMemo[o] = true return true end
         -- A creature's own body and weapons are not attacks either
         -- (Lord Varosh's greatsword read as a laser) - but a marker it
         -- is drawing on the floor, or a piece it has thrown, is.
@@ -2903,6 +2996,7 @@ local followRec = setmetatable({}, {__mode = "k"})
 Haz.followModel = {}
 local function MarkFollower(o)
     Haz.spell[o] = true
+    Haz.LearnSpell(o)
     local m = o:FindFirstAncestorOfClass("Model")
     if m and not IsCreature(m) and not Players:GetPlayerFromCharacter(m) then
         Haz.followModel[m] = true
@@ -2966,6 +3060,7 @@ local function SpellOnSight(o)
         local t = pl and ca[pl]
         if r and t and now - t < 1.0 and FlatDist(o.Position, r.Position) < 10 then
             Haz.spell[o] = true
+            Haz.LearnSpell(o)
             return true
         end
     end
@@ -2978,6 +3073,10 @@ local function IsOurs(o)
     if o.Name:sub(1, 4) == "DQR_" then return true end
     if Haz.spell and Haz.spell[o] then return true end
     if NameHas(o, CONFIG.IgnoreNames) then return true end
+    -- A learned spell name, on the part or on what it sits in.
+    if Haz.spellNames[o.Name] or (o.Parent and Haz.spellNames[o.Parent.Name]) then
+        return true
+    end
     for _, c in ipairs(chars) do
         if o:IsDescendantOf(c) then return true end
     end
@@ -3225,6 +3324,34 @@ function Haz.Note(o, kind, why)
     Haz.notes[#Haz.notes + 1] = {p = p, kind = kind, why = why, src = o}
 end
 
+-- Two footprints that are the same strip / circle: matching bounding
+-- circles, about the same height, and - for anything long - pointing
+-- the same way (two beams crossing in an X share a circle but are not
+-- one hazard).
+function Haz.LongAxis(s)
+    if s.kind == "line" then
+        local d = Vector3.new(s.b.X - s.a.X, 0, s.b.Z - s.a.Z)
+        return d.Magnitude > 0.5 and d.Unit or nil
+    elseif s.kind == "box" then
+        if math.abs(s.hx - s.hz) < 1 then return nil end
+        local v = s.hx > s.hz and s.cf.RightVector or s.cf.LookVector
+        local f = Vector3.new(v.X, 0, v.Z)
+        return f.Magnitude > 0.1 and f.Unit or nil
+    end
+    return nil                                      -- discs, balls: round
+end
+function Haz.SameShape(e, h, tol)
+    local dx, dz = e.bx - h.bx, e.bz - h.bz
+    if math.abs(e.br - h.br) > tol or dx * dx + dz * dz > tol * tol then return false end
+    local ey = e.y or (e.a and e.a.Y) or 0
+    local hy = h.y or (h.a and h.a.Y) or 0
+    if math.abs(ey - hy) > 10 then return false end
+    local ea, ha = Haz.LongAxis(e), Haz.LongAxis(h)
+    if (ea == nil) ~= (ha == nil) then return false end
+    if ea and math.abs(ea:Dot(ha)) < 0.95 then return false end
+    return true
+end
+
 local function Add(h)
     if TooOld(h.src) then
         Haz.Note(h.src, "not", "decoration - there too long")
@@ -3237,6 +3364,23 @@ local function Add(h)
     end
     h.why = Haz.why
     Bound(h)
+    -- One attack drawn with several parts (a purple beam is a core, a
+    -- glow and an outline, all the same strip): one hazard, not five.
+    -- Same footprint = bounding circles that match within HazardMerge.
+    -- The bigger one is kept, in place; no look-ahead ghost for a copy.
+    local tol = CONFIG.HazardMerge or 0
+    if tol > 0 then
+        for _, e in ipairs(Haz.real) do
+            if Haz.SameShape(e, h, tol) then
+                if h.br > e.br then
+                    for k in pairs(e) do e[k] = nil end
+                    for k, v in pairs(h) do e[k] = v end
+                end
+                Haz.merged = (Haz.merged or 0) + 1
+                return
+            end
+        end
+    end
     Haz.shapes[#Haz.shapes + 1] = h
     Haz.real[#Haz.real + 1] = h
     local g = Ghost(h)
@@ -3316,7 +3460,14 @@ local function IsTelegraph(o, pos, reach)
     local active, why = LooksActive(o, fresh,
         not o.CanCollide and tick() - (Haz.jumpAt or 0) > 3)
     if VisTrans(o) > 0.95 then return false end
-    if warn == "red" then return true end
+    -- Red still has to DO something - appear, move, fade in, grow or
+    -- light up. Red trim painted on the floor (Desert Temple's room
+    -- borders) is red forever and never changes; it was being dodged.
+    -- "fresh" (merely first seen close by) is not enough for red.
+    if warn == "red" then
+        if active and why ~= "fresh" then return true end
+        return WarnReject(o, warn, "red but static - floor paint")
+    end
     if o.CanCollide then
         if why == "moved" or why == "faded" or why == "grew" or why == "lit" then
             return true
@@ -3491,7 +3642,13 @@ local function Classify(o, pos, reach)
     -- skip the costlier tests. Most parts in range each sweep are these.
     if mapMemo[o] == true and not Haz.named[o] and not zoneParts[o]
     and (not recentParts[o] or streamed[o]) then return end
-    if IsOurs(o) then return end
+    if IsOurs(o) then
+        if CONFIG.HazardDebug and (Haz.spell[o] or Haz.spellNames[o.Name]
+        or NameHas(o, CONFIG.IgnoreNames)) then
+            Haz.Note(o, "not", "a player's spell")
+        end
+        return
+    end
     -- 0. A safe zone is where to stand, never a hazard.
     local zone = SafeZoneOf(o)
     if zone then
@@ -3531,6 +3688,7 @@ local function Classify(o, pos, reach)
         local height, w = ColumnShape(o, true)
         if height and (firstNear[o] or math.huge) < 6 then
             Haz.spell[o] = true                     -- ours: see rule 3a
+            Haz.LearnSpell(o)
             Haz.Note(o, "not", "a player's spell (appeared on a player)")
             return
         end
@@ -3558,6 +3716,7 @@ local function Classify(o, pos, reach)
         -- and travel; they are first seen well away from us.
         if height and (firstNear[o] or math.huge) < 6 then
             Haz.spell[o] = true
+            Haz.LearnSpell(o)
             Haz.Note(o, "not", "a player's spell (appeared on a player)")
             return
         end
@@ -3773,7 +3932,7 @@ function Haz.Scan(pos)
     table.clear(Haz.real)
     table.clear(Haz.safe)
     table.clear(Haz.notes)
-    Haz.orphans, Haz.spent = 0, 0
+    Haz.orphans, Haz.spent, Haz.merged = 0, 0, 0
     local done = {}
     -- Safe zones first, and even while hazards are muted: the mute is
     -- for misread footprints, and it used to switch the Lava King's
@@ -6448,6 +6607,7 @@ end
 local DoMelee, DoSpell
 do
 local spellSlot, lastSpell, lastMelee, lastBuff = false, 0, 0, 0
+local volley = false                    -- a Q -> E volley is being pressed
 
 local function FireKey(kc)
     pcall(function() VIM:SendKeyEvent(true, kc, false, game) end)
@@ -6510,8 +6670,30 @@ function DoSpell(dist, range, aimAt)
             if not ButtonsAtPoint(x, y)[1] then VIM:SendMouseMoveEvent(x, y, game) end
         end) end
         if CONFIG.BuffQ then
-            -- Q is the buff (DoBuff keeps it up); E is the only attack.
-            FireKey(CONFIG.AttackKey or Enum.KeyCode.E)
+            -- Q is the buff, E the attack - and Q ALWAYS goes first.
+            -- One volley at a time, so a Q from one can never land
+            -- between another's Q and E.
+            if volley then return end
+            volley = true
+            pcall(function()
+                local qr = Brain.qReady
+                if qr ~= false then
+                    -- Ready (or the HUD cannot be read): buff first, give
+                    -- it BuffLead to land, then attack.
+                    FireKey(CONFIG.BuffKey or Enum.KeyCode.Q)
+                    lastBuff = tick()
+                    S(CONFIG.BuffLead or 0.25)
+                elseif CONFIG.BuffHoldE and (CONFIG.BuffDuration or 0) > 0
+                and tick() - (Brain.qCastAt or 0) > CONFIG.BuffDuration then
+                    -- The buff has worn off and Q is still cooling down:
+                    -- hold E for it.
+                    Brain.holdingE = true
+                    return
+                end
+                Brain.holdingE = false
+                FireKey(CONFIG.AttackKey or Enum.KeyCode.E)
+            end)
+            volley = false
         elseif CONFIG.SpellMode == "both" then
             pcall(function()
                 VIM:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
@@ -6532,13 +6714,89 @@ end
 -- damage / speed boost is always running. Pressed on its own thread
 -- and a little apart from an E press, so the two never share a frame.
 function Brain.Buff()
-    if not CONFIG.BuffQ then return end
+    if not CONFIG.BuffQ or volley then return end
     local now = tick()
     if now - lastBuff < (CONFIG.BuffRate or 1) then return end
-    if now - lastSpell < 0.06 then return end
+    -- Known to be cooling down: nothing to press.
+    if Brain.qReady == false then return end
     lastBuff = now
     task.spawn(FireKey, CONFIG.BuffKey or Enum.KeyCode.Q)
 end
+
+-- THE Q SLOT. The hotbar shows the key letter under each slot and a
+-- cooldown number on it while it recharges. Found by the letter (the
+-- BuffKey's name, "Q"), then the number label nearest above it.
+-- Brain.qReady: true = ready, false = cooling down, nil = unknown (then
+-- Q is simply pressed first every time). Brain.qCastAt: when the number
+-- last appeared or jumped up - the moment Q went off.
+Brain.qReady, Brain.qCastAt = nil, 0
+task.spawn(function()
+    local cdLabel, keyLabel, scanAt, last, said = nil, nil, 0, nil, false
+    local function Num(o)
+        return o.Visible and tonumber((o.Text:gsub("%s", ""))) or nil
+    end
+    local function Centre(o)
+        return o.AbsolutePosition + o.AbsoluteSize / 2
+    end
+    while true do
+        S(0.1)
+        local now = tick()
+        if not CONFIG.BuffQ then
+            Brain.qReady = nil
+        else
+            if (not keyLabel or not keyLabel.Parent or not cdLabel or not cdLabel.Parent)
+            and now - scanAt > 2 then
+                scanAt = now
+                pcall(function()
+                    local pg = LP:FindFirstChildOfClass("PlayerGui")
+                    local cam = workspace.CurrentCamera
+                    local vp = cam and cam.ViewportSize
+                    if not (pg and vp) then return end
+                    local letter = (CONFIG.BuffKey or Enum.KeyCode.Q).Name:upper()
+                    local keys, nums = {}, {}
+                    for _, o in ipairs(pg:GetDescendants()) do
+                        if o:IsA("TextLabel") and not (LogGui and o:IsDescendantOf(LogGui)) then
+                            local c = Centre(o)
+                            if c.Y > vp.Y * 0.55 then
+                                local t = o.Text:gsub("%s", "")
+                                if t:upper() == letter then keys[#keys + 1] = o
+                                elseif tonumber(t) then nums[#nums + 1] = o end
+                            end
+                        end
+                    end
+                    -- The letter label nearest the bottom middle.
+                    table.sort(keys, function(a, b)
+                        return math.abs(Centre(a).X - vp.X / 2) < math.abs(Centre(b).X - vp.X / 2)
+                    end)
+                    keyLabel = keys[1]
+                    if not keyLabel then return end
+                    local kc, best, bestD = Centre(keyLabel), nil, 140
+                    for _, o in ipairs(nums) do
+                        local c = Centre(o)
+                        local d = (c - kc).Magnitude
+                        if c.Y <= kc.Y + 5 and d < bestD then best, bestD = o, d end
+                    end
+                    if best then cdLabel = best end
+                end)
+            end
+            if cdLabel and cdLabel.Parent then
+                local v = Num(cdLabel)
+                local ready = not v or v <= 0
+                if v and v > 0 and (last == nil or v > last + 0.5) then Brain.qCastAt = now end
+                last = v
+                Brain.qReady = ready
+                if not said then
+                    said = true
+                    print("[DQR] Q slot found on the HUD - Q goes first, E waits on it.")
+                end
+            else
+                -- Not found yet: it only shows a number once Q has been
+                -- used, so keep looking; until then press Q first anyway.
+                Brain.qReady = nil
+            end
+        end
+    end
+end)
 end
 
 -- ============================================================
@@ -6582,6 +6840,46 @@ function Brain.Reset()
     Haz.jumpAt = tick()
     prog, evade, dodge, lastPos, lastTarget = nil, nil, nil, nil, nil
     settleUntil, lastPick = 0, 0
+    Brain.esc = nil
+end
+
+-- THE WAY OUT. Standing in a hazard - or where two overlap - every step
+-- goes deeper into one of them, so the usual "walk must cross nothing"
+-- test rejected them all and the fallback picked a different spot every
+-- tick: back and forth inside the overlap until dead. Here every
+-- heading is walked out in 1.5-stud steps to the first spot whose
+-- hitbox is clear; the cost is the time spent inside hazards on the
+-- way, plus distance, plus being out of spell range. The cheapest is
+-- the exit - and the brain then COMMITS to it (Brain.esc) until it is
+-- reached, times out, or a real hazard lands on it.
+function Brain.Escape(pos, near, anchor, spellR)
+    local best, bestS = nil, math.huge
+    local maxD = CONFIG.EscapeMax or 24
+    local clearNeed = math.max(CONFIG.EvadeClear or 0.5, 0)
+    for i = 0, 23 do
+        local a = i * math.pi / 12
+        local u = Vector3.new(math.cos(a), 0, math.sin(a))
+        local inside = 0
+        local d = 1.5
+        while d <= maxD do
+            local p = pos + u * d
+            if Haz.BoxClear(p, true, near) >= clearNeed then
+                -- Inside costs most: each step in there is a step taking hits.
+                local s = inside * 1.5 * 4 + d * 0.5
+                if anchor and spellR then
+                    local f = FlatDist(p, anchor)
+                    if f > spellR then s = s + (f - spellR) * 1.5 end
+                end
+                if s < bestS and LineClear(pos, p) and HasGround(p) and GroundOnPath(pos, p) then
+                    best, bestS = p, s
+                end
+                break
+            end
+            inside = inside + 1
+            d = d + 1.5
+        end
+    end
+    return best
 end
 
 -- State changes go to the log, at most one every 1.5s so a busy fight
@@ -7425,9 +7723,37 @@ function Brain.Tick(root)
             end
             if here0 < cap + 3 or ahead then
                 weaving = true
-                local spot, here = Weave(pos, desire or goal, near, tgt and anchor or nil,
-                    tgt and spellR or nil, tgt and minR or nil, cap)
-                if spot and FlatDist(spot, pos) > 0.8 then
+                -- A committed way out: kept until reached, timed out, or a
+                -- REAL hazard (not a look-ahead ghost) covers it.
+                local esc = Brain.esc
+                if esc and (now > esc.untilT or FlatDist(esc.goal, pos) < 1.2
+                or Haz.BoxClear(esc.goal, true, Haz.real) < 0) then
+                    esc, Brain.esc = nil, nil
+                end
+                if here0 < 0 and not esc then
+                    local p = Brain.Escape(pos, near, tgt and anchor or nil, tgt and spellR or nil)
+                    if p then
+                        esc = {goal = p, untilT = now + FlatDist(p, pos) / 10 + 1.5}
+                        Brain.esc = esc
+                    end
+                end
+                local spot, here
+                if esc then
+                    spot, here = esc.goal, here0
+                    if here < 0 and Blink(root, spot) then
+                        Brain.esc = nil
+                        Nav.goal, Nav.direct, Brain.state = nil, false, "Blinked out of a hazard"
+                        Say(Brain.state)
+                        return
+                    end
+                else
+                    spot, here = Weave(pos, desire or goal, near, tgt and anchor or nil,
+                        tgt and spellR or nil, tgt and minR or nil, cap)
+                end
+                if esc then
+                    goal, direct = esc.goal, true
+                    state = "Stepping out of a hazard (shortest way out)"
+                elseif spot and FlatDist(spot, pos) > 0.8 then
                     if here < 0 and Blink(root, spot) then
                         Nav.goal, Nav.direct, Brain.state = nil, false, "Blinked out of a hazard"
                         Say(Brain.state)
@@ -8882,7 +9208,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.0 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.2 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
