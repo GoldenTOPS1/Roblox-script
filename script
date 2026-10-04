@@ -246,7 +246,7 @@ local CONFIG = {
     --                         spell, a leftover, decoration, spent...).
     --   green "SAFE ZONE"   - a place to stand.
     -- Also logs each hazard's source, as before.
-    HazardDebug    = false,
+    HazardDebug    = true,
     HazardLabelMax = 40,     -- most labels on screen at once
     HazardLabelRange = 80,   -- labels further from you than this are hidden
 
