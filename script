@@ -24,9 +24,9 @@ local CONFIG = {
     -- The dungeon to run. This also picks the settings: whatever that
     -- dungeon's entry in MAP_PROFILES (further down) says is used for
     -- the run, on top of the defaults in this CONFIG block.
-    TargetDungeon  = "Volcanic Chambers",
-    Difficulty     = "Nightmare",
-    Hardcore       = true,  -- true = also press HARDCORE MODE
+    TargetDungeon  = "Northern Lands",
+    Difficulty     = "Insane",
+    Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
     -- CARRY MODE: after creating the lobby, wait on the party screen
@@ -245,13 +245,34 @@ local CONFIG = {
     -- parts) are merged into one hazard when their footprints match
     -- within this many studs. 0 = off.
     HazardMerge    = 2.5,
+    -- WARNING vs LIVE. Many attacks (the purple and red strips) are drawn
+    -- see-through first - the warning - and go solid when they hit. A
+    -- footprint at least WarnAlpha transparent (but still visible) is a
+    -- WARNING: not hitting yet. A solid one is LIVE: hitting now.
+    --  - Standing in either is avoided (a warning turns live soon).
+    --  - Walking THROUGH a warning to get somewhere safe is allowed (it is
+    --    over in a moment); walking through a live one never is. In a
+    --    sweeping pattern the strip that just went solid is behind you,
+    --    so the bot cuts across the next, still see-through one.
+    -- Labels say "ATTACK - LIVE" or "ATTACK - warning". 1 = off (every
+    -- footprint is treated as live, like v13.2).
+    WarnAlpha      = 0.3,
+    WarnCrossCost  = 1.5,    -- escape cost of a step inside a warning
+    LiveCrossCost  = 10,     -- ...and inside a live one (per 1.5 studs)
+    -- An invisible hitBox only counts this long after it appears, moves
+    -- or resizes - the moment it fires. One already sitting there when
+    -- first seen is parked, not firing, and never counts.
+    InvisibleLinger= 1.2,
     -- Inside a hazard (or where two overlap): pick the SHORTEST way out
     -- and keep walking it until out - no re-deciding every tick, which
     -- walked the bot back and forth inside overlaps.
     EscapeMax      = 24,     -- furthest exit looked at
-    DodgeLead      = 0.6,    -- a moving or growing hazard also counts where
+    DodgeLead      = 0.8,    -- a moving or growing hazard also counts where
                              -- it will be this many seconds from now, so
-                             -- the bot moves before it arrives (0 = off)
+                             -- the bot moves before it arrives (0 = off).
+                             -- A moving ball / circle (Odin's yellow
+                             -- bouncing orbs) covers its whole path to
+                             -- there, not just the end point.
     -- Moving columns (whirlpools, tornadoes) get a solid grey pillar on
     -- your screen: your character is pushed back off it instead of
     -- walking in, like the reference script's.
@@ -265,7 +286,7 @@ local CONFIG = {
     --                         spell, a leftover, decoration, spent...).
     --   green "SAFE ZONE"   - a place to stand.
     -- Also logs each hazard's source, as before.
-    HazardDebug    = false,
+    HazardDebug    = true,
     HazardLabelMax = 40,     -- most labels on screen at once
     HazardLabelRange = 80,   -- labels further from you than this are hidden
 
@@ -369,6 +390,11 @@ local CONFIG = {
     -- finds none, and the route in hand is re-planned the moment a new
     -- hazard lands on it. false = Roblox pathfinder only (v12).
     SmartPath      = true,
+    -- STICKY ROUTES: a route is kept while the goal moves less than
+    -- this many studs, and a replan only replaces it when the new one
+    -- is clearly shorter. Stops the step-toward / step-back dance on
+    -- the way to stairs while the boss shuffles about up top.
+    RouteKeep      = 30,
     SmartCell      = 4,      -- grid cell size, studs
     SmartRadius    = 90,     -- how far from you the grid reaches
     SmartBudget    = 1500,   -- most cells searched per plan
@@ -1543,7 +1569,11 @@ end
 -- rule as "invisible". Re-read at most once a second per part.
 local visMemo = setmetatable({}, {__mode = "k"})
 function VisTrans(o)
+    -- What you actually see: the part's own transparency combined with
+    -- LocalTransparencyModifier (the game hiding it on your screen only).
     local v = o.Transparency
+    local ltm = o.LocalTransparencyModifier
+    if ltm > 0 then v = 1 - (1 - v) * (1 - ltm) end
     if v <= 0.95 then return v end
     local now, m = tick(), visMemo[o]
     if m and now - m.t < 1 then return m.v end
@@ -1552,7 +1582,11 @@ function VisTrans(o)
             v = c.Transparency
         elseif c:IsA("SurfaceGui") and c.Enabled then
             for _, g in ipairs(c:GetDescendants()) do
-                if g:IsA("GuiObject") and g.Visible then
+                -- Only something with an actual size on the surface: an
+                -- empty or zero-sized frame drew nothing, but used to make
+                -- an invisible part count as visible.
+                if g:IsA("GuiObject") and g.Visible and g.AbsoluteSize.X > 1
+                and g.AbsoluteSize.Y > 1 then
                     local t = g.BackgroundTransparency
                     if g:IsA("ImageLabel") or g:IsA("ImageButton") then
                         t = math.min(t, g.ImageTransparency)
@@ -3286,7 +3320,17 @@ local function Ghost(h)
     for k, val in pairs(h) do g[k] = val end
     g.ghost = true
     if h.kind == "disc" or h.kind == "ball" then
-        g.x, g.z, g.r = h.x + shift.X, h.z + shift.Z, h.r + math.max(d1, d2)
+        if shift.Magnitude >= 1 then
+            -- Moving: a capsule over the WHOLE way it will travel, so a
+            -- spot it rolls through on the way counts too (the bot walked
+            -- into Odin's bouncing orbs between "now" and "then").
+            g.kind = "line"
+            g.a = Vector3.new(h.x, h.y, h.z)
+            g.b = g.a + shift
+            g.r = h.r + math.max(d1, d2)
+        else
+            g.x, g.z, g.r = h.x + shift.X, h.z + shift.Z, h.r + math.max(d1, d2)
+        end
     elseif h.kind == "box" then
         g.cf, g.hx, g.hz = h.cf + shift, h.hx + d1, h.hz + d2
     else
@@ -3340,6 +3384,34 @@ function Haz.LongAxis(s)
     end
     return nil                                      -- discs, balls: round
 end
+-- How see-through a hazard's source is (0 solid .. 1 invisible).
+function Haz.AlphaOf(src)
+    if not src then return 0 end
+    local ok, a = pcall(function()
+        if src:IsA("BasePart") then return VisTrans(src) end
+        if src:IsA("Beam") then
+            local m = 1
+            for _, k in ipairs(src.Transparency.Keypoints) do
+                if k.Value < m then m = k.Value end
+            end
+            return m
+        end
+        if src:IsA("HandleAdornment") then return src.Transparency end
+        return 0
+    end)
+    return ok and a or 0
+end
+
+-- Only the LIVE footprints of a list (solid: hitting now). The walk
+-- tests use this - crossing a warning is allowed, a live one never.
+function Haz.Live(list)
+    local out = {}
+    for _, h in ipairs(list or Haz.shapes) do
+        if not h.warn then out[#out + 1] = h end
+    end
+    return out
+end
+
 function Haz.SameShape(e, h, tol)
     local dx, dz = e.bx - h.bx, e.bz - h.bz
     if math.abs(e.br - h.br) > tol or dx * dx + dz * dz > tol * tol then return false end
@@ -3363,19 +3435,27 @@ local function Add(h)
         return
     end
     h.why = Haz.why
+    -- Warning (see-through, not hitting yet) or live (solid, hitting).
+    -- An invisible hitBox is the damage itself: live.
+    local alpha = Haz.AlphaOf(h.src)
+    h.alpha = alpha
+    h.warn = alpha >= (CONFIG.WarnAlpha or 1) and alpha < 0.95
     Bound(h)
     -- One attack drawn with several parts (a purple beam is a core, a
     -- glow and an outline, all the same strip): one hazard, not five.
     -- Same footprint = bounding circles that match within HazardMerge.
     -- The bigger one is kept, in place; no look-ahead ghost for a copy.
+    -- Live if ANY of its parts is solid.
     local tol = CONFIG.HazardMerge or 0
     if tol > 0 then
         for _, e in ipairs(Haz.real) do
             if Haz.SameShape(e, h, tol) then
+                local warn = e.warn and h.warn
                 if h.br > e.br then
                     for k in pairs(e) do e[k] = nil end
                     for k, v in pairs(h) do e[k] = v end
                 end
+                e.warn = warn
                 Haz.merged = (Haz.merged or 0) + 1
                 return
             end
@@ -3670,14 +3750,26 @@ local function Classify(o, pos, reach)
         -- there invisible afterwards has been left behind (or parked for
         -- the next cast). Counted, it turned the hitbox red on open ground
         -- for ten seconds and had the bot stepping round nothing.
+        -- v13.3: an invisible one counts for InvisibleLinger seconds after
+        -- it appears, moves or resizes - not 2.5 - and one that was
+        -- already sitting there when first seen (parked for the next
+        -- cast, not just spawned) does not count at all. Those were the
+        -- "attacks" on empty floor.
         if VisTrans(o) > 0.95 then
             local now, rec = tick(), namedSeen[o]
             local sz = PartSize(o)
-            if not rec or (o.Position - rec.p).Magnitude > 0.5 or (sz - rec.s).Magnitude > 0.5 then
-                namedSeen[o] = {p = o.Position, s = sz, t = now}
-            elseif now - rec.t > 2.5 then
+            local linger = CONFIG.InvisibleLinger or 1.2
+            if not rec then
+                local born = recentParts[o]
+                local fresh = born ~= nil and now - born < linger and not streamed[o]
+                rec = {p = o.Position, s = sz, t = fresh and now or (now - linger - 1)}
+                namedSeen[o] = rec
+            elseif (o.Position - rec.p).Magnitude > 0.5 or (sz - rec.s).Magnitude > 0.5 then
+                rec.p, rec.s, rec.t = o.Position, sz, now
+            end
+            if now - rec.t > linger then
                 Haz.spent = Haz.spent + 1
-                Haz.Note(o, "not", "spent hitBox - invisible and still")
+                Haz.Note(o, "not", "invisible hitBox, idle - not firing")
                 return
             end
         else
@@ -4208,10 +4300,12 @@ local pool = {}
 local FAR = CFrame.new(0, -500, 0)
 local TAG_COL = {
     attack = Color3.fromRGB(255, 70, 70),
+    warn   = Color3.fromRGB(255, 175, 60),
     ["not"] = Color3.fromRGB(185, 190, 200),
     safe   = Color3.fromRGB(80, 235, 110),
 }
-local TAG_TITLE = {attack = "ATTACK", ["not"] = "NOT ATTACK", safe = "SAFE ZONE"}
+local TAG_TITLE = {attack = "ATTACK - LIVE", warn = "ATTACK - warning",
+                   ["not"] = "NOT ATTACK", safe = "SAFE ZONE"}
 
 local function Tag(i)
     local t = pool[i]
@@ -4272,7 +4366,7 @@ function Haz.Draw(pos)
         local key = h.src or h
         if not seen[key] then
             seen[key] = true
-            items[#items + 1] = {p = ShapeCentre(h), kind = "attack",
+            items[#items + 1] = {p = ShapeCentre(h), kind = h.warn and "warn" or "attack",
                 why = h.why or "hazard", src = h.src, size = Describe(h)}
         end
     end
@@ -4283,11 +4377,31 @@ function Haz.Draw(pos)
                 src = z.src, size = ("zone r=%d"):format(math.floor(z.r))}
         end
     end
+    -- Ignored parts with the same name and reason within 10 studs of
+    -- each other are ONE label with a count: a spell is a dozen parts,
+    -- and a dozen labels stacked on the player could not be read.
+    local groups = {}
     for _, nt in ipairs(Haz.notes) do
         if not seen[nt.src] then
             seen[nt.src] = true
-            items[#items + 1] = {p = nt.p, kind = nt.kind, why = nt.why, src = nt.src}
+            local key = nt.why .. "|" .. (nt.src and nt.src.Name or "?")
+            local list = groups[key]
+            if not list then list = {} groups[key] = list end
+            local hit = nil
+            for _, it in ipairs(list) do
+                if (it.p - nt.p).Magnitude < 10 then hit = it break end
+            end
+            if hit then
+                hit.n = hit.n + 1
+            else
+                local it = {p = nt.p, kind = nt.kind, why = nt.why, src = nt.src, n = 1}
+                list[#list + 1] = it
+                items[#items + 1] = it
+            end
         end
+    end
+    for _, it in ipairs(items) do
+        if it.n and it.n > 1 then it.size = ("x%d parts"):format(it.n) end
     end
     -- Nearest first, and only within HazardLabelRange.
     local maxR = CONFIG.HazardLabelRange or 80
@@ -4297,7 +4411,10 @@ function Haz.Draw(pos)
         if it.d <= maxR then shown[#shown + 1] = it end
     end
     table.sort(shown, function(a, b)
-        if (a.kind == "attack") ~= (b.kind == "attack") then return a.kind == "attack" end
+        -- Live attacks first, then warnings, safe zones, ignored parts.
+        local ra = a.kind == "attack" and 0 or a.kind == "warn" and 1 or a.kind == "safe" and 2 or 3
+        local rb = b.kind == "attack" and 0 or b.kind == "warn" and 1 or b.kind == "safe" and 2 or 3
+        if ra ~= rb then return ra < rb end
         return a.d < b.d
     end)
     local n = math.min(#shown, CONFIG.HazardLabelMax or 40)
@@ -5858,13 +5975,17 @@ end
 
 -- Does walking `wps` from `from` (the first `n` legs) step into a
 -- hazard we are not already in?
-function Nav.RouteCrosses(from, wps, n)
+-- `liveOnly`: only solid footprints count (a warning on the route is
+-- priced in by the planner, not a reason to throw the route away).
+function Nav.RouteCrosses(from, wps, n, liveOnly)
     if #Haz.shapes == 0 or not wps then return false end
+    local list = liveOnly and Haz.Live(Haz.shapes) or nil
+    if list and #list == 0 then return false end
     local a = from
     for i = 1, math.min(#wps, n or #wps) do
         local b = wps[i].Position
         if FlatDist(a, from) > CONFIG.DodgeRange + 10 then break end
-        if Haz.OnPath(a, b) then return true end
+        if Haz.OnPath(a, b, list) then return true end
         a = b
     end
     return false
@@ -5894,14 +6015,22 @@ function Nav.SmartPlan(from, to)
     end
     local maxUp = CONFIG.AllowJump and CONFIG.JumpMax or math.min(CONFIG.JumpMax, cell + 1)
 
+    -- Live footprints cost the full SmartHazCost; warnings (see-through,
+    -- not hitting yet) 40% of it - by the time we get there they may be
+    -- live, so they are still steered round when that is cheap.
+    local liveList = hazList and Haz.Live(hazList) or nil
     local function Cost(p)
         local c = 0
         if hazList then
             local clear = Haz.Clear(p, true, hazList) - hitR
+            local full = hazCost
+            if clear < nearHaz and liveList and (Haz.Clear(p, true, liveList) - hitR) >= nearHaz then
+                full = hazCost * 0.4                -- only warnings here
+            end
             if clear < 0 then
-                c = c + hazCost
+                c = c + full
             elseif clear < nearHaz then
-                c = c + hazCost * 0.5 * (1 - clear / nearHaz)
+                c = c + full * 0.5 * (1 - clear / nearHaz)
             end
         end
         for _, m in ipairs(mobs) do
@@ -6038,6 +6167,31 @@ function Nav.SmartPlan(from, to)
             hazList and (", round %d hazard(s)"):format(#hazList) or ""))
     end
     return out, full, expanded
+end
+
+-- Walking length of a route from `from`.
+function Nav.PathLen(from, wps)
+    local len, a = 0, from
+    for _, wp in ipairs(wps) do
+        len = len + (wp.Position - a).Magnitude
+        a = wp.Position
+    end
+    return len, a
+end
+
+-- Keep the route in hand instead of `wps`? Yes when it still ends near
+-- the goal, steps into no hazard, and is not clearly longer than the
+-- new one (old route + the bit from its end to the goal, against the
+-- new route, with 20% and 6 studs of slack).
+function Nav.KeepOld(pos, goal, wps)
+    local q = Nav.queue
+    if #q == 0 then return false end
+    local oldLen, oldEnd = Nav.PathLen(pos, q)
+    local gap = (goal - oldEnd).Magnitude
+    if gap > (CONFIG.RouteKeep or 30) then return false end
+    if Nav.RouteCrosses(pos, q, 4, true) then return false end
+    local newLen = Nav.PathLen(pos, wps)
+    return oldLen + gap <= newLen * 1.2 + 6
 end
 
 -- ShowPath: small dots on each waypoint of the route in hand.
@@ -6191,7 +6345,12 @@ local function Worker(myGen)
         local root, human, goal = GetRoot(), GetHuman(), Nav.goal
         if human and human.Health <= 0 then goal = nil end
         if not (root and goal) then
-            if #Nav.queue > 0 then ClearPath() end
+            -- Dead or no character: drop it. Just no goal for a moment
+            -- (casting from here): the Heartbeat holds the route for 2s.
+            local dead = not root or not human or human.Health <= 0
+            if #Nav.queue > 0 and (dead or (Nav.noGoalSince and tick() - Nav.noGoalSince > 2)) then
+                ClearPath()
+            end
             Nav.steer = nil
             continue
         end
@@ -6212,7 +6371,7 @@ local function Worker(myGen)
         if CONFIG.SmartPath and not Nav.direct and #Haz.shapes > 0 then
             local now = tick()
             if #Nav.queue > 0 and now - (Nav.hazReplanAt or 0) > 1
-            and Nav.RouteCrosses(pos, Nav.queue, 4) then
+            and Nav.RouteCrosses(pos, Nav.queue, 4, true) then
                 Nav.hazReplanAt, Nav.force = now, true
             end
             hazLine = flat > CONFIG.PathMinDist and Haz.OnPath(pos, goal)
@@ -6222,9 +6381,17 @@ local function Worker(myGen)
         if need then
             local moved = Nav.qGoal and (goal - Nav.qGoal).Magnitude or 1e9
             if Nav.force or moved > CONFIG.RepathDist or #Nav.queue == 0 then
+                -- Forced (stuck, a waypoint timed out, a hazard landed on
+                -- the route): the new route always wins.
+                local forced = Nav.force
                 Nav.force = false
                 local wps = ComputePath(pos, goal)
-                if wps then
+                if wps and not forced and #Nav.queue > 0 and Nav.KeepOld(pos, goal, wps) then
+                    -- The route in hand still gets there about as well:
+                    -- keep it. Swapping to a route that starts off the
+                    -- other way is a step back for every replan.
+                    Nav.qGoal = goal
+                elseif wps then
                     Nav.queue, Nav.qGoal, Nav.pathFail, Nav.steer = wps, goal, 0, nil
                 elseif #Nav.queue > 0 then
                     -- Keep walking the route we have; an empty recompute
@@ -6290,11 +6457,24 @@ local function Heartbeat(dt)
     local now, pos, goal = tick(), root.Position, Nav.goal
     -- A route computed for somewhere else (the brain changed its mind):
     -- drop it now, not after the worker notices.
+    -- STICKY ROUTES: only a goal somewhere really different (RouteKeep
+    -- studs) throws the route away here. A goal that shuffled a few
+    -- studs - a boss stepping about at the top of the stairs - keeps us
+    -- walking the route we have while the worker plans the next one;
+    -- dropping it every time is what had the bot step toward the stairs,
+    -- stop, turn, and step back, over and over.
     if goal and Nav.qGoal and #Nav.queue > 0
-    and (goal - Nav.qGoal).Magnitude > CONFIG.RepathDist then
+    and (goal - Nav.qGoal).Magnitude > (CONFIG.RouteKeep or 30) then
         ClearPath()
     end
-    if not goal and #Nav.queue > 0 then ClearPath() end
+    -- No goal for a moment (casting from where we stand): hold the
+    -- route, and only drop it once the goal has been gone a while.
+    if goal then
+        Nav.noGoalSince = nil
+    elseif #Nav.queue > 0 then
+        Nav.noGoalSince = Nav.noGoalSince or now
+        if now - Nav.noGoalSince > 2 then ClearPath() end
+    end
 
     local step = goal
     if Nav.unstick and now < Nav.unstickUntil then
@@ -6852,30 +7032,38 @@ end
 -- way, plus distance, plus being out of spell range. The cheapest is
 -- the exit - and the brain then COMMITS to it (Brain.esc) until it is
 -- reached, times out, or a real hazard lands on it.
-function Brain.Escape(pos, near, anchor, spellR)
+-- v13.3: steps inside a WARNING (see-through, not hitting yet) cost
+-- WarnCrossCost, steps inside a LIVE one LiveCrossCost - so it cuts
+-- across the next strip of a sweep rather than the one that just went
+-- solid. `prevDir`: the way the last exit went; carrying on that way is
+-- worth a little, so a re-pick does not turn it round for nothing.
+function Brain.Escape(pos, near, anchor, spellR, prevDir)
     local best, bestS = nil, math.huge
     local maxD = CONFIG.EscapeMax or 24
     local clearNeed = math.max(CONFIG.EvadeClear or 0.5, 0)
+    local live = Haz.Live(near)
+    local wc, lc = CONFIG.WarnCrossCost or 1.5, CONFIG.LiveCrossCost or 10
     for i = 0, 23 do
         local a = i * math.pi / 12
         local u = Vector3.new(math.cos(a), 0, math.sin(a))
-        local inside = 0
+        local cost = 0
         local d = 1.5
         while d <= maxD do
             local p = pos + u * d
             if Haz.BoxClear(p, true, near) >= clearNeed then
-                -- Inside costs most: each step in there is a step taking hits.
-                local s = inside * 1.5 * 4 + d * 0.5
+                local s = cost + d * 0.5
                 if anchor and spellR then
                     local f = FlatDist(p, anchor)
                     if f > spellR then s = s + (f - spellR) * 1.5 end
                 end
+                if prevDir then s = s - u:Dot(prevDir) * 3 end
                 if s < bestS and LineClear(pos, p) and HasGround(p) and GroundOnPath(pos, p) then
                     best, bestS = p, s
                 end
                 break
             end
-            inside = inside + 1
+            -- Still inside something: live costs far more than a warning.
+            cost = cost + ((#live > 0 and Haz.BoxClear(p, true, live) < 0) and lc or wc)
             d = d + 1.5
         end
     end
@@ -6937,11 +7125,13 @@ local function PickExit(pos, aim, keepR, heading, maxD, fallback)
         end
     end
     table.sort(cands, function(x, y) return x.s < y.s end)
+    -- Walks may cross a warning, never a live footprint.
+    local live = Haz.Live(near)
     -- Up to ten tried (five used to be all, and in a busy pattern all
     -- five paths crossed something - so it stood still instead).
     for i = 1, math.min(#cands, 10) do
         local p = cands[i].p
-        if not Haz.OnPath(pos, p, near) and LineClear(pos, p)
+        if not Haz.OnPath(pos, p, live) and LineClear(pos, p)
         and HasGround(p) and GroundOnPath(pos, p) then
             return p
         end
@@ -6972,7 +7162,7 @@ local function PickExit(pos, aim, keepR, heading, maxD, fallback)
     table.sort(cands2, function(x, y) return x.s > y.s end)
     for i = 1, math.min(#cands2, 10) do
         local p = cands2[i].p
-        if not Haz.OnPath(pos, p, near) and LineClear(pos, p) and HasGround(p) then return p end
+        if not Haz.OnPath(pos, p, live) and LineClear(pos, p) and HasGround(p) then return p end
     end
     -- Last resort: every way out crosses something. Standing here is a
     -- sure hit; the best spot, crossing a strip on the way, may not be.
@@ -7029,11 +7219,15 @@ local function Weave(pos, desire, near, anchor, spellR, minR, cap)
             end
             if minR and d < minR then s = s - (minR - d) * 2 end
         end
-        -- A little loyalty to the spot picked last time: re-deciding from
-        -- scratch every tenth of a second would dither between two.
-        if last and FlatDist(c, last) < 2 then s = s + 1.5 end
+        -- Loyalty to the spot picked last time: re-deciding from scratch
+        -- every tenth of a second dithered between two. (v13.3: was +1.5
+        -- within 2 studs - too little to stop the back and forth.)
+        if last and FlatDist(c, last) < 3 then s = s + 4 end
         return s, cl
     end
+    -- Walks may cross a WARNING (see-through, not hitting yet), never a
+    -- live one. Where the walk ENDS still has to be clear of both.
+    local live = Haz.Live(near)
     local s0, here = Score(pos, 0)
     local cands = {{p = pos, s = s0, move = 0}}
     for i = 0, 15 do
@@ -7051,7 +7245,7 @@ local function Weave(pos, desire, near, anchor, spellR, minR, cap)
     for i = 1, math.min(#cands, 14) do
         local c = cands[i]
         if c.move == 0 then spot = pos break end
-        if not Haz.OnPath(pos, c.p, near) and LineClear(pos, c.p) and HasGround(c.p) then
+        if not Haz.OnPath(pos, c.p, live) and LineClear(pos, c.p) and HasGround(c.p) then
             spot = c.p
             break
         end
@@ -7181,6 +7375,17 @@ local approachSide = {s = nil, t = 0}           -- the way round last chosen
 local SafeApproachRaw
 local function SafeApproach(pos, goal)
     if #Haz.shapes == 0 then return goal end
+    -- v13.3: a ROUTED walk (target up a level, a wall between, or a
+    -- route already being walked) is not judged by the straight line -
+    -- that line runs under the platform, not up the stairs. Cutting the
+    -- goal short at a hazard on it pulled the bot off the route and back,
+    -- over and over. The route planner steers round hazards itself, and
+    -- re-plans when one lands on the route.
+    if CONFIG.SmartPath and (math.abs(goal.Y - pos.Y) > CONFIG.JumpMax
+    or (#Nav.queue > 0 and Nav.qGoal and (Nav.qGoal - goal).Magnitude < (CONFIG.RouteKeep or 30))
+    or not LineClear(pos, goal)) then
+        return goal
+    end
     -- The same question a moment later from nearly the same spot gets
     -- the same answer: asked twenty times a second, the search below was
     -- a big part of the stutter in a busy fight.
@@ -7716,25 +7921,50 @@ function Brain.Tick(root)
             local here0 = Haz.BoxClear(pos, true, near)
             local ahead = false
             local g = goal or desire
+            -- v13.3: walking a route, "ahead" is the next waypoint - not
+            -- the straight line to the target, which on the way to stairs
+            -- points somewhere else entirely - and weaving leans that way
+            -- too, so a dodge does not undo the route.
+            if goal and not direct and #Nav.queue > 0 and Nav.qGoal
+            and (Nav.qGoal - goal).Magnitude < (CONFIG.RouteKeep or 30) then
+                g = Nav.queue[1].Position
+                desire = g
+            end
             if g then
                 local d = Flat(g - pos)
                 if d.Magnitude > 16 then g = pos + d.Unit * 16 end
-                ahead = d.Magnitude > 0.5 and Haz.OnPath(pos, g, near)
+                -- Only a LIVE footprint ahead takes over from the plan; a
+                -- warning on the way is crossed (it is over in a moment).
+                ahead = d.Magnitude > 0.5 and Haz.OnPath(pos, g, Haz.Live(near))
             end
             if here0 < cap + 3 or ahead then
                 weaving = true
-                -- A committed way out: kept until reached, timed out, or a
-                -- REAL hazard (not a look-ahead ghost) covers it.
+                -- A committed way out (v13.3): dropped only when reached, timed out, or something
+                -- LIVE now sits on the exit or across the walk to it - a
+                -- warning drifting over it, or a look-ahead ghost, is not
+                -- enough. A re-pick prefers carrying on the same way, and
+                -- re-picks are at most two a second: deciding afresh every
+                -- tick is what walked it into the next hazard.
                 local esc = Brain.esc
-                if esc and (now > esc.untilT or FlatDist(esc.goal, pos) < 1.2
-                or Haz.BoxClear(esc.goal, true, Haz.real) < 0) then
-                    esc, Brain.esc = nil, nil
+                local prevDir = esc and esc.dir
+                if esc then
+                    local done = now > esc.untilT or FlatDist(esc.goal, pos) < 1.2
+                    if not done and now - (esc.checkedAt or 0) > 0.15 then
+                        esc.checkedAt = now
+                        local liveReal = Haz.Live(Haz.real)
+                        done = Haz.BoxClear(esc.goal, true, liveReal) < 0
+                            or Haz.OnPath(pos, esc.goal, liveReal)
+                    end
+                    if done then esc, Brain.esc = nil, nil end
                 end
-                if here0 < 0 and not esc then
-                    local p = Brain.Escape(pos, near, tgt and anchor or nil, tgt and spellR or nil)
+                if here0 < 0 and not esc and now - (Brain.escAt or 0) > 0.5 then
+                    local p = Brain.Escape(pos, near, tgt and anchor or nil,
+                        tgt and spellR or nil, prevDir)
                     if p then
-                        esc = {goal = p, untilT = now + FlatDist(p, pos) / 10 + 1.5}
-                        Brain.esc = esc
+                        local dir = Flat(p - pos)
+                        esc = {goal = p, untilT = now + FlatDist(p, pos) / 10 + 1.5,
+                               dir = dir.Magnitude > 0.1 and dir.Unit or nil}
+                        Brain.esc, Brain.escAt = esc, now
                     end
                 end
                 local spot, here
@@ -9208,7 +9438,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.2 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.3 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
