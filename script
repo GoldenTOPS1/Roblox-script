@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.10
+--  DQR AUTO FARM v13.11
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -273,6 +273,13 @@ local CONFIG = {
     -- (beyond HitboxPad) it likes the box to stay from any edge.
     Weave          = true,
     WeaveClear     = 4,
+    -- BLINKING HAZARDS (the Crystal Golem's flashing purple circle): a
+    -- footprint that vanishes is still avoided for HazardHold seconds;
+    -- one that came back after vanishing is a blinker, avoided through
+    -- every off-flash until it has stayed gone BlinkHold seconds - and
+    -- never walked through. 0 / 0 = off.
+    HazardHold     = 0.4,
+    BlinkHold      = 2.5,
     -- Parts that make up ONE attack (a purple beam is several layered
     -- parts) are merged into one hazard when their footprints match
     -- within this many studs. 0 = off.
@@ -4244,7 +4251,76 @@ function Haz.Scan(pos)
     end
     ScanBeams(pos, reach)
     ScanAdorns(pos, reach)
+    pcall(Haz.Remember, now)
     if CONFIG.HazardDebug then pcall(Haz.Draw, pos) end
+end
+
+-- BLINKING HAZARDS (v13.11). The Crystal Golem's purple crystal rings
+-- itself with a circle that flashes on and off for five seconds. Each
+-- sweep only saw what was showing at that instant, so every "off" the
+-- bot walked in, and every "on" it walked back out - over and over.
+-- Now every footprint is remembered by where and how big it is:
+--  - one that vanishes is still kept for HazardHold seconds (the first
+--    blink, before it is known to be a blinker);
+--  - one that COMES BACK where it vanished is a blinker: it is kept
+--    through every off-phase, until it has stayed gone BlinkHold
+--    seconds - fully over - and it is never walked through, even when
+--    it shows see-through.
+-- Kept footprints are labelled "blinking - kept out until it stays gone".
+Haz.mem = {}
+function Haz.Remember(now)
+    local hold, bhold = CONFIG.HazardHold or 0, CONFIG.BlinkHold or 0
+    local mem = Haz.mem
+    if hold <= 0 and bhold <= 0 then table.clear(mem) return end
+    -- A boss just died: what it left blinking is over.
+    if Mobs.bossDiedAt and now - Mobs.bossDiedAt < 1 then table.clear(mem) end
+    -- 1. What is showing now.
+    local n = #Haz.real
+    for i = 1, n do
+        local h = Haz.real[i]
+        local m = nil
+        for _, e in ipairs(mem) do
+            if Haz.SameShape(e.h, h, 3) then m = e break end
+        end
+        if m then
+            if m.offSince then
+                m.blinks = m.blinks + 1                 -- it came back
+                if m.blinks == 1 and CONFIG.HazardDebug then
+                    print(("[DQR] Blinking hazard (%s) - keeping out until it stays gone %.1fs.")
+                        :format(h.src and h.src.Name or Describe(h), bhold))
+                end
+            end
+            m.offSince = nil
+        elseif #mem < 200 then
+            m = {blinks = 0}
+            mem[#mem + 1] = m
+        end
+        if m then
+            if m.blinks > 0 then h.warn = false end     -- a blinker is never crossed
+            local c = {}
+            for k, v in pairs(h) do c[k] = v end
+            m.h, m.seen = c, now
+        end
+    end
+    -- 2. What has gone: kept a moment - a blinker until it stays gone.
+    for i = #mem, 1, -1 do
+        local m = mem[i]
+        if m.seen ~= now then
+            m.offSince = m.offSince or now
+            local keep = m.blinks > 0 and bhold or hold
+            if now - m.offSince > keep then
+                table.remove(mem, i)
+            else
+                local c = {}
+                for k, v in pairs(m.h) do c[k] = v end
+                c.held, c.ghost, c.warn = true, nil, false
+                c.why = m.blinks > 0 and "blinking - kept out until it stays gone"
+                        or "just vanished - held a moment"
+                Haz.shapes[#Haz.shapes + 1] = c
+                Haz.real[#Haz.real + 1] = c
+            end
+        end
+    end
 end
 
 do
@@ -9825,7 +9901,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.10 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.11 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
