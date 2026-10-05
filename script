@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.3
+--  DQR AUTO FARM v13.4
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -245,6 +245,13 @@ local CONFIG = {
     -- parts) are merged into one hazard when their footprints match
     -- within this many studs. 0 = off.
     HazardMerge    = 2.5,
+    -- RINGS: an attack part whose own name contains one of these is a
+    -- ring - only its band, RingBand studs wide, hurts; the middle and
+    -- the gaps between rings are safe (Odin's thirdBossMultiRings). Raise
+    -- RingBand if the bot gets clipped by the edge of a ring, lower it if
+    -- it refuses gaps that are clearly safe.
+    RingNames      = {"ring", "shockwave"},
+    RingBand       = 10,
     -- WARNING vs LIVE. Many attacks (the purple and red strips) are drawn
     -- see-through first - the warning - and go solid when they hit. A
     -- footprint at least WarnAlpha transparent (but still visible) is a
@@ -1209,12 +1216,29 @@ Haz.GENERIC = {part = true, meshpart = true, union = true, unionoperation = true
     main = true, center = true, centre = true, root = true, core = true,
     hitbox = true, precast = true, debris = true, projectile = true, ball = true,
     sphere = true, beam = true, wedge = true, cylinder = true, block = true}
+-- v13.4: never a 3D-modelling default ("Cube.013", "Plane", "Circle.001",
+-- "NurbsPath.015") or a body part ("RightUpperArm.008") - armour is made
+-- of those, and a respawn taught it dozens of them; a boss mesh with
+-- the same default name would then have been ignored.
+Haz.GENERIC_PATTERNS = {
+    "^cube", "^plane", "^circle", "^cylinder", "^sphere", "^icosphere", "^uvsphere",
+    "^cone", "^torus", "^nurbs", "^bezier", "^mesh", "^text", "^curve", "^object",
+    "^left", "^right", "^upper", "^lower", "^head", "^torso", "^hand", "^foot",
+    "^arm", "^leg", "^accessory", "^hat", "^hair", "^spawn", "^dqr_", "^%w+%.%d+$",
+}
 function Haz.LearnableName(n)
     if not n or #n < 5 then return false end
     local l = n:lower()
     if Haz.GENERIC[(l:gsub("%d", ""))] then return false end
+    for _, pat in ipairs(Haz.GENERIC_PATTERNS) do
+        if l:find(pat) then return false end
+    end
     for _, frag in ipairs(CONFIG.HazardNames) do
         if l:find(frag, 1, true) then return false end
+    end
+    -- A player's name: those are already caught by name.
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if l:find(pl.Name:lower(), 1, true) then return false end
     end
     return true
 end
@@ -1223,7 +1247,19 @@ function Haz.LearnSpell(o)
     local n = o.Name
     if Haz.spellNames[n] or Haz.spellFar[n] or not Haz.LearnableName(n) then return end
     if Haz.spellCounted[o] then return end            -- this part already counted
+    -- Not in the first seconds after a respawn or teleport: armour and
+    -- the like appear around the new body then, looking like a cast.
+    if tick() - (Haz.jumpAt or 0) < 4 then return end
+    -- Part of someone's character (armour, accessories): not a spell.
+    local m = o:FindFirstAncestorOfClass("Model")
+    if m and Players:GetPlayerFromCharacter(m) then return end
     Haz.spellCounted[o] = true
+    -- Counted once per CAST, not per part: one cast is often a dozen
+    -- parts with the same name, which reached "3" in one go.
+    Haz.spellLastAt = Haz.spellLastAt or {}
+    local now = tick()
+    if now - (Haz.spellLastAt[n] or 0) < 0.6 then return end
+    Haz.spellLastAt[n] = now
     Haz.spellCount[n] = (Haz.spellCount[n] or 0) + 1
     if Haz.spellCount[n] >= 3 then
         Haz.spellNames[n] = true
@@ -1297,7 +1333,10 @@ local function HookCharacter(pl, char)
 end
 local function HookPlayer(pl)
     if pl.Character then HookCharacter(pl, pl.Character) end
-    pl.CharacterAdded:Connect(function(c) HookCharacter(pl, c) end)
+    pl.CharacterAdded:Connect(function(c)
+        if pl == LP then Haz.jumpAt = tick() end    -- respawn: no spell learning for a moment
+        HookCharacter(pl, c)
+    end)
 end
 for _, pl in ipairs(Players:GetPlayers()) do HookPlayer(pl) end
 Players.PlayerAdded:Connect(HookPlayer)
@@ -3247,6 +3286,9 @@ local function Describe(h)
     if h.kind == "disc" then return ("disc r=%d"):format(h.r) end
     if h.kind == "ball" then return ("ball r=%d"):format(h.r) end
     if h.kind == "box" then return ("box %dx%d"):format(h.hx * 2, h.hz * 2) end
+    if h.kind == "arc" then
+        return ("%s R=%d band=%d"):format(h.dx and "half ring" or "ring", h.r, h.band)
+    end
     return ("line len=%d r=%d"):format((h.b - h.a).Magnitude, h.r)
 end
 
@@ -3331,6 +3373,12 @@ local function Ghost(h)
         else
             g.x, g.z, g.r = h.x + shift.X, h.z + shift.Z, h.r + math.max(d1, d2)
         end
+    elseif h.kind == "arc" then
+        -- An expanding ring: the band widened outward by the growth, so
+        -- the whole sweep of the next DodgeLead seconds counts.
+        local grow = math.max(d1, d2)
+        g.x, g.z = h.x + shift.X, h.z + shift.Z
+        g.r, g.band = h.r + grow, h.band + grow
     elseif h.kind == "box" then
         g.cf, g.hx, g.hz = h.cf + shift, h.hx + d1, h.hz + d2
     else
@@ -3415,6 +3463,13 @@ end
 function Haz.SameShape(e, h, tol)
     local dx, dz = e.bx - h.bx, e.bz - h.bz
     if math.abs(e.br - h.br) > tol or dx * dx + dz * dz > tol * tol then return false end
+    -- Rings only merge with rings facing the same way (two half rings
+    -- back to back are a full ring, not one half).
+    if (e.kind == "arc") ~= (h.kind == "arc") then return false end
+    if e.kind == "arc" then
+        if (e.dx == nil) ~= (h.dx == nil) then return false end
+        if e.dx and e.dx * h.dx + e.dz * h.dz < 0.9 then return false end
+    end
     local ey = e.y or (e.a and e.a.Y) or 0
     local hy = h.y or (h.a and h.a.Y) or 0
     if math.abs(ey - hy) > 10 then return false end
@@ -3468,12 +3523,25 @@ local function Add(h)
         Bound(g)
         Haz.shapes[#Haz.shapes + 1] = g
     end
+    -- An attack well away from every player is a mob's: its name is never
+    -- learned as a spell ('genericNeonBall' was, after it went off near us).
+    if h.src and h.src:IsA("BasePart") and Haz.SeenFar then
+        local far = true
+        for _, c in ipairs(chars) do
+            local r = c:FindFirstChild("HumanoidRootPart")
+            if r and FlatDist(r.Position, h.src.Position) < 15 then far = false break end
+        end
+        if far then Haz.SeenFar(h.src) end
+    end
     if CONFIG.HazardDebug and h.src then
+        -- Once per NAME and shape every 5s, not once per part: six mages
+        -- firing put eighteen identical lines a second in the log.
         local now = tick()
-        if not censusAt[h.src] or now - censusAt[h.src] > 5 then
-            censusAt[h.src] = now
-            print(("[DQR] Hazard %s <- %s (%s)")
-                :format(Describe(h), h.src:GetFullName(), h.src.ClassName))
+        local key = h.src.Name .. "|" .. h.kind .. "|" .. (h.why or "")
+        if not censusAt[key] or now - censusAt[key] > 5 then
+            censusAt[key] = now
+            print(("[DQR] Hazard %s%s <- %s (%s)")
+                :format(Describe(h), h.warn and " [warning]" or "", h.src:GetFullName(), h.src.ClassName))
         end
     end
 end
@@ -3496,8 +3564,59 @@ local function AddBall(c, r, src)
     Add({kind = "ball", x = c.X, y = c.Y, z = c.Z, r = r, huge = r > HUGE, src = src})
 end
 
--- A part's flat footprint, padded: a disc when round, a box otherwise.
+-- RINGS. A ring-shaped attack (a part named like one in RingNames -
+-- Odin's thirdBossMultiRings.ring) is hollow: only its band hurts.
+-- Taken as a box, Odin's 211x106 half ring covered the whole arena, the
+-- bot found "no clean exit" and stood in it until it died - while the
+-- gaps between the rings were safe the whole time.
+-- About square from above = a full ring round the part's centre. About
+-- twice as wide as deep = a half ring, whose circle's centre is the
+-- middle of one long edge: the edge nearer a part named "center" beside
+-- it, else nearer the mob that cast it.
+function Haz.AddArc(o, pad)
+    local lname = o.Name:lower()
+    local hit = false
+    for _, frag in ipairs(CONFIG.RingNames or {}) do
+        if lname:find(frag, 1, true) then hit = true break end
+    end
+    if not hit then return false end
+    local height, a, b, va = Footprint(o)
+    local long, short = math.max(a, b), math.min(a, b)
+    if long < 12 then return false end
+    local band = (CONFIG.RingBand or 10) + pad
+    local R = long / 2 + pad
+    local c, dir = o.Position, nil
+    if short < long * 0.75 then
+        local ax = a >= b and Vector3.new(-va.Z, 0, va.X) or Vector3.new(va.X, 0, va.Z)
+        if ax.Magnitude < 0.01 then return false end
+        ax = ax.Unit
+        local c1, c2 = o.Position - ax * (short / 2), o.Position + ax * (short / 2)
+        local ref = nil
+        local par = o.Parent
+        local cp = par and par ~= workspace and (par:FindFirstChild("center")
+            or par:FindFirstChild("Center") or par:FindFirstChild("middle"))
+        if cp and cp:IsA("BasePart") then ref = cp.Position end
+        if not ref then
+            local best = math.huge
+            for _, m in ipairs(owners) do
+                local d = FlatDist(m.p, o.Position)
+                if d < best then best, ref = d, m.p end
+            end
+        end
+        if not ref then return false end           -- no idea which side: a box
+        if FlatDist(c1, ref) <= FlatDist(c2, ref) then c, dir = c1, ax
+        else c, dir = c2, -ax end
+    end
+    Haz.why = dir and "half ring (only the band hurts)" or "ring (only the band hurts)"
+    Add({kind = "arc", x = c.X, y = o.Position.Y, z = c.Z, r = R, band = math.min(band, R),
+         hy = height / 2, dx = dir and dir.X, dz = dir and dir.Z, huge = false, src = o})
+    return true
+end
+
+-- A part's flat footprint, padded: a disc when round, a box otherwise -
+-- or a ring (see Haz.AddArc).
 local function AddFootprint(o, pad)
+    if Haz.AddArc(o, pad) then return end
     local height, a, b, va = Footprint(o)
     if math.abs(a - b) < 2 then
         AddDisc(o.Position, math.max(a, b) / 2 + pad, height / 2, o)
@@ -4116,6 +4235,23 @@ local function ShapeClear(h, p)
         local cy = math.clamp(h.y, p.Y - 3, p.Y + 2)
         local dx, dy, dz = p.X - h.x, cy - h.y, p.Z - h.z
         return math.sqrt(dx * dx + dy * dy + dz * dz) - h.r
+    elseif h.kind == "arc" then
+        -- A ring: only the band between r - band and r hurts; the hole
+        -- in the middle and everything outside are clear.
+        if math.abs(p.Y - h.y) < math.max(8, (h.hy or 0) + 5) then
+            local dx, dz = p.X - h.x, p.Z - h.z
+            local d = math.sqrt(dx * dx + dz * dz)
+            local inner = h.r - h.band
+            local radial = math.max(d - h.r, inner - d)
+            if not h.dx then return radial end
+            -- Half ring: the band on its own side of the diameter; behind
+            -- that line, the distance to the band's two cut ends.
+            local along = dx * h.dx + dz * h.dz
+            if along >= 0 then return radial end
+            local side = math.abs(dx * -h.dz + dz * h.dx)
+            local ex = side - math.clamp(side, math.max(inner, 0), h.r)
+            return math.sqrt(ex * ex + along * along)
+        end
     else
         local ab = h.b - h.a
         local len2 = ab:Dot(ab)
@@ -4357,6 +4493,12 @@ end
 local function ShapeCentre(h)
     if h.kind == "box" then return h.cf.Position end
     if h.kind == "line" then return (h.a + h.b) / 2 end
+    if h.kind == "arc" then
+        -- On the band itself, not in the empty middle.
+        local dx, dz = h.dx or 1, h.dz or 0
+        local m = h.r - h.band / 2
+        return Vector3.new(h.x + dx * m, h.y, h.z + dz * m)
+    end
     return Vector3.new(h.x, h.y, h.z)
 end
 
@@ -6081,10 +6223,14 @@ function Nav.SmartPlan(from, to)
     end
     local function H(p) return FlatDist(p, to) * 1.15 end   -- a little greedy: faster
 
+    -- "Closest reachable" for a partial plan counts height left too (x2):
+    -- across the ground alone, the closest spot to a target up on a
+    -- platform is right under it - a dead end.
+    local function Left(p) return FlatDist(p, to) + math.abs(p.Y - to.Y) * 2 end
     local sk = Key(0, 0)
     g[sk], pos[sk], ix_[sk], iz_[sk] = 0, from, 0, 0
     Push(sk, H(from))
-    local bestK, bestH = sk, FlatDist(from, to)
+    local bestK, bestH = sk, Left(from)
     local reached, expanded = nil, 0
     local DIRS = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}}
 
@@ -6096,7 +6242,8 @@ function Nav.SmartPlan(from, to)
             if expanded % 60 == 0 then task.wait() end
             local p = pos[k]
             local hd = FlatDist(p, to)
-            if hd < bestH then bestK, bestH = k, hd end
+            local left = Left(p)
+            if left < bestH then bestK, bestH = k, left end
             if k == goalK and goalInGrid and math.abs(p.Y - to.Y) <= CONFIG.WaypointReachY + 2 then
                 reached = k
                 break
@@ -6136,7 +6283,7 @@ function Nav.SmartPlan(from, to)
     local full = reached ~= nil
     if endK == sk then return nil, false, expanded end
     -- Partial: only worth walking if it actually gets us somewhere.
-    if not full and bestH > FlatDist(from, to) - cell * 2 then return nil, false, expanded end
+    if not full and bestH > Left(from) - cell * 2 then return nil, false, expanded end
 
     local chain = {}
     local k = endK
@@ -6179,19 +6326,23 @@ function Nav.PathLen(from, wps)
     return len, a
 end
 
--- Keep the route in hand instead of `wps`? Yes when it still ends near
--- the goal, steps into no hazard, and is not clearly longer than the
--- new one (old route + the bit from its end to the goal, against the
--- new route, with 20% and 6 studs of slack).
+-- Keep the route in hand instead of `wps`? Each is scored as its length
+-- plus what is LEFT from its end to the goal - height left counting
+-- double, so a route that climbs the stairs beats one that ends under
+-- the platform. The old one stays unless it walks into something live
+-- or the new one is clearly better (15% and 6 studs of slack).
 function Nav.KeepOld(pos, goal, wps)
     local q = Nav.queue
     if #q == 0 then return false end
-    local oldLen, oldEnd = Nav.PathLen(pos, q)
-    local gap = (goal - oldEnd).Magnitude
-    if gap > (CONFIG.RouteKeep or 30) then return false end
     if Nav.RouteCrosses(pos, q, 4, true) then return false end
-    local newLen = Nav.PathLen(pos, wps)
-    return oldLen + gap <= newLen * 1.2 + 6
+    local function Left(e)
+        return FlatDist(goal, e) + math.abs(goal.Y - e.Y) * 2
+    end
+    local oldLen, oldEnd = Nav.PathLen(pos, q)
+    local newLen, newEnd = Nav.PathLen(pos, wps)
+    local oldCost = oldLen + Left(oldEnd) * 1.5
+    local newCost = newLen + Left(newEnd) * 1.5
+    return oldCost <= newCost * 1.15 + 6
 end
 
 -- ShowPath: small dots on each waypoint of the route in hand.
@@ -6237,14 +6388,23 @@ local function ComputePath(from, to)
     local now = tick()
     -- No Roblox route: our own planner, which also knows walk-through
     -- (baseplate-mode) walls and every step it probed.
+    -- v13.4: a goal on ANOTHER LEVEL that is beyond the planner's grid is
+    -- left to the stair finder below - and the planner's "closest
+    -- reachable" fallback is never used for one. That fallback is the
+    -- spot under the platform: it is closest across the ground and a dead
+    -- end. The route flipped between it and the stairs every replan (the
+    -- stair finder only runs every 0.8s), and the bot walked toward the
+    -- stairs, back, toward them again...
     local partial = nil
-    if CONFIG.SmartPath then
+    local otherLevel = math.abs(to.Y - from.Y) > CONFIG.JumpMax
+    local inGrid = FlatDist(from, to) <= (CONFIG.SmartRadius or 90) - (CONFIG.SmartCell or 4)
+    if CONFIG.SmartPath and (inGrid or not otherLevel) then
         local smart, full = Nav.SmartPlan(from, to)
         if smart and full then
             pathFails, detourTo = 0, nil
             return smart
         end
-        partial = smart
+        if not otherLevel then partial = smart end
     end
     -- The goal is up a level and there is no route: take the stairs,
     -- straight away, instead of steering at the goal or searching the
@@ -6266,7 +6426,9 @@ local function ComputePath(from, to)
             return lead
         end
     end
-    if pathFails < 2 then return partial end
+    -- (nil = keep walking the route in hand; a partial plan only once
+    -- everything else below has failed too)
+    if pathFails < 2 then return nil end
 
     -- On a detour already: re-aim at the same spot rather than search
     -- again, or each search from a slightly different position picks a
@@ -6276,7 +6438,7 @@ local function ComputePath(from, to)
         if r then return r end
         detourTo = nil
     end
-    if now < nextDetour then return partial end
+    if now < nextDetour then return nil end
     nextDetour = now + 1.2
 
     local mid, soft = {{2, 60}}, {{1.5, 70}}
@@ -7041,7 +7203,20 @@ function Brain.Escape(pos, near, anchor, spellR, prevDir)
     local best, bestS = nil, math.huge
     local maxD = CONFIG.EscapeMax or 24
     local clearNeed = math.max(CONFIG.EvadeClear or 0.5, 0)
+    -- v13.4: its OWN list, out to the full search distance. The caller's
+    -- reached 22 studs and exits were looked for out to 24: an exit could
+    -- sit inside a hazard it had never been told about.
+    near = Haz.Near(pos, maxD + 2)
     local live = Haz.Live(near)
+    -- Mobs in the way: walking into one's body got it stuck there.
+    local bodies = {}
+    for _, rec in ipairs(Mobs.list or {}) do
+        pcall(function()
+            if rec.Humanoid.Health > 0 and FlatDist(rec.Root.Position, pos) < maxD + 15 then
+                bodies[#bodies + 1] = {p = rec.Root.Position, r = (rec.Radius or 2) + 3}
+            end
+        end)
+    end
     local wc, lc = CONFIG.WarnCrossCost or 1.5, CONFIG.LiveCrossCost or 10
     for i = 0, 23 do
         local a = i * math.pi / 12
@@ -7057,6 +7232,12 @@ function Brain.Escape(pos, near, anchor, spellR, prevDir)
                     if f > spellR then s = s + (f - spellR) * 1.5 end
                 end
                 if prevDir then s = s - u:Dot(prevDir) * 3 end
+                for _, b in ipairs(bodies) do
+                    -- Flat distance from the mob to the walk pos -> p.
+                    local t = math.clamp(((b.p.X - pos.X) * u.X + (b.p.Z - pos.Z) * u.Z) / d, 0, 1)
+                    local q = pos + u * (d * t)
+                    if FlatDist(b.p, q) < b.r then s = s + 25 end
+                end
                 if s < bestS and LineClear(pos, p) and HasGround(p) and GroundOnPath(pos, p) then
                     best, bestS = p, s
                 end
@@ -7951,9 +8132,11 @@ function Brain.Tick(root)
                     local done = now > esc.untilT or FlatDist(esc.goal, pos) < 1.2
                     if not done and now - (esc.checkedAt or 0) > 0.15 then
                         esc.checkedAt = now
-                        local liveReal = Haz.Live(Haz.real)
-                        done = Haz.BoxClear(esc.goal, true, liveReal) < 0
-                            or Haz.OnPath(pos, esc.goal, liveReal)
+                        -- v13.4: ANY real hazard on the exit itself (a warning
+                        -- there turns live while we stand in it); only a live
+                        -- one across the walk.
+                        done = Haz.BoxClear(esc.goal, true, Haz.real) < 0
+                            or Haz.OnPath(pos, esc.goal, Haz.Live(Haz.real))
                     end
                     if done then esc, Brain.esc = nil, nil end
                 end
@@ -9438,7 +9621,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.3 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.4 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
