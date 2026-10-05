@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.4
+--  DQR AUTO FARM v13.6
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -86,6 +86,9 @@ local CONFIG = {
     HideWeapon     = false,
     StripTextures  = true,
     LowerGraphics  = true,
+    -- Frame-rate cap, set at load through the executor's setfpscap.
+    -- 0 = uncapped; nil = leave it alone. (Roblox's default is 60.)
+    FpsCap         = 144,
     ShowLog        = false,  -- log window starts hidden; F7 shows it
     ShowDest       = true,   -- green ball where the bot is heading
     -- The map itself, on your screen only:
@@ -152,6 +155,20 @@ local CONFIG = {
     -- BuffDuration to how long your buff lasts. 0 = never hold E.
     BuffHoldE      = true,
     BuffDuration   = 0,
+    -- STRICT Q -> E: every E needs a Q that went off AFTER the last E -
+    -- Q, E, Q, E, never E, E. After pressing Q the bot waits to SEE Q's
+    -- cooldown start before pressing E; if Q did not go off, no E. If
+    -- your E recharges faster than Q, this casts E once per Q (most
+    -- damage per E, fewer E's); false = E fires whenever it is ready and
+    -- Q is cooling (then BuffHoldE / BuffDuration decide).
+    StrictQE       = true,
+    -- WAIT FOR COOLDOWNS (mobs only, never a boss): with the next mob
+    -- out of range and Q or E still recharging, stand and wait for both
+    -- before walking over, so the next pack is opened with a full Q -> E
+    -- volley. Dodging still happens while waiting. CooldownWaitMax caps
+    -- one wait, in case the HUD is misread.
+    WaitForCooldowns = true,
+    CooldownWaitMax  = 10,
     -- RANGE CIRCLE: a flat green ring on the floor round your character
     -- at the distance E starts casting from (AttackRange + CastSlack).
     -- Anything whose edge is inside the ring gets hit with E. It turns
@@ -293,7 +310,7 @@ local CONFIG = {
     --                         spell, a leftover, decoration, spent...).
     --   green "SAFE ZONE"   - a place to stand.
     -- Also logs each hazard's source, as before.
-    HazardDebug    = false,
+    HazardDebug    = true,
     HazardLabelMax = 40,     -- most labels on screen at once
     HazardLabelRange = 80,   -- labels further from you than this are hidden
 
@@ -7018,22 +7035,57 @@ function DoSpell(dist, range, aimAt)
             if volley then return end
             volley = true
             pcall(function()
-                local qr = Brain.qReady
-                if qr ~= false then
-                    -- Ready (or the HUD cannot be read): buff first, give
-                    -- it BuffLead to land, then attack.
-                    FireKey(CONFIG.BuffKey or Enum.KeyCode.Q)
+                local qKey = CONFIG.BuffKey or Enum.KeyCode.Q
+                local eKey = CONFIG.AttackKey or Enum.KeyCode.E
+                local qr, er = Brain.qReady, Brain.eReady
+                -- E recharging: nothing to press - and no Q either, or the
+                -- buff would be spent before E can use it.
+                if er == false then return end
+                local function PressE()
+                    Brain.holdingE = false
+                    FireKey(eKey)
+                    -- Unreadable E slot: the press is the best guess of a cast.
+                    if Brain.eReady == nil then Brain.eCastAt = tick() end
+                end
+                if qr == nil then
+                    -- Q slot not read yet (it shows a number only once used):
+                    -- Q, a moment for it to land, then E.
+                    FireKey(qKey)
                     lastBuff = tick()
                     S(CONFIG.BuffLead or 0.25)
-                elseif CONFIG.BuffHoldE and (CONFIG.BuffDuration or 0) > 0
-                and tick() - (Brain.qCastAt or 0) > CONFIG.BuffDuration then
-                    -- The buff has worn off and Q is still cooling down:
-                    -- hold E for it.
+                    PressE()
+                    return
+                end
+                if qr == true then
+                    -- Q ready: cast it, and WAIT TO SEE it go off (its
+                    -- cooldown starts) before E. A Q the game ignored (mid-
+                    -- animation, stunned) used to be followed by E anyway.
+                    local before = Brain.qCastAt or 0
+                    FireKey(qKey)
+                    lastBuff = tick()
+                    local t0 = tick()
+                    while (Brain.qCastAt or 0) <= before and tick() - t0 < 0.8 do S(0.05) end
+                    if (Brain.qCastAt or 0) <= before then
+                        Brain.holdingE = true      -- Q did not go off: no E
+                        return
+                    end
+                    S(CONFIG.BuffLead or 0.25)
+                    PressE()
+                    return
+                end
+                -- Q recharging.
+                if CONFIG.StrictQE and (Brain.qCastAt or 0) <= (Brain.eCastAt or 0) then
+                    -- E already had its turn since the last Q: wait for Q.
                     Brain.holdingE = true
                     return
                 end
-                Brain.holdingE = false
-                FireKey(CONFIG.AttackKey or Enum.KeyCode.E)
+                if CONFIG.BuffHoldE and (CONFIG.BuffDuration or 0) > 0
+                and tick() - (Brain.qCastAt or 0) > CONFIG.BuffDuration then
+                    -- The buff has worn off and Q is still cooling down.
+                    Brain.holdingE = true
+                    return
+                end
+                PressE()
             end)
             volley = false
         elseif CONFIG.SpellMode == "both" then
@@ -7065,76 +7117,116 @@ function Brain.Buff()
     task.spawn(FireKey, CONFIG.BuffKey or Enum.KeyCode.Q)
 end
 
--- THE Q SLOT. The hotbar shows the key letter under each slot and a
--- cooldown number on it while it recharges. Found by the letter (the
--- BuffKey's name, "Q"), then the number label nearest above it.
--- Brain.qReady: true = ready, false = cooling down, nil = unknown (then
--- Q is simply pressed first every time). Brain.qCastAt: when the number
--- last appeared or jumped up - the moment Q went off.
-Brain.qReady, Brain.qCastAt = nil, 0
+-- WAIT FOR COOLDOWNS (mobs only): true while Q or E is recharging, for
+-- at most CooldownWaitMax seconds of one wait. A wait is "one" while it
+-- is asked about continuously (a gap of half a second starts a new one).
+function Brain.CooldownsBusy(now)
+    if not (CONFIG.WaitForCooldowns and CONFIG.BuffQ) then return false end
+    if now - (Brain.cdAskedAt or 0) > 0.5 then Brain.cdWaitSince = nil end
+    Brain.cdAskedAt = now
+    local busy = Brain.qReady == false or Brain.eReady == false
+    if not busy then Brain.cdWaitSince = nil return false end
+    Brain.cdWaitSince = Brain.cdWaitSince or now
+    return now - Brain.cdWaitSince <= (CONFIG.CooldownWaitMax or 10)
+end
+
+-- THE Q AND E SLOTS. The hotbar shows the key letter under each slot
+-- and a cooldown number on it while it recharges. Both letters are
+-- found (BuffKey's and AttackKey's names), and every number label is
+-- given to the letter it sits nearest - so on a narrow screen E's
+-- number can no longer be taken for Q's (v13.5 looked for Q's alone,
+-- and took the nearest number within 140 pixels, whichever it was).
+-- Brain.qReady / eReady: true = ready, false = recharging, nil = not
+-- read yet (a slot shows a number only once it has been used).
+-- Brain.qCastAt / eCastAt: when its number last appeared or jumped up -
+-- the moment that spell went off.
+Brain.qReady, Brain.qCastAt, Brain.eReady, Brain.eCastAt = nil, 0, nil, 0
 task.spawn(function()
-    local cdLabel, keyLabel, scanAt, last, said = nil, nil, 0, nil, false
+    local slots = {
+        q = {field = "q", label = nil, last = nil},
+        e = {field = "e", label = nil, last = nil},
+    }
+    local scanAt, said = 0, false
     local function Num(o)
         return o.Visible and tonumber((o.Text:gsub("%s", ""))) or nil
     end
     local function Centre(o)
         return o.AbsolutePosition + o.AbsoluteSize / 2
     end
+    local function Scan()
+        local pg = LP:FindFirstChildOfClass("PlayerGui")
+        local cam = workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize
+        if not (pg and vp) then return end
+        local qL = (CONFIG.BuffKey or Enum.KeyCode.Q).Name:upper()
+        local eL = (CONFIG.AttackKey or Enum.KeyCode.E).Name:upper()
+        local qs, es, nums = {}, {}, {}
+        for _, o in ipairs(pg:GetDescendants()) do
+            if o:IsA("TextLabel") and not (LogGui and o:IsDescendantOf(LogGui))
+            and not o.Name:find("^DQR_") then
+                local c = Centre(o)
+                if c.Y > vp.Y * 0.55 then
+                    local t = o.Text:gsub("%s", "")
+                    if t:upper() == qL then qs[#qs + 1] = o
+                    elseif t:upper() == eL then es[#es + 1] = o
+                    elseif tonumber(t) then nums[#nums + 1] = o end
+                end
+            end
+        end
+        -- Each letter: the one nearest the bottom middle of the screen.
+        local function Pick(list)
+            table.sort(list, function(a, b)
+                return math.abs(Centre(a).X - vp.X / 2) < math.abs(Centre(b).X - vp.X / 2)
+            end)
+            return list[1]
+        end
+        local qk, ek = Pick(qs), Pick(es)
+        local function Assign(slot, key, other)
+            if not key or (slot.label and slot.label.Parent) then return end
+            local kc = Centre(key)
+            local oc = other and Centre(other)
+            local best, bestD = nil, 160
+            for _, o in ipairs(nums) do
+                local c = Centre(o)
+                local d = (c - kc).Magnitude
+                -- Above (or level with) its letter, nearer it than the other.
+                if c.Y <= kc.Y + 5 and d < bestD and (not oc or d < (c - oc).Magnitude) then
+                    best, bestD = o, d
+                end
+            end
+            if best then slot.label, slot.last = best, nil end
+        end
+        Assign(slots.q, qk, ek)
+        Assign(slots.e, ek, qk)
+    end
     while true do
         S(0.1)
         local now = tick()
         if not CONFIG.BuffQ then
-            Brain.qReady = nil
+            Brain.qReady, Brain.eReady = nil, nil
         else
-            if (not keyLabel or not keyLabel.Parent or not cdLabel or not cdLabel.Parent)
-            and now - scanAt > 2 then
+            local missing = not (slots.q.label and slots.q.label.Parent)
+                         or not (slots.e.label and slots.e.label.Parent)
+            if missing and now - scanAt > 2 then
                 scanAt = now
-                pcall(function()
-                    local pg = LP:FindFirstChildOfClass("PlayerGui")
-                    local cam = workspace.CurrentCamera
-                    local vp = cam and cam.ViewportSize
-                    if not (pg and vp) then return end
-                    local letter = (CONFIG.BuffKey or Enum.KeyCode.Q).Name:upper()
-                    local keys, nums = {}, {}
-                    for _, o in ipairs(pg:GetDescendants()) do
-                        if o:IsA("TextLabel") and not (LogGui and o:IsDescendantOf(LogGui)) then
-                            local c = Centre(o)
-                            if c.Y > vp.Y * 0.55 then
-                                local t = o.Text:gsub("%s", "")
-                                if t:upper() == letter then keys[#keys + 1] = o
-                                elseif tonumber(t) then nums[#nums + 1] = o end
-                            end
-                        end
-                    end
-                    -- The letter label nearest the bottom middle.
-                    table.sort(keys, function(a, b)
-                        return math.abs(Centre(a).X - vp.X / 2) < math.abs(Centre(b).X - vp.X / 2)
-                    end)
-                    keyLabel = keys[1]
-                    if not keyLabel then return end
-                    local kc, best, bestD = Centre(keyLabel), nil, 140
-                    for _, o in ipairs(nums) do
-                        local c = Centre(o)
-                        local d = (c - kc).Magnitude
-                        if c.Y <= kc.Y + 5 and d < bestD then best, bestD = o, d end
-                    end
-                    if best then cdLabel = best end
-                end)
+                pcall(Scan)
             end
-            if cdLabel and cdLabel.Parent then
-                local v = Num(cdLabel)
-                local ready = not v or v <= 0
-                if v and v > 0 and (last == nil or v > last + 0.5) then Brain.qCastAt = now end
-                last = v
-                Brain.qReady = ready
-                if not said then
-                    said = true
-                    print("[DQR] Q slot found on the HUD - Q goes first, E waits on it.")
+            for _, slot in pairs(slots) do
+                local o = slot.label
+                if o and o.Parent then
+                    local v = Num(o)
+                    if v and v > 0 and (slot.last == nil or v > slot.last + 0.5) then
+                        Brain[slot.field .. "CastAt"] = now
+                    end
+                    slot.last = v
+                    Brain[slot.field .. "Ready"] = not v or v <= 0
+                else
+                    Brain[slot.field .. "Ready"] = nil
                 end
-            else
-                -- Not found yet: it only shows a number once Q has been
-                -- used, so keep looking; until then press Q first anyway.
-                Brain.qReady = nil
+            end
+            if not said and slots.q.label and slots.e.label then
+                said = true
+                print("[DQR] Q and E cooldowns found on the HUD - strict Q -> E.")
             end
         end
     end
@@ -8007,6 +8099,14 @@ function Brain.Tick(root)
             goal = Nav.SafeStep(pos, away, ring - flat + 2)
             desire = goal or (pos + away.Unit * (ring - flat + 2))
             state = goal and ("Backing off " .. name) or ("Fighting " .. name)
+        elseif flat > ring + CONFIG.HoldSlack and not tgt.Boss and tgt.Model ~= Mobs.barModel
+        and dist > spellR + CONFIG.CastSlack and Brain.CooldownsBusy(now) then
+            -- WaitForCooldowns: the next mob is out of range and Q or E is
+            -- still recharging - stand here until both are ready, then go
+            -- and open on it with a full Q -> E. Never for a boss.
+            desire = pos
+            state = ("Waiting for Q/E cooldowns before %s"):format(name)
+            if prog then prog.since = now end         -- waiting is not being stuck
         elseif flat > ring + CONFIG.HoldSlack then
             local pt, crosses = RingPoint(pos, anchor, ring, tgt.Model)
             desire = pt
@@ -9621,7 +9721,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.4 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.6 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -9629,6 +9729,20 @@ task.spawn(function()
     -- Captures CONFIG as written; every farm start re-applies from it.
     Prof.Apply()
     NukeGraphics()
+    -- FPS cap: the executor's setfpscap (Roblox itself offers no way).
+    if CONFIG.FpsCap ~= nil then
+        local cap = Env("setfpscap")
+        if typeof(cap) ~= "function" then
+            pcall(function() cap = getgenv().setfpscap end)
+        end
+        if typeof(cap) == "function" then
+            local ok = pcall(cap, CONFIG.FpsCap)
+            print(ok and ("[DQR] FPS cap set to %s."):format(CONFIG.FpsCap == 0 and "uncapped"
+                or tostring(CONFIG.FpsCap)) or "[DQR] setfpscap failed - FPS cap unchanged.")
+        else
+            print("[DQR] This executor has no setfpscap - FPS cap unchanged.")
+        end
+    end
     S(2.5)
 
     -- Watchers first. They used to start only after the lobby decision
