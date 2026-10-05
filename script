@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.7
+--  DQR AUTO FARM v13.9
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -24,8 +24,8 @@ local CONFIG = {
     -- The dungeon to run. This also picks the settings: whatever that
     -- dungeon's entry in MAP_PROFILES (further down) says is used for
     -- the run, on top of the defaults in this CONFIG block.
-    TargetDungeon  = "Northern Lands",
-    Difficulty     = "Insane",
+    TargetDungeon  = "Enchanted Forest",
+    Difficulty     = "Nightmare",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
 
@@ -149,22 +149,28 @@ local CONFIG = {
     -- without the buff when Q is ready. The Q slot's cooldown number on
     -- the HUD is read to know when Q is ready.
     BuffLead       = 0.25,
-    -- BuffHoldE = true: while Q is cooling down AND more than
-    -- BuffDuration seconds have passed since Q was cast (the buff has
-    -- worn off), E waits for Q instead of firing unbuffed. Set
-    -- BuffDuration to how long your buff lasts. 0 = never hold E.
+    -- BUFF WINDOW: E only fires while Q's buff is running, and not in its
+    -- last BuffEndMargin seconds (so E lands buffed). Outside the window
+    -- E waits for the next Q - cast the moment it is ready, always first.
+    -- HOW LONG THE BUFF LASTS is MEASURED (BuffMeasure): Enhanced Inner
+    -- Rage raises your walking speed, so the bot times speed-up to speed-
+    -- down after each Q and uses that (the log says "Q buff measured").
+    -- BuffDuration is only the starting guess until the first
+    -- measurement: Q's whole cycle is ~5.5s and the buff ends ~2.5s
+    -- before Q is ready, so ~3s. BuffHoldE = false: no window.
     BuffHoldE      = true,
-    BuffDuration   = 0,
-    -- STRICT Q -> E: every E needs a Q that went off AFTER the last E -
-    -- Q, E, Q, E, never E, E. After pressing Q the bot waits to SEE Q's
-    -- cooldown start before pressing E; if Q did not go off, no E. If
-    -- your E recharges faster than Q, this casts E once per Q (most
-    -- damage per E, fewer E's); false = E fires whenever it is ready and
-    -- Q is cooling (then BuffHoldE / BuffDuration decide).
-    StrictQE       = true,
+    BuffDuration   = 3,
+    BuffMeasure    = true,
+    BuffEndMargin  = 0.4,
+    -- STRICT Q -> E: at most ONE E per Q (Q, E, Q, E). Not needed for "Q
+    -- before E" while the buff window is on - every E is inside a Q's
+    -- buff anyway - and it costs E's when E recharges faster than Q.
+    -- false = E as often as it recharges inside the window (most damage).
+    -- Either way, after pressing Q the bot waits to SEE it go off before E.
+    StrictQE       = false,
     -- WAIT FOR COOLDOWNS (mobs only, never a boss): with the next mob
-    -- out of range and E unable to fire yet (recharging, or - StrictQE -
-    -- still waiting on its Q), stand and wait before walking over, so
+    -- out of range and E unable to fire yet (recharging, or waiting for
+    -- the next Q's buff), stand and wait before walking over, so
     -- the next pack is opened with E. Q's own cooldown is NOT waited on:
     -- Q is re-cast the moment it is ready to keep the buff up. Dodging
     -- still happens while waiting. CooldownWaitMax caps one wait, in
@@ -312,7 +318,7 @@ local CONFIG = {
     --                         spell, a leftover, decoration, spent...).
     --   green "SAFE ZONE"   - a place to stand.
     -- Also logs each hazard's source, as before.
-    HazardDebug    = true,
+    HazardDebug    = false,
     HazardLabelMax = 40,     -- most labels on screen at once
     HazardLabelRange = 80,   -- labels further from you than this are hidden
 
@@ -7081,9 +7087,9 @@ function DoSpell(dist, range, aimAt)
                     Brain.holdingE = true
                     return
                 end
-                if CONFIG.BuffHoldE and (CONFIG.BuffDuration or 0) > 0
-                and tick() - (Brain.qCastAt or 0) > CONFIG.BuffDuration then
-                    -- The buff has worn off and Q is still cooling down.
+                if not Brain.BuffUp() then
+                    -- The buff is over (or in its last BuffEndMargin) and Q
+                    -- is still recharging: E waits for the next Q.
                     Brain.holdingE = true
                     return
                 end
@@ -7128,12 +7134,29 @@ end
 -- wait all over again. What matters is whether E could fire on arrival:
 -- E recharged, and (StrictQE) not still owed a Q - the Q that comes
 -- next frees it, so that wait always ends.
+-- Q's buff still running, with at least BuffEndMargin seconds left -
+-- timed from when Q's cooldown last started (Brain.qCastAt). The length
+-- is the MEASURED one (Brain.buffLen, see the speed watch below) once
+-- there is one, else BuffDuration. With neither, the live speed reading
+-- decides. Always true with BuffHoldE off.
+function Brain.BuffUp()
+    if not CONFIG.BuffHoldE then return true end
+    local since = tick() - (Brain.qCastAt or 0)
+    local len = (CONFIG.BuffMeasure ~= false and Brain.buffLen) or CONFIG.BuffDuration
+    if len and len > 0 then return len - since >= (CONFIG.BuffEndMargin or 0) end
+    if Brain.baseSpeed then return Brain.buffOn == true end
+    return true
+end
 function Brain.EUsable()
     if Brain.eReady == false then return false end
-    if CONFIG.StrictQE and Brain.qReady == false
-    and (Brain.qCastAt or 0) <= (Brain.eCastAt or 0) then
-        return false
+    if Brain.qReady == false then
+        -- Q recharging: E must still be owed (StrictQE) and inside the buff.
+        if CONFIG.StrictQE and (Brain.qCastAt or 0) <= (Brain.eCastAt or 0) then
+            return false
+        end
+        if not Brain.BuffUp() then return false end
     end
+    -- Q ready (or unread): it goes first, so E will be buffed.
     return true
 end
 function Brain.CooldownsBusy(now)
@@ -7242,7 +7265,37 @@ task.spawn(function()
             end
             if not said and slots.q.label and slots.e.label then
                 said = true
-                print("[DQR] Q and E cooldowns found on the HUD - strict Q -> E.")
+                print("[DQR] Q and E cooldowns found on the HUD - Q goes first, E inside its buff.")
+            end
+            -- THE BUFF, MEASURED. Enhanced Inner Rage raises walking speed.
+            -- While Q is READY the buff is not running (it ends before Q
+            -- recharges), so the speed then is the normal one. The buff is
+            -- on while speed is 10%+ above that; when it drops back, the
+            -- time since Q went off is how long the buff lasted.
+            local hum = GetHuman()
+            if hum and hum.Health > 0 then
+                local ws = hum.WalkSpeed
+                if Brain.qReady == true and ws > 0 then Brain.baseSpeed = ws end
+                local base = Brain.baseSpeed
+                if base and base > 0 and ws > 0 then
+                    local on = ws >= base * 1.1
+                    if Brain.buffOn and not on then
+                        local len = now - (Brain.qCastAt or now)
+                        if len > 0.5 and len < 30 then
+                            local old = Brain.buffLen
+                            -- Smoothed: one late reading does not move it far.
+                            Brain.buffLen = old and (old * 0.6 + len * 0.4) or len
+                            if not old or math.abs(Brain.buffLen - old) > 0.5 then
+                                print(("[DQR] Q buff measured: lasts %.1fs (speed %.0f -> %.0f). "
+                                    .. "E only inside it, not in its last %.1fs.")
+                                    :format(Brain.buffLen, base, Brain.buffPeak or ws,
+                                        CONFIG.BuffEndMargin or 0))
+                            end
+                        end
+                    end
+                    if on then Brain.buffPeak = math.max(Brain.buffOn and Brain.buffPeak or 0, ws) end
+                    Brain.buffOn = on
+                end
             end
         end
     end
@@ -9738,7 +9791,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.7 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.9 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
