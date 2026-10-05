@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.11
+--  DQR AUTO FARM v13.12
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -181,9 +181,11 @@ local CONFIG = {
     -- toward the next one and only stops once the nearest mob is within
     -- StageDistance studs - outside spell range (AttackRange + CastSlack
     -- = 50 for a Mage) and, hopefully, outside their aggro. When E is
-    -- ready it walks the rest of the way in. Raise it if mobs still come
-    -- running at the bot while it waits; lower it to stop closer.
-    StageDistance    = 60,
+    -- ready it walks the rest of the way in. If a mob ends up more than 8
+    -- studs inside this while it waits (it overshot, or they wandered
+    -- closer), it steps back out. Raise it if mobs still come running at
+    -- the bot while it waits; lower it to stop closer (keep it above 50).
+    StageDistance    = 80,
     -- RANGE CIRCLE: a flat green ring on the floor round your character
     -- at the distance E starts casting from (AttackRange + CastSlack).
     -- Anything whose edge is inside the ring gets hit with E. It turns
@@ -8270,7 +8272,7 @@ function Brain.Tick(root)
             state = goal and ("Backing off " .. name) or ("Fighting " .. name)
         elseif flat > ring + CONFIG.HoldSlack and not tgt.Boss and tgt.Model ~= Mobs.barModel
         and dist > spellR + CONFIG.CastSlack
-        and Brain.NearestMob(pos) <= (CONFIG.StageDistance or 60) + (Brain.stagePrev and 10 or 0)
+        and Brain.NearestMob(pos) <= (CONFIG.StageDistance or 80) + (Brain.stagePrev and 10 or 0)
         and Brain.CooldownsBusy(now) then
             -- WaitForCooldowns: E cannot fire yet, and we have walked up to
             -- StageDistance of the next pack - hold here, short of them,
@@ -8278,9 +8280,16 @@ function Brain.Tick(root)
             -- that, the approach below carries on walking meanwhile. (Q
             -- keeps being re-cast for the buff; its cooldown is not waited
             -- on.) Never for a boss.
+            -- v13.12: more than 8 studs too close (overshot, or they drifted
+            -- toward us): step back out, away from the target.
             Brain.staging = true
-            desire = pos
-            state = ("Waiting short of %s for E's cooldown"):format(name)
+            if Brain.NearestMob(pos) < (CONFIG.StageDistance or 80) - 8 then
+                local away = Flat(pos - anchor)
+                if away.Magnitude > 0.5 then goal = Nav.SafeStep(pos, away, 10) end
+            end
+            desire = goal or pos
+            state = (goal and "Backing away from %s while E recharges"
+                     or "Waiting short of %s for E's cooldown"):format(name)
             if prog then prog.since = now end         -- waiting is not being stuck
         elseif flat > ring + CONFIG.HoldSlack then
             local pt, crosses = RingPoint(pos, anchor, ring, tgt.Model)
@@ -9901,7 +9910,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.11 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.12 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
