@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.9
+--  DQR AUTO FARM v13.10
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -177,6 +177,13 @@ local CONFIG = {
     -- case the HUD is misread.
     WaitForCooldowns = true,
     CooldownWaitMax  = 10,
+    -- ...and it does not wait where the last pack died: it keeps walking
+    -- toward the next one and only stops once the nearest mob is within
+    -- StageDistance studs - outside spell range (AttackRange + CastSlack
+    -- = 50 for a Mage) and, hopefully, outside their aggro. When E is
+    -- ready it walks the rest of the way in. Raise it if mobs still come
+    -- running at the bot while it waits; lower it to stop closer.
+    StageDistance    = 60,
     -- RANGE CIRCLE: a flat green ring on the floor round your character
     -- at the distance E starts casting from (AttackRange + CastSlack).
     -- Anything whose edge is inside the ring gets hit with E. It turns
@@ -7159,6 +7166,19 @@ function Brain.EUsable()
     -- Q ready (or unread): it goes first, so E will be buffed.
     return true
 end
+-- Straight-line distance to the edge of the nearest living mob (any mob,
+-- not just the target - a pack's nearest member is what notices us).
+function Brain.NearestMob(pos)
+    local best = math.huge
+    for _, rec in ipairs(Mobs.list or {}) do
+        local ok, d = pcall(function()
+            if rec.Humanoid.Health <= 0 or Mobs.Banned(rec.Model) then return nil end
+            return (rec.Root.Position - pos).Magnitude - (rec.Radius or 0)
+        end)
+        if ok and d and d < best then best = d end
+    end
+    return best
+end
 function Brain.CooldownsBusy(now)
     if not (CONFIG.WaitForCooldowns and CONFIG.BuffQ) then return false end
     if now - (Brain.cdAskedAt or 0) > 0.5 then Brain.cdWaitSince = nil end
@@ -8157,6 +8177,10 @@ function Brain.Tick(root)
     -- 3. Positioning against the target. `desire` is where we would like
     -- to be; the weaving pass takes it from there when hazards are near.
     local desire = nil
+    -- Staging (WaitForCooldowns): whether last tick was spent holding short
+    -- of the next pack - it then holds until the nearest mob is 10 studs
+    -- further than StageDistance, so it does not stop-start on the line.
+    Brain.stagePrev, Brain.staging = Brain.staging, false
     if not goal and tgt then
         if blocked or stranded then
             desire = pos
@@ -8169,13 +8193,18 @@ function Brain.Tick(root)
             desire = goal or (pos + away.Unit * (ring - flat + 2))
             state = goal and ("Backing off " .. name) or ("Fighting " .. name)
         elseif flat > ring + CONFIG.HoldSlack and not tgt.Boss and tgt.Model ~= Mobs.barModel
-        and dist > spellR + CONFIG.CastSlack and Brain.CooldownsBusy(now) then
-            -- WaitForCooldowns: the next mob is out of range and E cannot
-            -- fire yet - stand here until it can, then go and open on it.
-            -- (Q keeps being re-cast for the buff meanwhile; its cooldown
-            -- is not waited on.) Never for a boss.
+        and dist > spellR + CONFIG.CastSlack
+        and Brain.NearestMob(pos) <= (CONFIG.StageDistance or 60) + (Brain.stagePrev and 10 or 0)
+        and Brain.CooldownsBusy(now) then
+            -- WaitForCooldowns: E cannot fire yet, and we have walked up to
+            -- StageDistance of the next pack - hold here, short of them,
+            -- until it can; then go in and open on them. Further off than
+            -- that, the approach below carries on walking meanwhile. (Q
+            -- keeps being re-cast for the buff; its cooldown is not waited
+            -- on.) Never for a boss.
+            Brain.staging = true
             desire = pos
-            state = ("Waiting for E's cooldown before %s"):format(name)
+            state = ("Waiting short of %s for E's cooldown"):format(name)
             if prog then prog.since = now end         -- waiting is not being stuck
         elseif flat > ring + CONFIG.HoldSlack then
             local pt, crosses = RingPoint(pos, anchor, ring, tgt.Model)
@@ -8190,6 +8219,11 @@ function Brain.Tick(root)
                 goal = (now < wob.detourUntil) and pt or SafeApproach(pos, pt)
                 if goal == pt then
                     state = ("Approaching %s (%d studs)"):format(name, math.floor(dist / 5) * 5)
+                    -- Walking up while E recharges: it will stop short.
+                    if CONFIG.WaitForCooldowns and CONFIG.BuffQ and not tgt.Boss
+                    and tgt.Model ~= Mobs.barModel and not Brain.EUsable() then
+                        state = state .. " - E recharging, will stop short"
+                    end
                 elseif goal then
                     state = ("Approaching %s round a hazard"):format(name)
                 else
@@ -9791,7 +9825,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.9 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.10 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
