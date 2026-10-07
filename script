@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.27
+--  DQR AUTO FARM v13.28
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -9744,6 +9744,48 @@ function Hud.Text(frag)
     return hit
 end
 
+-- The EXP bar's text ("370.07B/5.65T"). Not found by name (the HUD's
+-- labels are not called "exp") but by what it says: a "number/number"
+-- label in the HUD panel that is not the HP bar - that one is ruled out
+-- by name, and by its max matching the Humanoid's MaxHealth. One beside
+-- an "EXP" / "XP" tag, or under something named exp / xp / level, wins.
+function Hud.ExpText()
+    local byName = Hud.Text("exp")
+    if byName and byName:find("/", 1, true) then return byName end
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    local root = pg and pg:FindFirstChild("playerStatus")
+    if not root then return nil end
+    local hum = GetHuman()
+    local maxHp = hum and hum.MaxHealth or 0
+    local best, bestScore = nil, -1
+    pcall(function()
+        for _, o in ipairs(root:GetDescendants()) do
+            if o:IsA("TextLabel") then
+                local a, b = o.Text:match("^%s*([%d%.,]+%a*)%s*/%s*([%d%.,]+%a*)%s*$")
+                if a then
+                    local p = o.Parent
+                    local names = (o.Name .. " " .. (p and p.Name or "") .. " "
+                        .. (p and p.Parent and p.Parent.Name or "")):lower()
+                    local score = 0
+                    local bv = Hud.ParseShort(b)
+                    if names:find("hp", 1, true) or names:find("health", 1, true) then score = -10 end
+                    if bv and maxHp > 0 and math.abs(bv - maxHp) <= maxHp * 0.01 then score = -10 end
+                    if names:find("xp", 1, true) or names:find("exp", 1, true)
+                    or names:find("level", 1, true) then score = score + 5 end
+                    for _, sib in ipairs(p and p:GetChildren() or {}) do
+                        if sib ~= o and sib:IsA("TextLabel") then
+                            local st = Norm(sib.Text)
+                            if st == "exp" or st == "xp" then score = score + 5 end
+                        end
+                    end
+                    if score > bestScore then best, bestScore = o.Text, score end
+                end
+            end
+        end
+    end)
+    return best
+end
+
 -- leaderstats first (the real value), the HUD label second. The
 -- vanity spoofer rewrites HUD text, so a spoofed name or level would
 -- otherwise end up in the status post.
@@ -9913,7 +9955,7 @@ function Farm.StatusWatcher()
                 end
                 -- EXP as "current / to next level", the HUD's own bar text
                 -- ("370.07B/5.65T") read as numbers, with how far along.
-                local expTxt = Hud.Text("exp")
+                local expTxt = Hud.ExpText()
                 local ea, eb = tostring(expTxt or ""):match("^%s*([^/]+)/%s*(.-)%s*$")
                 local cur, max = Hud.ParseShort(ea), Hud.ParseShort(eb)
                 if cur and max and max > 0 then
@@ -11101,7 +11143,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.27 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.28 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
