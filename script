@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.30
+--  DQR AUTO FARM v13.33
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -24,7 +24,7 @@ local CONFIG = {
     -- The dungeon to run. This also picks the settings: whatever that
     -- dungeon's entry in MAP_PROFILES (further down) says is used for
     -- the run, on top of the defaults in this CONFIG block.
-    TargetDungeon  = "Northern Lands",
+    TargetDungeon  = "Enchanted Forest",
     Difficulty     = "Nightmare",
     Hardcore       = false,  -- true = also press HARDCORE MODE
     AutoRunDungeon = true,   -- queue runs from the lobby by itself
@@ -217,6 +217,11 @@ local CONFIG = {
     --   "hide" - the same look, but walls keep their collision.
     --   "off"  - leave the map alone.
     MapMode        = "baseplate",
+    -- Never hidden or made walk-through by the map look, whatever the
+    -- mode: anything whose name, or a folder above it, contains one of
+    -- these (a boss's own pieces - Bob the Frost Giant's crystals, the
+    -- orbs that chase you). Add more if something that matters vanishes.
+    MapKeepNames   = {"boss", "orb", "crystal"},
     -- FakeFloor = true brings back the old baseplate: terrain deleted and
     -- one flat floor laid at the spawn's height. Looks flatter, but
     -- wherever the real ground is lower you walk on air as far as the
@@ -548,6 +553,10 @@ local CONFIG = {
     --   Bosses = {["Lava King"] = {CircleRadius = 22, MinRange = 12}}
     -- (CircleRadius / MinRange / AttackRange, any of them).
     Bosses         = {},
+    -- Cover mechanic (set per dungeon in MAP_PROFILES): while an orb
+    -- matching Cover.Orbs is out and Cover.Boss is up, stand behind the
+    -- crystal (under Cover.Crystals) of the orb's colour. nil = none.
+    Cover          = nil,
 
     -- ---- MOVEMENT ----------------------------------------------
     -- SMART PATHING: the bot plans its own route on a grid round you
@@ -764,9 +773,23 @@ local MAP_PROFILES = {
         -- Bosses closer, and only cast at from inside AttackRange
         -- (measured from the edge of the body).
         Bosses    = {
-            ["Midgardian Champion"] = {CircleRadius = 18, MinRange = 10, AttackRange = 45},
+            -- v13.31: kept well BACK. Its strips fan out from its body in a
+            -- circle, and at 18 studs the gaps between them were too narrow
+            -- to stand in - the bot walked in while none were up and died
+            -- when they came. At ~40 the gaps are wider, and E (45, +5 slack,
+            -- measured to the edge of the body) still lands: it stays
+            -- between MinRange 33 and CircleRadius 40 (+4), casting all the
+            -- while.
+            ["Midgardian Champion"] = {CircleRadius = 40, MinRange = 33, AttackRange = 45},
             ["Bob The Frost Giant"] = {CircleRadius = 18, MinRange = 10, AttackRange = 45},
         },
+        -- Bob the Frost Giant's orb chases you; standing behind the crystal
+        -- of the orb's colour (the crystal between you and the orb) stops
+        -- it. Name patterns (lowercase Lua patterns) for the orb and the
+        -- crystals' model, among the workspace's children; Gap = studs
+        -- behind the crystal's edge.
+        Cover     = {Boss = "Bob The Frost Giant", Orbs = "secondboss.*orb",
+                     Crystals = "secondbosscrystals", Gap = 3.5},
         Warrior   = {CircleRadius = 15, MeleeRange = 16, MinRange = 10, AttackRange = 35},
         Tank      = {CircleRadius = 8,  MeleeRange = 16, MinRange = 4,  AttackRange = 30},
         Mage      = {CircleRadius = 26, MinRange = 15, AttackRange = 45},
@@ -5647,9 +5670,12 @@ end
 
 -- Under a map folder, and not part of a creature.
 local function IsScenery(o, want)
+    -- A boss's own pieces never (CONFIG.MapKeepNames; Look.Kept, below).
+    if Look.Kept and Look.Kept(o.Name) then return false end
     local n, depth = o.Parent, 0
     while n and n ~= workspace and depth < 14 do
         if n:IsA("Model") and IsCreature(n) then return false end
+        if Look.Kept and Look.Kept(n.Name) then return false end
         if want[n.Name:lower()] then return true end
         n, depth = n.Parent, depth + 1
     end
@@ -5823,8 +5849,25 @@ local plane = nil
 -- folder, an effect, a tool, or ours.
 local SKIP_WORDS = {"enem", "mob", "effect", "fx", "debris", "projectile",
                     "attack", "spell", "drop", "loot", "ignore"}
+-- v13.32: a boss's own pieces are never scenery - Bob the Frost Giant's
+-- coloured crystals (cover you need to see and stand behind) and the
+-- orbs that chase you (they hurt) were hidden as props, the crystals
+-- made walk-through too. Checked on the part's OWN name as well as its
+-- folders': secondBossYellowOrb sits straight in the workspace.
+-- CONFIG.MapKeepNames: these words, plus any you add.
+function Look.Kept(name)
+    local l = name:lower()
+    for _, w in ipairs(SKIP_WORDS) do
+        if l:find(w, 1, true) then return true end
+    end
+    for _, w in ipairs(CONFIG.MapKeepNames or {}) do
+        if l:find(tostring(w):lower(), 1, true) then return true end
+    end
+    return false
+end
 local function IsWorldScenery(o)
     if o.Name:sub(1, 4) == "DQR_" then return false end
+    if Look.Kept(o.Name) then return false end
     local n, depth = o.Parent, 0
     while n and n ~= workspace do
         if n:IsA("Camera") or n:IsA("Tool") or n:IsA("Accessory") or n:IsA("Terrain") then
@@ -5833,10 +5876,7 @@ local function IsWorldScenery(o)
         if n:IsA("Model") and (IsCreature(n) or Players:GetPlayerFromCharacter(n)) then
             return false
         end
-        local l = n.Name:lower()
-        for _, w in ipairs(SKIP_WORDS) do
-            if l:find(w, 1, true) then return false end
-        end
+        if Look.Kept(n.Name) then return false end
         n, depth = n.Parent, depth + 1
         if depth > 24 then return false end
     end
@@ -8427,6 +8467,96 @@ end
 -- underneath instead of up the stairs. Tries closer spots on each
 -- heading, then the floor at the target's feet. Returns spot,
 -- crossesHazard.
+-- COVER (CONFIG.Cover, set in a dungeon profile). Bob the Frost Giant
+-- sends a coloured orb after you, and what stops it is standing BEHIND
+-- the crystal of the same colour - the crystal between you and the orb.
+-- While such an orb is out (and the boss is about), returns where to
+-- stand - on the far side of the matching crystal from the orb, on solid
+-- floor - and the colour, else nil. The orb and the crystals are found
+-- among the workspace's own children (that is where they live), by the
+-- name patterns in CONFIG.Cover; the colour by name ("Yellow" in
+-- secondBossYellowOrb, a crystal called "green"), else by tint.
+Brain.COLOR_WORDS = {"yellow", "green", "blue", "red", "purple", "orange", "pink",
+                     "white", "cyan", "black"}
+function Brain.ColorWord(name)
+    local l = tostring(name or ""):lower()
+    for _, w in ipairs(Brain.COLOR_WORDS) do
+        if l:find(w, 1, true) then return w end
+    end
+    return nil
+end
+function Brain.CoverSpot(pos)
+    local cv = CONFIG.Cover
+    if type(cv) ~= "table" then return nil end
+    local now = tick()
+    local m = Brain.coverMemo
+    if m and now - m.t < 0.25 and (m.pos - pos).Magnitude < 3 then return m.spot, m.what end
+    m = {t = now, pos = pos}
+    Brain.coverMemo = m
+    -- Only while that boss is up.
+    if cv.Boss then
+        local up = false
+        for _, rec in ipairs(Mobs.list or {}) do
+            local ok, yes = pcall(function()
+                return Norm(rec.Model.Name) == Norm(cv.Boss) and rec.Humanoid.Health > 0
+            end)
+            if ok and yes then up = true break end
+        end
+        if not up then return nil end
+    end
+    local orbPat, cryPat = tostring(cv.Orbs or "orb"):lower(), tostring(cv.Crystals or "crystal"):lower()
+    local orb, orbD, crystals = nil, math.huge, {}
+    for _, o in ipairs(workspace:GetChildren()) do
+        local l = o.Name:lower()
+        if l:match(orbPat) then
+            local part = o:IsA("BasePart") and o or o:FindFirstChildWhichIsA("BasePart", true)
+            if part and VisTrans(part) < 0.95 then
+                local d = FlatDist(part.Position, pos)
+                if d < orbD and d < (cv.Range or 200) then orb, orbD = part, d end
+            end
+        elseif l:match(cryPat) then
+            local list = o:IsA("BasePart") and {o} or o:GetDescendants()
+            for _, c in ipairs(list) do
+                if c:IsA("BasePart") and VisTrans(c) < 0.95 then crystals[#crystals + 1] = c end
+            end
+        end
+    end
+    if not orb or #crystals == 0 then return nil end
+    -- The orb's colour; the crystal of that colour (by name, else tint -
+    -- hue within 8%); the nearest of those.
+    local want = Brain.ColorWord(orb.Name)
+        or (orb.Parent ~= workspace and Brain.ColorWord(orb.Parent and orb.Parent.Name))
+    local oh = orb.Color:ToHSV()
+    local best, bestScore = nil, math.huge
+    for _, c in ipairs(crystals) do
+        local word = Brain.ColorWord(c.Name)
+        local score
+        if want and word then
+            score = word == want and 0 or math.huge
+        else
+            local ch = c.Color:ToHSV()
+            local dh = math.abs(ch - oh)
+            dh = math.min(dh, 1 - dh)
+            score = dh <= 0.08 and dh * 100 or math.huge
+        end
+        if score < math.huge then
+            score = score + FlatDist(c.Position, pos) * 0.01
+            if score < bestScore then best, bestScore = c, score end
+        end
+    end
+    if not best then return nil end
+    -- Behind it: on the far side from the orb.
+    local cpos = best.Position
+    local away = Vector3.new(cpos.X - orb.Position.X, 0, cpos.Z - orb.Position.Z)
+    if away.Magnitude < 0.5 then away = Vector3.new(cpos.X - pos.X, 0, cpos.Z - pos.Z) end
+    if away.Magnitude < 0.5 then return nil end
+    local r = math.max(best.Size.X, best.Size.Z) / 2
+    local spot = cpos + away.Unit * (r + (cv.Gap or 3.5))
+    spot = FloorNear(Vector3.new(spot.X, pos.Y, spot.Z), orb) or Vector3.new(spot.X, pos.Y, spot.Z)
+    m.spot, m.what = spot, want or "matching"
+    return spot, m.what
+end
+
 local ringCache = {t = 0}
 local function RingPoint(pos, anchor, ring, model)
     local now = tick()
@@ -8917,7 +9047,23 @@ function Brain.Tick(root)
     -- of the next pack - it then holds until the nearest mob is 10 studs
     -- further than StageDistance, so it does not stop-start on the line.
     Brain.stagePrev, Brain.staging = Brain.staging, false
-    if not goal and tgt then
+    -- COVER (CONFIG.Cover): an orb out after us and a crystal of its
+    -- colour - stand behind the crystal. Ahead of the normal positioning
+    -- (only a projectile dodge outranks it); spells keep going at
+    -- whatever is in range, and the weaving pass below still steers clear
+    -- of other hazards on the way there.
+    local coverOn = false
+    if not goal and CONFIG.Cover then
+        local spot, what = Brain.CoverSpot(pos)
+        if spot then
+            coverOn = true
+            desire = spot
+            if FlatDist(spot, pos) > 2 then goal = spot end
+            state = ("Taking cover behind the %s crystal"):format(what)
+            if prog then prog.since = now end         -- hiding is not being stuck
+        end
+    end
+    if not goal and tgt and not coverOn then
         if blocked or stranded then
             desire = pos
             state = stranded and ("Casting at " .. name .. " from range")
@@ -8982,8 +9128,8 @@ function Brain.Tick(root)
         if not desire then desire = pos end
     end
 
-    -- 4. Nothing to fight.
-    if not tgt then
+    -- 4. Nothing to fight (and not hiding behind a crystal).
+    if not tgt and not coverOn then
         if now - lastNoTarget > 5 then
             lastNoTarget = now
             print(("[DQR] No target. %d mob(s) in the scan."):format(#Mobs.list))
@@ -9107,8 +9253,11 @@ function Brain.Tick(root)
                         return
                     end
                 else
-                    spot, here = Weave(pos, desire or goal, near, tgt and anchor or nil,
-                        tgt and spellR or nil, tgt and minR or nil, cap)
+                    -- Taking cover: no pull toward spell range - the crystal
+                    -- is where to be.
+                    local fight = tgt and not coverOn
+                    spot, here = Weave(pos, desire or goal, near, fight and anchor or nil,
+                        fight and spellR or nil, fight and minR or nil, cap)
                 end
                 if esc then
                     goal, direct = esc.goal, true
@@ -11546,7 +11695,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.30 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.33 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
