@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.26
+--  DQR AUTO FARM v13.27
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -120,10 +120,10 @@ local CONFIG = {
     -- Which rarities are worth a post. An item whose rarity cannot be
     -- read is always posted, so an unknown colour never hides a drop.
     LootRarities   = {
-        Common    = false,
-        Uncommon  = false,
-        Rare      = false,
-        Epic      = false,
+        Common    = true,
+        Uncommon  = true,
+        Rare      = true,
+        Epic      = true,
         Legendary = true,
         Ultimate  = true,
     },
@@ -168,6 +168,9 @@ local CONFIG = {
     -- seconds. Use a different channel from the loot one. "" = off.
     StatusWebhook  = "https://discord.com/api/webhooks/1552146166706339880/_taQGMvg1dmQxDhSWwxSzHGsasOjqNuK86WxwOYyx3QlZGQVdodTgqcXwGGq-H91B1Tg",
     StatusInterval = 5,
+    -- How gold, gems and EXP are written in the status: "both" = short
+    -- over full ("1.07T" / "1,070,000,000,000"), "short", or "full".
+    StatusNumbers  = "both",
 
     -- ---- LOOKS (your screen only) ------------------------------
     SpoofName      = false,
@@ -9666,6 +9669,42 @@ end
 -- (Hud is the module table declared at the top.)
 
 -- 323 -> "5:23", 3725 -> "1:02:05".
+-- 1070000000000 -> "1,070,000,000,000".
+function Hud.Commas(n)
+    n = math.floor(tonumber(n) or 0)
+    local s = ("%.0f"):format(math.abs(n))
+    local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+    return (n < 0 and "-" or "") .. out
+end
+
+-- "1.07T" -> 1.07e12, "113,630" -> 113630; nil if it is not a number.
+function Hud.ParseShort(s)
+    s = tostring(s or ""):gsub("[,%s]", "")
+    -- Not anchored: "EXP 370.07B" (a label with its prefix) still reads.
+    local num, suf = s:match("([%d%.]+)(%a*)")
+    local v = num and tonumber(num)
+    if not v then return nil end
+    if suf ~= "" then
+        local mult = ({k = 1e3, m = 1e6, b = 1e9, t = 1e12, q = 1e15, qd = 1e15,
+                       qa = 1e15, qn = 1e18, qi = 1e18, sx = 1e21})[suf:lower()]
+        if not mult then return nil end
+        v = v * mult
+    end
+    return v
+end
+
+-- A number for the status, the CONFIG.StatusNumbers way: "both" =
+-- "1.07T" over "1,070,000,000,000", "short", or "full".
+function Hud.Num(v)
+    local n = tonumber(v) or Hud.ParseShort(v)
+    if not n then return v end
+    if n < 1000 then return Hud.Commas(n) end
+    local style = CONFIG.StatusNumbers or "both"
+    if style == "short" then return Hud.Short(n) end
+    if style == "full" then return Hud.Commas(n) end
+    return Hud.Short(n) .. "\n" .. Hud.Commas(n)
+end
+
 function Hud.Clock(sec)
     sec = math.max(0, math.floor(tonumber(sec) or 0))
     local h, m, s = math.floor(sec / 3600), math.floor(sec / 60) % 60, sec % 60
@@ -9872,9 +9911,24 @@ function Farm.StatusWatcher()
                     F("HP", ("%s / %s"):format(
                         Hud.Short(human.Health), Hud.Short(human.MaxHealth)))
                 end
-                F("EXP",   Hud.Text("exp"))
-                F("Gold",  Hud.Real("gold"))
-                F("Gems",  Hud.Real("gem") or Hud.Real("diamond"))
+                -- EXP as "current / to next level", the HUD's own bar text
+                -- ("370.07B/5.65T") read as numbers, with how far along.
+                local expTxt = Hud.Text("exp")
+                local ea, eb = tostring(expTxt or ""):match("^%s*([^/]+)/%s*(.-)%s*$")
+                local cur, max = Hud.ParseShort(ea), Hud.ParseShort(eb)
+                if cur and max and max > 0 then
+                    local style = CONFIG.StatusNumbers or "both"
+                    local short = ("%s / %s exp  (%.1f%%)"):format(
+                        cur < 1000 and Hud.Commas(cur) or Hud.Short(cur),
+                        max < 1000 and Hud.Commas(max) or Hud.Short(max), cur / max * 100)
+                    local full = ("%s / %s exp"):format(Hud.Commas(cur), Hud.Commas(max))
+                    F("EXP", style == "short" and short or style == "full" and full
+                        or (short .. "\n" .. full))
+                else
+                    F("EXP", expTxt)
+                end
+                F("Gold",  Hud.Num(Hud.Real("gold")))
+                F("Gems",  Hud.Num(Hud.Real("gem") or Hud.Real("diamond")))
                 -- Runs finished since the script started, and when the next
                 -- every-N-runs sell is due.
                 local runs = ("%d"):format(Farm.runsDone or 0)
@@ -11047,7 +11101,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.26 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.27 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
