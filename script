@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.29
+--  DQR AUTO FARM v13.30
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -102,6 +102,19 @@ local CONFIG = {
     -- starts again from 0 after this many hours with no run (0 = never).
     -- DQR_ResetRuns() in the console zeroes it by hand.
     RunsResetHours = 6,
+
+    -- ---- BREAKS ------------------------------------------------
+    -- true = every BreakEveryMin-BreakEveryMax minutes of farming (a
+    -- random time each break), once the run in progress is over, the bot
+    -- leaves for the lobby, waits BreakMin-BreakMax minutes there (random)
+    -- - selling, if a sell is due - then queues the next run as usual.
+    -- Remembered across servers. "endbreak" in the command box cuts one
+    -- short; "breaknow" takes one after the current run.
+    TakeBreaks     = false,
+    BreakEveryMin  = 45,     -- minutes of farming between breaks...
+    BreakEveryMax  = 90,
+    BreakMin       = 5,      -- ...and how long a break lasts, in minutes
+    BreakMax       = 10,
     LobbyButtonPath = {},       -- e.g. {"mainInterface", "buttons", "lobbyButton"}
     -- SellDryRun = true: walks there, opens the shop and clicks the items,
     -- but does NOT press Sell - the log lists what it would have sold.
@@ -10237,6 +10250,8 @@ function Farm.StatusWatcher()
                 if Farm.parked then
                     doing = ("Parked after a %s - no more runs (DQR_Resume() carries on)")
                         :format(Farm.parked)
+                elseif Farm.breakUntil and os.time() < Farm.breakUntil then
+                    doing = ("On a break - back in %s"):format(Hud.Clock(Farm.breakUntil - os.time()))
                 elseif dead then               doing = "Dead - waiting to respawn"
                 elseif InLobby() then          doing = "In the lobby"
                 elseif lobbyFlowActive then    doing = "Queueing a dungeon"
@@ -10302,6 +10317,12 @@ function Farm.StatusWatcher()
                 F("Run time", rt)
                 F("Deaths", ("%d this run\n%d overall"):format(Farm.runDeaths or 0,
                     Farm.deathsTotal or 0))
+                -- Breaks: when the next one is due (after the run then).
+                if CONFIG.TakeBreaks and Farm.nextBreakAt
+                and not (Farm.breakUntil and os.time() < Farm.breakUntil) then
+                    local left = Farm.nextBreakAt - os.time()
+                    F("Next break", left > 0 and ("in " .. Hud.Clock(left)) or "after this run")
+                end
                 local near = 0
                 for _, rec in ipairs(Mobs.list) do
                     if rec.Flat <= 150 then near = near + 1 end
@@ -11028,7 +11049,8 @@ function Farm.SaveRuns()
     local ok, data = pcall(function()
         return HttpService:JSONEncode({runs = Farm.runsDone, soldAt = Farm.soldAtRun,
             last = Farm.lastRunTime, parked = Farm.parked, won = Farm.runsWon,
-            lost = Farm.runsLost, deaths = Farm.deathsTotal, at = os.time()})
+            lost = Farm.runsLost, deaths = Farm.deathsTotal,
+            breakUntil = Farm.breakUntil, nextBreak = Farm.nextBreakAt, at = os.time()})
     end)
     if not ok then return end
     local wf = Env("writefile")
@@ -11056,6 +11078,10 @@ function Farm.LoadRuns()
     Farm.lastRunTime = tonumber(t.last)
     Farm.runsWon, Farm.runsLost = tonumber(t.won) or 0, tonumber(t.lost) or 0
     Farm.deathsTotal = tonumber(t.deaths) or 0
+    Farm.breakUntil, Farm.nextBreakAt = tonumber(t.breakUntil), tonumber(t.nextBreak)
+    if Farm.breakUntil and os.time() < Farm.breakUntil then
+        print(("[DQR] Mid-break: back to it in %s."):format(Hud.Clock(Farm.breakUntil - os.time())))
+    end
     if type(t.parked) == "string" and t.parked ~= "" then
         Farm.parked = t.parked
         print(("[DQR] Still parked after a %s - no new runs (DQR_Resume() carries on)."):format(t.parked))
@@ -11242,6 +11268,66 @@ function Farm.ReturnToLobby()
     return false
 end
 
+-- BREAKS (TakeBreaks). Every BreakEveryMin-BreakEveryMax minutes (random
+-- each time) the bot takes a break once the run in progress is over:
+-- it leaves for the lobby, waits BreakMin-BreakMax minutes there (random),
+-- then queues the next run as usual. Times are wall-clock (os.time) and
+-- saved with the run count - the lobby is a new server, and the script
+-- starting afresh there must know it is mid-break.
+function Farm.BreakRand(lo, hi)
+    lo, hi = tonumber(lo) or 0, tonumber(hi) or 0
+    if hi < lo then lo, hi = hi, lo end
+    return math.floor(Random.new():NextNumber(lo, hi) * 60)
+end
+function Farm.BreakDue()
+    if not Farm.nextBreakAt then
+        Farm.nextBreakAt = os.time() + Farm.BreakRand(CONFIG.BreakEveryMin or 45, CONFIG.BreakEveryMax or 90)
+        pcall(Farm.SaveRuns)
+        print(("[DQR] Breaks on: next one in about %d min."):format(math.floor((Farm.nextBreakAt - os.time()) / 60)))
+        return false
+    end
+    return os.time() >= Farm.nextBreakAt
+end
+function Farm.StartBreak()
+    local len = Farm.BreakRand(CONFIG.BreakMin or 5, CONFIG.BreakMax or 10)
+    Farm.breakUntil, Farm.breakLeaveTried, Farm.breakSaid = os.time() + len, false, false
+    pcall(Farm.SaveRuns)
+    Farm.statusNow = true
+    print(("[DQR] Taking a break: %s in the lobby, then back to it."):format(Hud.Clock(len)))
+end
+function Farm.EndBreak()
+    Farm.breakUntil = nil
+    Farm.nextBreakAt = os.time() + Farm.BreakRand(CONFIG.BreakEveryMin or 45, CONFIG.BreakEveryMax or 90)
+    pcall(Farm.SaveRuns)
+    Farm.statusNow = true
+    print(("[DQR] Break over - back to the dungeon. Next break in about %d min.")
+        :format(math.floor((Farm.nextBreakAt - os.time()) / 60)))
+end
+-- While on a break: get to the lobby (once - if that fails, the break is
+-- waited out on the Replay screen instead), sell if a sell is due, idle.
+function Farm.OnBreak()
+    if not Farm.RealLobby() and not Farm.breakLeaveTried then
+        Farm.breakLeaveTried = true
+        if not Farm.ReturnToLobby() then
+            print("[DQR] Could not get to the lobby - taking the break here instead.")
+        end
+        return
+    end
+    if Farm.RealLobby() then
+        if Farm.SellDue() then
+            Farm.soldAtRun = Farm.runsDone
+            pcall(Farm.SaveRuns)
+            Sell.Run(true)
+        elseif CONFIG.AutoSell then
+            Sell.Run()
+        end
+    end
+    if not Farm.breakSaid then
+        Farm.breakSaid = true
+        print(("[DQR] On a break - back in %s."):format(Hud.Clock(Farm.breakUntil - os.time())))
+    end
+end
+
 -- RARE DROP: what the Supervisor does instead of the next run while
 -- Farm.parked is set. RareDropLobby: leave for the lobby (once - if that
 -- fails, it stays put rather than replay). RareDropStop: then stop the
@@ -11397,6 +11483,19 @@ local function Supervisor()
                 continue
             end
             if not CONFIG.AutoRunDungeon then continue end
+            -- BREAKS (TakeBreaks): due -> leave for the lobby and wait the
+            -- break out there; over -> carry on below and queue the next run.
+            if CONFIG.TakeBreaks then
+                if Farm.breakUntil and os.time() < Farm.breakUntil then
+                    pcall(Farm.OnBreak)
+                    continue
+                elseif Farm.breakUntil then
+                    Farm.EndBreak()
+                elseif Farm.BreakDue() then
+                    Farm.StartBreak()
+                    continue
+                end
+            end
             -- Selling: AutoSell after every run, SellAfterRuns every
             -- SellEveryRuns runs. The shop is in the REAL lobby, and a run
             -- ends on the dungeon's Replay screen - so first leave (door
@@ -11447,7 +11546,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.29 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.30 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -11741,6 +11840,20 @@ function Farm.RunCommand(text)
     table.sort(list)
     print("[DQR] Commands: " .. table.concat(list, ", "))
     print("[DQR] e.g.  resume  |  resetruns  |  tolobby  |  lobbydump  |  sell  |  selfdestruct")
+end
+
+-- DQR_EndBreak(): cut a break short (the next run is queued straight
+-- away). DQR_BreakNow(): take a break once the current run is over.
+getgenv().DQR_EndBreak   = function()
+    if not Farm.breakUntil then print("[DQR] Not on a break.") return end
+    Farm.breakUntil = os.time()
+    print("[DQR] Break cut short - back to the dungeon.")
+end
+getgenv().DQR_BreakNow   = function()
+    Farm.nextBreakAt = os.time()
+    pcall(Farm.SaveRuns)
+    print("[DQR] A break will start once the current run is over"
+        .. (CONFIG.TakeBreaks and "." or " - but TakeBreaks is off, so turn it on first."))
 end
 
 -- DQR_Resume(): after a rare drop parked the bot, carry on farming.
