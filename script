@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.19
+--  DQR AUTO FARM v13.22
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -50,6 +50,10 @@ local CONFIG = {
     SelfDestructIgnore        = {},      -- e.g. {"MyAltAccount"}
     SelfDestructIgnoreFriends = true,
     SelfDestructFps           = 60,      -- FPS cap put back (nil = leave it)
+    -- Tell Discord when it goes off: the status embed is changed to
+    -- "SELF-DESTRUCT ACTIVATED - manual reset required", and you are
+    -- pinged (DiscordUserId, below) with who joined.
+    SelfDestructNotify        = true,
 
     CarryMode      = false,
     CarryFor       = {"24MINZ"},
@@ -147,6 +151,10 @@ local CONFIG = {
     -- ---- LOOKS (your screen only) ------------------------------
     SpoofName      = false,
     FakeName       = "WOAH2EZ",
+    -- With SpoofName on, also hide your avatar picture in the HUD panel
+    -- (the little player beside your name). DQR_StatusDump() lists the
+    -- panel's pictures if it misses it.
+    SpoofAvatar    = true,
     SpoofLevel     = false,
     FakeLevel      = "99999999",
     HideArmour     = true,
@@ -1315,6 +1323,41 @@ local function VanityPass()
                 end
             end) end
         end
+    end
+    -- SpoofAvatar: the avatar picture beside the name in the HUD, made
+    -- fully transparent - the frame and the level badge on it stay, and
+    -- the self-destruct puts it back. Ours only: a thumbnail of OUR user
+    -- id anywhere on screen, or, in the playerStatus panel, a picture or
+    -- 3D view named like an avatar.
+    if CONFIG.SpoofName and CONFIG.SpoofAvatar ~= false then
+        local uid = tostring(LP.UserId)
+        local pg = LP:FindFirstChildOfClass("PlayerGui")
+        local panel = pg and pg:FindFirstChild("playerStatus")
+        for _, o in ipairs(pg and pg:GetDescendants() or {}) do pcall(function()
+            local isImg = o:IsA("ImageLabel") or o:IsA("ImageButton") or o:IsA("ViewportFrame")
+            if not isImg or o.ImageTransparency >= 1 then return end
+            local hit = false
+            if not o:IsA("ViewportFrame") then
+                local img = tostring(o.Image)
+                local l = img:lower()
+                -- "rbxthumb://type=AvatarHeadShot&id=<id>", ".../headshot-thumbnail/image?userId=<id>"
+                if img:find("[=/]" .. uid .. "%f[%D]")
+                and (l:find("thumb", 1, true) or l:find("headshot", 1, true) or l:find("avatar", 1, true)) then
+                    hit = true
+                end
+            end
+            if not hit and panel and o:IsDescendantOf(panel) then
+                local n = o.Name:lower()
+                for _, w in ipairs({"avatar", "headshot", "thumbnail", "portrait", "pfp",
+                                    "profile", "playerimage", "playericon", "character"}) do
+                    if n:find(w, 1, true) then hit = true break end
+                end
+            end
+            if hit then
+                Farm.Keep(o, "ImageTransparency")
+                o.ImageTransparency = 1
+            end
+        end) end
     end
 end
 
@@ -8846,8 +8889,10 @@ do
 
 -- The executor's HTTP function, under whichever name it uses. The
 -- game's own HttpService cannot be used from a client.
-local function HttpRequest(opts)
-    if Farm.dead then return nil end                 -- self-destructed: no posts
+local function HttpRequest(opts, force)
+    -- Self-destructed: no posts - except `force`, the self-destruct's own
+    -- notice (Hud.SelfDestructNotice).
+    if Farm.dead and not force then return nil end
     for _, name in ipairs({"request", "http_request"}) do
         local fn = Env(name)
         if typeof(fn) == "function" then
@@ -9132,6 +9177,7 @@ function ReportLoot(panel)
             desc[#desc + 1] = ("*%d item%s dropped, all below your rarity filter.*")
                 :format(hidden, hidden == 1 and "" or "s")
         end
+        desc[#desc + 1] = ("Deaths: %d"):format(Farm.runDeaths or 0)
         if #names > 0 then
             desc[#desc + 1] = table.concat(names, "\n")
         elseif dropped == 0 then
@@ -9402,6 +9448,12 @@ function Farm.StatusDump()
         if o:IsA("TextLabel") then
             print(("%s = '%s'"):format(
                 o:GetFullName():gsub("^.*playerStatus%.", ""), o.Text))
+        elseif o:IsA("ImageLabel") or o:IsA("ImageButton") or o:IsA("ViewportFrame") then
+            -- Pictures too: what SpoofAvatar would hide.
+            print(("%s [%s] image=%s transparency=%s"):format(
+                o:GetFullName():gsub("^.*playerStatus%.", ""), o.ClassName,
+                o:IsA("ViewportFrame") and "(3D view)" or tostring(o.Image),
+                tostring(o.ImageTransparency)))
         end
     end
     print("[DQR] === END HUD PANEL ===")
@@ -9556,6 +9608,7 @@ function Farm.StatusWatcher()
                     if Farm.lastRunTime then rt = rt .. "\nlast " .. Hud.Clock(Farm.lastRunTime) end
                 end
                 F("Run time", rt)
+                F("Deaths", ("%d this run"):format(Farm.runDeaths or 0))
                 local near = 0
                 for _, rec in ipairs(Mobs.list) do
                     if rec.Flat <= 150 then near = near + 1 end
@@ -9656,6 +9709,60 @@ function Farm.StatusWatcher()
                 print("[DQR] Status update failed: " .. tostring(err))
             end
         end
+    end
+end
+
+-- SELF-DESTRUCT NOTICE (SelfDestructNotify). The status embed is frozen on
+-- a red "SELF-DESTRUCT ACTIVATED - manual reset required" - the watcher
+-- that kept it current has stopped, and a status that just stops updating
+-- looks like the bot is still fine - and you get pinged (DiscordUserId)
+-- on the loot channel, or the status channel if there is no loot one.
+-- Sent with HttpRequest's `force`: everything else is blocked by then.
+-- Re-executing the script picks the same status message up again and
+-- writes the live status over the notice.
+function Hud.SelfDestructNotice(why)
+    local HttpS = game:GetService("HttpService")
+    local stamp = os.date("%Y-%m-%d %H:%M:%S")
+    -- Read before the first yield: the self-destruct clears the shared
+    -- table this can come from straight after.
+    local surl = CONFIG.StatusWebhook
+    local sid = type(surl) == "string" and surl:find("^https://") and Hud.LoadId(surl) or nil
+    local purl = CONFIG.DiscordWebhook
+    if type(purl) ~= "string" or not purl:find("^https://") then purl = surl end
+    local uid = tostring(CONFIG.DiscordUserId or ""):gsub("%D", "")
+    -- A status update already on its way lands first, not on top of this.
+    S(1.5)
+    if sid then
+        pcall(function()
+            HttpRequest({
+                Url = surl .. "/messages/" .. sid, Method = "PATCH",
+                Headers = {["Content-Type"] = "application/json"},
+                Body = HttpS:JSONEncode({embeds = {{
+                    title = "SELF-DESTRUCT ACTIVATED",
+                    description = ("**%s.**\n\nThe script shut itself down and undid "
+                        .. "everything it changed. It is no longer running.\n\n"
+                        .. "**Manual reset required** - re-execute the script to start "
+                        .. "again.\n\nRuns so far: %d"):format(why, Farm.runsDone or 0),
+                    color = 15158332,
+                    footer = {text = stamp .. "  -  DQR"},
+                }}}),
+            }, true)
+        end)
+    end
+    if type(purl) == "string" and purl:find("^https://") then
+        local payload = {
+            username = "DQR",
+            content = (uid ~= "" and ("<@%s> "):format(uid) or "")
+                .. ("**DQR self-destruct activated** - %s. Manual reset required."):format(why),
+        }
+        if uid ~= "" then payload.allowed_mentions = {users = {uid}} end
+        pcall(function()
+            HttpRequest({
+                Url = purl, Method = "POST",
+                Headers = {["Content-Type"] = "application/json"},
+                Body = HttpS:JSONEncode(payload),
+            }, true)
+        end)
     end
 end
 
@@ -10261,7 +10368,26 @@ pcall(Farm.LoadRuns)
 function Farm.OpenRun()
     Farm.runOpen = true
     Farm.runStartAt, Farm.runEndAt = nil, nil
+    Farm.runDeaths = 0
 end
+
+-- DEATHS this run (status "Deaths", the loot post). Every character's
+-- Humanoid.Died, counted only while a run is open - so not in the lobby,
+-- and not after the run has been counted. Back to 0 when the next run
+-- opens; the last run's stays shown until then.
+Farm.runDeaths = 0
+function Farm.HookDeaths(char)
+    local hum = char and char:WaitForChild("Humanoid", 10)
+    if not hum then return end
+    Farm.Track(hum.Died:Connect(function()
+        if Farm.dead or not Farm.runOpen then return end
+        Farm.runDeaths = (Farm.runDeaths or 0) + 1
+        Farm.statusNow = true
+        print(("[DQR] Died - %d death(s) this run."):format(Farm.runDeaths))
+    end))
+end
+if LP.Character then task.spawn(Farm.HookDeaths, LP.Character) end
+Farm.Track(LP.CharacterAdded:Connect(function(c) task.spawn(Farm.HookDeaths, c) end))
 function Farm.CountRun(how)
     if not Farm.runOpen then return end
     Farm.runOpen = false
@@ -10552,7 +10678,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.19 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.22 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -10662,6 +10788,12 @@ function Farm.SelfDestruct(why)
     -- 1. Stop: the farm, and every loop (they all check Farm.dead).
     Farm.dead, Farm.Running = true, false
     pcall(function() Nav.goal, Nav.face = nil, nil end)
+    -- Tell Discord (SelfDestructNotify): the status embed frozen on the
+    -- notice, and a ping. Its own thread - it reads what it needs before
+    -- the cleanup below clears it, then sends.
+    if CONFIG.SelfDestructNotify ~= false then
+        task.spawn(function() pcall(Hud.SelfDestructNotice, tostring(why)) end)
+    end
     -- 2. Movement back to you: controls on, camera yours, AutoRotate and
     -- jumping back, the move binding gone.
     pcall(Nav.Stop)
