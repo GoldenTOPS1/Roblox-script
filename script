@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.17
+--  DQR AUTO FARM v13.18
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -43,7 +43,8 @@ local CONFIG = {
     -- Not set off by: anyone in SelfDestructIgnore or CarryFor, and your
     -- Roblox friends when SelfDestructIgnoreFriends is true. Players
     -- already in the server when the script starts do not count - only
-    -- new joins. (In the lobby, a stranger joining sets it off too.)
+    -- new joins. ONLY DURING A RUN: from the dungeon's START screen to
+    -- its Replay screen. Joins in the lobby (a public server) are ignored.
     -- DQR_SelfDestruct() in the console does it by hand.
     SelfDestructOnJoin        = true,
     SelfDestructIgnore        = {},      -- e.g. {"MyAltAccount"}
@@ -10444,7 +10445,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.17 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.18 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -10652,14 +10653,26 @@ function Farm.JoinAllowed(pl)
     return false
 end
 
+-- In a run: the dungeon's server, from its START screen through the
+-- fight to the Replay screen at the end. Not the real lobby (a public
+-- server - strangers join all the time), and not a loading screen the
+-- bot cannot place yet.
+function Farm.InRun()
+    if Farm.RealLobby() then return false end
+    if Farm.Running or Farm.runOpen then return true end
+    if DungeonStartButton() or PathVisible(UI.Replay) then return true end
+    return IsInDungeon()
+end
+
 Farm.Track(Players.PlayerAdded:Connect(function(pl)
     if not CONFIG.SelfDestructOnJoin or Farm.dead then return end
     task.spawn(function()
+        if not Farm.InRun() then return end           -- only during a run
         if Farm.JoinAllowed(pl) then
             print(("[DQR] %s joined - on the ignore list, carrying on."):format(pl.Name))
             return
         end
-        Farm.SelfDestruct(pl.Name .. " joined the server")
+        Farm.SelfDestruct(pl.Name .. " joined the dungeon")
     end)
 end))
 
