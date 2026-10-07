@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.12
+--  DQR AUTO FARM v13.13
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -33,6 +33,23 @@ local CONFIG = {
     -- until everyone in CarryFor has joined, then start. CarryWait is
     -- how long to wait before starting anyway (0 = forever). Lobby
     -- only - the in-dungeon START button is always pressed.
+    -- SELF-DESTRUCT: true = the moment another player JOINS the server,
+    -- the script shuts itself down for good: farming stops, your
+    -- controls and camera come back, every hook it made is unhooked,
+    -- every loop ends, and everything it changed on your screen goes
+    -- back - map, graphics, armour, name/level, spell animations,
+    -- markers, labels, the log window, the FPS cap (to SelfDestructFps).
+    -- Re-execute the script to start it again.
+    -- Not set off by: anyone in SelfDestructIgnore or CarryFor, and your
+    -- Roblox friends when SelfDestructIgnoreFriends is true. Players
+    -- already in the server when the script starts do not count - only
+    -- new joins. (In the lobby, a stranger joining sets it off too.)
+    -- DQR_SelfDestruct() in the console does it by hand.
+    SelfDestructOnJoin        = false,
+    SelfDestructIgnore        = {},      -- e.g. {"MyAltAccount"}
+    SelfDestructIgnoreFriends = true,
+    SelfDestructFps           = 60,      -- FPS cap put back (nil = leave it)
+
     CarryMode      = false,
     CarryFor       = {"24MINZ"},
     CarryWait      = 0,
@@ -719,6 +736,37 @@ local Prof  = {}   -- map profiles
 local Look  = {}   -- hitbox box, flat map, hidden animations
 local Sell  = {}   -- auto sell, in the lobby
 
+-- SELF-DESTRUCT BOOKKEEPING (see Farm.SelfDestruct, near the end).
+--  Farm.Track(conn): every event hook this script makes goes through
+--    here, so all of them can be disconnected at once.
+--  Farm.Keep(obj, prop): called just BEFORE the script changes a
+--    property of something that is not its own (graphics, armour, name
+--    labels, terrain) - the original value is kept, the first time only,
+--    to be put back. Strong keys: a weak table keyed by Roblox objects
+--    drops entries whenever nothing else holds the object.
+--  Farm.dead: set by the self-destruct; every loop checks it.
+Farm.dead, Farm.conns, Farm.undo = false, {}, {}
+function Farm.Track(c)
+    if c then Farm.conns[#Farm.conns + 1] = c end
+    return c
+end
+function Farm.Keep(o, prop)
+    if Farm.dead or not o then return end
+    local t = Farm.undo[o]
+    if not t then t = {} Farm.undo[o] = t end
+    if t[prop] == nil then
+        local ok, v = pcall(function() return o[prop] end)
+        if ok and v ~= nil then t[prop] = v end
+    end
+end
+-- Forget what belonged to parts that are gone (a finished dungeon's map).
+function Farm.PruneUndo()
+    for o in pairs(Farm.undo) do
+        local ok, gone = pcall(function() return o.Parent == nil and o ~= game end)
+        if not ok or gone then Farm.undo[o] = nil end
+    end
+end
+
 -- ============================================================
 --  EXECUTOR GLOBALS
 -- ============================================================
@@ -880,7 +928,7 @@ local function BuildLogGui()
     LogBox.Text                   = ""
     LogBox.Parent                 = LogScroll
 
-    copyBtn.MouseButton1Click:Connect(function()
+    Farm.Track(copyBtn.MouseButton1Click:Connect(function()
         local all = table.concat(LOG, "\n")
         if Copy(all) then
             copyBtn.Text = "Copied!"
@@ -892,34 +940,34 @@ local function BuildLogGui()
             copyBtn.Text = "Ctrl+C"
         end
         task.delay(1.5, function() copyBtn.Text = "Copy" end)
-    end)
-    clearBtn.MouseButton1Click:Connect(function()
+    end))
+    Farm.Track(clearBtn.MouseButton1Click:Connect(function()
         table.clear(LOG)
         LogRender()
-    end)
+    end))
 
     -- Drag by the title bar.
     local dragging, dragStart, startPos
-    bar.InputBegan:Connect(function(i)
+    Farm.Track(bar.InputBegan:Connect(function(i)
         if i.UserInputType == Enum.UserInputType.MouseButton1
         or i.UserInputType == Enum.UserInputType.Touch then
             dragging, dragStart, startPos = true, i.Position, main.Position
         end
-    end)
-    UserInputService.InputChanged:Connect(function(i)
+    end))
+    Farm.Track(UserInputService.InputChanged:Connect(function(i)
         if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
         or i.UserInputType == Enum.UserInputType.Touch) then
             local d = i.Position - dragStart
             main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
                                       startPos.Y.Scale, startPos.Y.Offset + d.Y)
         end
-    end)
-    UserInputService.InputEnded:Connect(function(i)
+    end))
+    Farm.Track(UserInputService.InputEnded:Connect(function(i)
         if i.UserInputType == Enum.UserInputType.MouseButton1
         or i.UserInputType == Enum.UserInputType.Touch then
             dragging = false
         end
-    end)
+    end))
     LogRender()
 end
 
@@ -1077,27 +1125,46 @@ end
 local function NukeGraphics()
     if not CONFIG.LowerGraphics then return end
     local L = game:GetService("Lighting")
+    -- Originals first (self-destruct puts them back).
+    if not Farm.quality then
+        Farm.quality = {}
+        pcall(function() Farm.quality.render = settings().Rendering.QualityLevel end)
+        pcall(function()
+            Farm.quality.saved = game:GetService("UserGameSettings").SavedQualityLevel
+        end)
+    end
     pcall(function() settings().Rendering.QualityLevel = 1 end)
     pcall(function()
         game:GetService("UserGameSettings").SavedQualityLevel =
             Enum.SavedQualitySetting.QualityLevel01
     end)
+    for _, p in ipairs({"GlobalShadows", "FogEnd", "Brightness",
+                        "EnvironmentDiffuseScale", "EnvironmentSpecularScale"}) do
+        Farm.Keep(L, p)
+    end
     pcall(function()
         L.GlobalShadows, L.FogEnd, L.Brightness = false, 9e8, 0
         L.EnvironmentDiffuseScale, L.EnvironmentSpecularScale = 0, 0
     end)
     for _, fx in ipairs(L:GetChildren()) do
-        if fx:IsA("PostEffect") then pcall(function() fx.Enabled = false end) end
+        if fx:IsA("PostEffect") then
+            Farm.Keep(fx, "Enabled")
+            pcall(function() fx.Enabled = false end)
+        end
     end
     local stripped = 0
     for _, o in ipairs(workspace:GetDescendants()) do pcall(function()
         if o:IsA("ParticleEmitter") or o:IsA("Trail") or o:IsA("Smoke")
         or o:IsA("Fire") or o:IsA("Sparkles") then
+            Farm.Keep(o, "Enabled")
             o.Enabled = false
         elseif CONFIG.StripTextures and (o:IsA("Decal") or o:IsA("Texture")) then
+            Farm.Keep(o, "Transparency")
             o.Transparency = 1
             stripped = stripped + 1
         elseif o:IsA("BasePart") then
+            Farm.Keep(o, "CastShadow")
+            Farm.Keep(o, "Reflectance")
             o.CastShadow, o.Reflectance = false, 0
         end
     end) end
@@ -1129,21 +1196,29 @@ local function HideArmour(char)
         if o:IsA("Accessory") or o:IsA("Hat") then
             for _, d in ipairs(o:GetDescendants()) do pcall(function()
                 if d:IsA("BasePart") then
+                    Farm.Keep(d, "Transparency")
+                    Farm.Keep(d, "LocalTransparencyModifier")
                     d.Transparency, d.LocalTransparencyModifier = 1, 1
                 elseif d:IsA("Decal") or d:IsA("Texture") then
+                    Farm.Keep(d, "Transparency")
                     d.Transparency = 1
                 elseif d:IsA("ParticleEmitter") or d:IsA("Trail") then
+                    Farm.Keep(d, "Enabled")
                     d.Enabled = false
                 end
             end) end
         elseif o:IsA("BasePart") and not BODY_PARTS[o.Name] then
             if CONFIG.HideWeapon or not InTool(o) then
+                Farm.Keep(o, "Transparency")
+                Farm.Keep(o, "LocalTransparencyModifier")
                 o.Transparency, o.LocalTransparencyModifier = 1, 1
             end
         elseif o:IsA("Decal") or o:IsA("Texture") then
+            Farm.Keep(o, "Transparency")
             o.Transparency = 1
         elseif o:IsA("ParticleEmitter") or o:IsA("Trail")
             or o:IsA("Fire") or o:IsA("Sparkles") then
+            Farm.Keep(o, "Enabled")
             o.Enabled = false
         end
     end) end
@@ -1170,14 +1245,17 @@ local function VanityPass()
                 if t == "" then return end
                 if CONFIG.SpoofName then
                     if t == real or t == disp then
+                        Farm.Keep(o, "Text")
                         o.Text = CONFIG.FakeName
                     elseif t:find(real, 1, true) then
+                        Farm.Keep(o, "Text")
                         o.Text = t:gsub((real:gsub("%W", "%%%0")), CONFIG.FakeName)
                     end
                 end
                 if CONFIG.SpoofLevel and t:match("^%d+$") then
                     local nm = (o.Name .. " " .. (o.Parent and o.Parent.Name or "")):lower()
                     if nm:find("level") or nm:find("lvl") or (lvl and t == lvl) then
+                        Farm.Keep(o, "Text")
                         o.Text = CONFIG.FakeLevel
                     end
                 end
@@ -1187,10 +1265,13 @@ local function VanityPass()
 end
 
 local function VanityWatcher()
-    while true do
+    local pruneAt = tick()
+    while not Farm.dead do
         S(0.5)
+        if Farm.dead then break end
         if CONFIG.SpoofName or CONFIG.SpoofLevel then pcall(VanityPass) end
         if CONFIG.HideArmour then pcall(HideArmour, GetChar()) end
+        if tick() - pruneAt > 30 then pruneAt = tick() pcall(Farm.PruneUndo) end
     end
 end
 
@@ -1339,7 +1420,7 @@ local function HookAnimator(pl, a, char)
         end
     end
     pcall(Core)
-    a.AnimationPlayed:Connect(function(track)
+    Farm.Track(a.AnimationPlayed:Connect(function(track)
         local anim = track.Animation
         if next(core) == nil then pcall(Core) end      -- Animate loads late
         if anim and core[anim.AnimationId] then return end
@@ -1363,25 +1444,25 @@ local function HookAnimator(pl, a, char)
         if pl == LP and Haz.cdWorks then return end
         castAt[pl] = tick()
         if pl == LP then Haz.castVia = "animation" end
-    end)
+    end))
 end
 local function HookCharacter(pl, char)
     local function Try(d)
         if d:IsA("Animator") then pcall(HookAnimator, pl, d, char) end
     end
     for _, d in ipairs(char:GetDescendants()) do Try(d) end
-    char.DescendantAdded:Connect(Try)
+    Farm.Track(char.DescendantAdded:Connect(Try))
 end
 local function HookPlayer(pl)
     if pl.Character then HookCharacter(pl, pl.Character) end
-    pl.CharacterAdded:Connect(function(c)
+    Farm.Track(pl.CharacterAdded:Connect(function(c)
         if pl == LP then Haz.jumpAt = tick() end    -- respawn: no spell learning for a moment
         HookCharacter(pl, c)
-    end)
+    end))
 end
 for _, pl in ipairs(Players:GetPlayers()) do HookPlayer(pl) end
-Players.PlayerAdded:Connect(HookPlayer)
-Players.PlayerRemoving:Connect(function(pl) castAt[pl] = nil end)
+Farm.Track(Players.PlayerAdded:Connect(HookPlayer))
+Farm.Track(Players.PlayerRemoving:Connect(function(pl) castAt[pl] = nil end))
 
 -- Cast signal 2 (us only): a cooldown number appearing on the Q / E
 -- slots. When the text there goes from nothing (spell ready) to a
@@ -1390,7 +1471,7 @@ Players.PlayerRemoving:Connect(function(pl) castAt[pl] = nil end)
 task.spawn(function()
     local labels, last, scanAt = {}, {}, 0
     local logged, shown = nil, 0
-    while true do
+    while not Farm.dead do
         S(0.1)
         local now = tick()
         if now - scanAt > 3 then
@@ -1435,7 +1516,7 @@ task.spawn(function()
 end)
 Haz.castAt = castAt
 
-workspace.DescendantAdded:Connect(function(o)
+Farm.Track(workspace.DescendantAdded:Connect(function(o)
     if o:IsA("Beam") then
         beamObjects[o] = true
     elseif o:IsA("BasePart") then
@@ -1448,10 +1529,10 @@ workspace.DescendantAdded:Connect(function(o)
             hiddenParts[o] = true
         end
     end
-end)
+end))
 task.spawn(function()
     local trimAt = 0
-    while true do
+    while not Farm.dead do
         S(0.1)
         -- Old entries out, farm or no farm (the hazard scan trims them
         -- too, but only runs while farming).
@@ -1588,17 +1669,17 @@ end)
 -- drops an entry whenever the script holds no other reference to that
 -- object - even though it is still in the game. A beam or a laser part
 -- nobody had looked at for a moment simply fell out of the list.
-workspace.DescendantRemoving:Connect(function(o)
+Farm.Track(workspace.DescendantRemoving:Connect(function(o)
     beamObjects[o], recentParts[o], hiddenParts[o], playerBorn[o] = nil, nil, nil, nil
     Haz.named[o], Haz.spell[o], spellModel[o] = nil, nil, nil
     if Haz.followModel then Haz.followModel[o] = nil end
-end)
+end))
 end
 pcall(function()
-    game.DescendantAdded:Connect(function(o)
+    Farm.Track(game.DescendantAdded:Connect(function(o)
         if IsAdorn(o) then adornObjects[o] = true end
-    end)
-    game.DescendantRemoving:Connect(function(o) adornObjects[o] = nil end)
+    end))
+    Farm.Track(game.DescendantRemoving:Connect(function(o) adornObjects[o] = nil end))
 end)
 task.spawn(function()
     S(1)
@@ -1810,6 +1891,7 @@ local function ButtonsAtPoint(x, y)
 end
 
 local function ClickButton(btn)
+    if Farm.dead then return false end               -- self-destructed: no clicks
     if VisibleOnScreen(btn) then
         local x, y = ScreenPointOf(btn)
         local wasOpen = LogGui and LogGui.Enabled
@@ -2048,7 +2130,7 @@ end
 local function DungeonConfirmed() return NotLobbyFor() >= CONFIG.LobbyGrace end
 
 task.spawn(function()
-    while true do S(0.5) pcall(LobbyMarker) end
+    while not Farm.dead do S(0.5) pcall(LobbyMarker) end
 end)
 
 -- ============================================================
@@ -2188,7 +2270,7 @@ local function RunLobbyFlow()
         print(("[DQR] Step 5b: Carry mode - waiting for %s.")
             :format(table.concat(CONFIG.CarryFor, ", ")))
         local waited, said = 0, -10
-        while true do
+        while not Farm.dead do
             local missing = {}
             for _, who in ipairs(CONFIG.CarryFor) do
                 if not InParty(who) then missing[#missing + 1] = who end
@@ -2340,7 +2422,7 @@ local function Watch(o)
         end
     end
 end
-workspace.DescendantAdded:Connect(Watch)
+Farm.Track(workspace.DescendantAdded:Connect(Watch))
 task.spawn(function()
     for _, o in ipairs(workspace:GetDescendants()) do Watch(o) end
 end)
@@ -2349,11 +2431,11 @@ end)
 -- collector before the first scan seven seconds later), so a model
 -- leaving the game leaves the registry here. One moved within the
 -- workspace is re-registered by Watch straight after.
-workspace.DescendantRemoving:Connect(function(o)
+Farm.Track(workspace.DescendantRemoving:Connect(function(o)
     if models[o] or enemyOf[o] or knownBoss[o] then
         models[o], enemyOf[o], knownBoss[o] = nil, nil, nil
     end
-end)
+end))
 
 -- The part a model is measured from. Big boss rigs rarely have a
 -- HumanoidRootPart and keep their parts in sub-models, so fall back
@@ -3770,11 +3852,11 @@ local function ZoneCheck(o)
         zoneParts[o] = true
     end
 end
-workspace.DescendantAdded:Connect(function(o)
+Farm.Track(workspace.DescendantAdded:Connect(function(o)
     if not o:IsA("BasePart") or not CONFIG.SafeZone or CONFIG.SafeZone == "" then return end
     task.defer(ZoneCheck, o)
     task.delay(0.3, ZoneCheck, o)
-end)
+end))
 local zoneSweepAt = 0
 local function ZonesAround(pos, done)
     local want = CONFIG.SafeZone
@@ -3843,7 +3925,7 @@ end
 do
 local pillars = {}                                  -- source -> part
 Haz.pillars = pillars
-RunService.Heartbeat:Connect(function()
+Farm.Track(RunService.Heartbeat:Connect(function()
     local now, root = tick(), GetRoot()
     for src, info in pairs(Haz.columns) do
         -- Only for a column on the move (a whirlpool travelling): one that
@@ -3872,7 +3954,7 @@ RunService.Heartbeat:Connect(function()
             p.CanCollide = not (root and FlatDist(root.Position, c) < info.w / 2 + 1.5)
         end
     end
-end)
+end))
 end
 
 local function Classify(o, pos, reach)
@@ -4503,7 +4585,7 @@ function Haz.FirstCrossing(a, b, list)
     end
     local u = len > 0.01 and d / len or Vector3.zero
     local s = math.min(2, len)
-    while true do
+    while not Farm.dead do
         local p = s >= len and b or (a + u * s)
         FillBox(p)
         for i, h in ipairs(near) do
@@ -4895,7 +4977,7 @@ function Look.Hitbox(show)
         box.Color = Haz.At(p) and RED or GREY
     end
 end
-RunService.Heartbeat:Connect(function() pcall(Look.Hitbox, Farm.Running) end)
+Farm.Track(RunService.Heartbeat:Connect(function() pcall(Look.Hitbox, Farm.Running) end))
 
 -- ---- range circle -------------------------------------------
 -- A flat ring of thin neon segments on the floor round the character,
@@ -4964,7 +5046,7 @@ function Look.Range(show)
         for i, part in ipairs(ringParts) do part.CFrame = ringCFs[i] end
     end
 end
-RunService.Heartbeat:Connect(function() pcall(Look.Range, Farm.Running) end)
+Farm.Track(RunService.Heartbeat:Connect(function() pcall(Look.Range, Farm.Running) end))
 end
 
 -- ---- spell animations ---------------------------------------
@@ -5017,9 +5099,9 @@ function Look.Anims()
     if a ~= animator then
         animator = a
         if animConn then animConn:Disconnect() end
-        animConn = a.AnimationPlayed:Connect(function(track)
+        animConn = Farm.Track(a.AnimationPlayed:Connect(function(track)
             if CONFIG.NoSpellAnims and not IsCore(track) then Hide(track) end
-        end)
+        end))
         core = CoreSet(GetChar())
     elseif next(core) == nil then
         core = CoreSet(GetChar())      -- Animate loads a moment after the rig
@@ -5029,8 +5111,21 @@ function Look.Anims()
         if not IsCore(track) then Hide(track) end
     end
 end
+
+-- Self-destruct: stop hiding, and every track still playing back at
+-- full weight.
+function Look.UnhideAnims()
+    if animConn then pcall(function() animConn:Disconnect() end) end
+    animConn, animator = nil, nil
+    local hum = GetHuman()
+    local a = hum and hum:FindFirstChildOfClass("Animator")
+    if not a then return end
+    for _, track in ipairs(a:GetPlayingAnimationTracks()) do
+        if track.WeightTarget < 0.01 then pcall(function() track:AdjustWeight(1, 0.1) end) end
+    end
+end
 task.spawn(function()
-    while true do S(0.25) pcall(Look.Anims) end
+    while not Farm.dead do S(0.25) pcall(Look.Anims) end
 end)
 
 -- ---- flat map -------------------------------------------------
@@ -5325,7 +5420,7 @@ end
 
 -- Keep the plane under us: a 2048 plane ends 1024 studs out.
 task.spawn(function()
-    while true do
+    while not Farm.dead do
         S(1)
         local root = GetRoot()
         if plane and plane.Parent and root and Look.planeY
@@ -5522,7 +5617,7 @@ local function Unwall(w)
     Repaint(w)
 end
 task.spawn(function()
-    while true do
+    while not Farm.dead do
         S(1)
         if #newGround > 0 then
             local pts = newGround
@@ -5592,10 +5687,18 @@ function Look.ApplyMap()
         task.spawn(function()
             local T = workspace:FindFirstChildOfClass("Terrain")
             if T then
+                Farm.Keep(T, "Decoration")
                 pcall(function() T.Decoration = false end)
                 local col = CONFIG.FloorColor or Color3.fromRGB(96, 104, 116)
+                -- Original colours kept, for the self-destruct.
+                Farm.terrainCols = Farm.terrainCols or {}
                 for _, m in ipairs(Enum.Material:GetEnumItems()) do
-                    pcall(function() T:SetMaterialColor(m, col) end)
+                    pcall(function()
+                        if Farm.terrainCols[m] == nil then
+                            Farm.terrainCols[m] = T:GetMaterialColor(m)
+                        end
+                        T:SetMaterialColor(m, col)
+                    end)
                 end
             end
             local n = 0
@@ -5685,7 +5788,7 @@ end
 
 -- Map parts that stream in later: stripped after a moment (an attack
 -- has usually moved or gone by then), if they still look built.
-workspace.DescendantAdded:Connect(function(o)
+Farm.Track(workspace.DescendantAdded:Connect(function(o)
     if not Look.mapMode or not o:IsA("BasePart") then return end
     if Look.mapMode == "baseplate" and not CONFIG.FakeFloor then
         -- Same test as the pass; a part that arrived near us only once it
@@ -5720,22 +5823,22 @@ workspace.DescendantAdded:Connect(function(o)
         if (o.Position - at).Magnitude > 0.5 or not LooksBuilt(o) then return end
         pcall(Strip, o, Look.mapMode, true)
     end)
-end)
+end))
 -- Map parts leaving (the run over, or streamed out) leave these lists.
 -- Strong tables - the staircase list is exactly what must not forget a
 -- step - so this is what keeps them from growing run after run.
-workspace.DescendantRemoving:Connect(function(o)
+Farm.Track(workspace.DescendantRemoving:Connect(function(o)
     if done[o] then
         done[o], orig[o], walls[o], stairs[o] = nil, nil, nil, nil
     end
-end)
+end))
 
 -- WATCHDOG. Every 3 seconds while farming: if more than 40 map parts
 -- around us are still showing untouched, the map was rebuilt (a replay)
 -- or loaded after the pass - run the pass again.
 task.spawn(function()
     local lastRe = 0
-    while true do
+    while not Farm.dead do
         S(3)
         local mode = CONFIG.MapMode
         local root = GetRoot()
@@ -5918,11 +6021,11 @@ local function Reassert()
     if not (pm and pm:FindFirstChild("PlayerModule")) then controls = nil end
     SetControls(false)
 end
-UserInputService.LastInputTypeChanged:Connect(function()
+Farm.Track(UserInputService.LastInputTypeChanged:Connect(function()
     if wantDisabled then task.defer(Reassert) end
-end)
+end))
 task.spawn(function()
-    while true do S(0.5) if wantDisabled then Reassert() end end
+    while not Farm.dead do S(0.5) if wantDisabled then Reassert() end end
 end)
 
 function Nav.Diag()
@@ -6319,7 +6422,7 @@ function Nav.SmartPlan(from, to)
         hn = hn - 1
         if hn > 0 then
             local i = 1
-            while true do
+            while not Farm.dead do
                 local c = i * 2
                 if c > hn then break end
                 if c < hn and heapF[c + 1] < heapF[c] then c = c + 1 end
@@ -6898,6 +7001,7 @@ local function Heartbeat(dt)
 end
 
 function Nav.Start()
+    if Farm.dead then return end                     -- self-destructed: never again
     if conn then conn:Disconnect() end
     ClearPath()
     Nav.goal, Nav.face, Nav.force = nil, nil, false
@@ -6918,7 +7022,7 @@ function Nav.Start()
         pcall(function() h.AutoJumpEnabled = allow end)
     end
     print("[DQR] Move start: " .. Nav.Diag())
-    conn = RunService.Heartbeat:Connect(Heartbeat)
+    conn = Farm.Track(RunService.Heartbeat:Connect(Heartbeat))
     -- The move command again, every frame, right AFTER Roblox's own
     -- controls (they run at Input priority and set it to zero whenever no
     -- key is held) and right before physics. Set only in Heartbeat -
@@ -7062,6 +7166,7 @@ local spellSlot, lastSpell, lastMelee, lastBuff = false, 0, 0, 0
 local volley = false                    -- a Q -> E volley is being pressed
 
 local function FireKey(kc)
+    if Farm.dead then return end                     -- self-destructed: no keys
     pcall(function() VIM:SendKeyEvent(true, kc, false, game) end)
     S(0.05)
     pcall(function() VIM:SendKeyEvent(false, kc, false, game) end)
@@ -7084,6 +7189,7 @@ local function AimPoint(aimAt)
 end
 
 function DoMelee(aimAt)
+    if Farm.dead then return end
     local now = tick()
     if now - lastMelee < CONFIG.MeleeRate then return end
     lastMelee = now
@@ -7111,7 +7217,7 @@ end
 -- two casts landing as one volley. The game ignores whichever key is
 -- still cooling down, so pressing on a timer is harmless.
 function DoSpell(dist, range, aimAt)
-    if dist > range then return end
+    if Farm.dead or dist > range then return end
     local now = tick()
     if now - lastSpell < CONFIG.AttackRate then return end
     lastSpell, spellSlot = now, not spellSlot
@@ -7201,7 +7307,7 @@ end
 -- damage / speed boost is always running. Pressed on its own thread
 -- and a little apart from an E press, so the two never share a frame.
 function Brain.Buff()
-    if not CONFIG.BuffQ or volley then return end
+    if Farm.dead or not CONFIG.BuffQ or volley then return end
     local now = tick()
     if now - lastBuff < (CONFIG.BuffRate or 1) then return end
     -- Known to be cooling down: nothing to press.
@@ -7336,7 +7442,7 @@ task.spawn(function()
         Assign(slots.q, qk, ek)
         Assign(slots.e, ek, qk)
     end
-    while true do
+    while not Farm.dead do
         S(0.1)
         local now = tick()
         if not CONFIG.BuffQ then
@@ -8610,6 +8716,7 @@ do
 -- The executor's HTTP function, under whichever name it uses. The
 -- game's own HttpService cannot be used from a client.
 local function HttpRequest(opts)
+    if Farm.dead then return nil end                 -- self-destructed: no posts
     for _, name in ipairs({"request", "http_request"}) do
         local fn = Env(name)
         if typeof(fn) == "function" then
@@ -9019,7 +9126,7 @@ end
 -- was recorded as "seen during the fight" and then ruled out.
 function LootWatcher()
     local ran, stoppedAt, warned = false, 0, false
-    while true do
+    while not Farm.dead do
         S(0.5)
         local fighting = Farm.Running and Brain.target ~= nil
         if fighting then
@@ -9199,7 +9306,7 @@ end
 function Farm.StatusWatcher()
     local msgId, base, startedAt = nil, nil, tick()
     local said, lastErr, loaded = false, 0, false
-    while true do
+    while not Farm.dead do
         S(math.max(2, CONFIG.StatusInterval or 5))
         local url = CONFIG.StatusWebhook
         if type(url) ~= "string" or url == "" then
@@ -9544,6 +9651,7 @@ end
 -- Open the shop: already open, or use the prompt (fired directly when
 -- the executor can, else its key held down), then wait for the screen.
 function Sell.Open(prompt)
+    if Farm.dead then return nil end
     local b = Sell.FindButton()
     if b then return b end
     if prompt then
@@ -9789,7 +9897,7 @@ local function Guarded(name, fn)
 end
 
 function Farm.Start()
-    if Farm.Running then return end
+    if Farm.dead or Farm.Running then return end
     if Farm.restartAt and tick() < Farm.restartAt then return end
     if InLobby() then
         print("[DQR] Refusing to farm - lobby marker '" .. tostring(LobbyMarker())
@@ -9822,7 +9930,7 @@ function Farm.Stop()
     print("[DQR] Farm stopped.")
 end
 
-LP.CharacterAdded:Connect(function()
+Farm.Track(LP.CharacterAdded:Connect(function()
     S(2)
     pcall(HideArmour, GetChar())
     if Farm.Running then
@@ -9830,14 +9938,14 @@ LP.CharacterAdded:Connect(function()
         S(0.5)
         Farm.Start()
     end
-end)
+end))
 
 -- ============================================================
 --  WATCHERS
 -- ============================================================
 -- The in-dungeon START button has no known path; match it by text.
 local function StartWatcher()
-    while true do
+    while not Farm.dead do
         S(1.5)
         -- Never the lobby party screen's start: see DungeonStartButton.
         local b = DungeonStartButton()
@@ -9852,7 +9960,7 @@ end
 -- Notices the run is over (the lobby is back) and stops the farm.
 -- What happens next is the Supervisor's job.
 local function DungeonWatcher()
-    while true do
+    while not Farm.dead do
         S(3)
         if Farm.Running and InLobby() then
             print("[DQR] Back in the lobby - run over, stopping farm.")
@@ -9865,7 +9973,7 @@ end
 -- Runs forever, farm or no farm: works out where we are and gets
 -- things moving again, so no single failed transition parks the bot.
 local function Supervisor()
-    while true do
+    while not Farm.dead do
         S(4)
         if Farm.Running and tick() - Farm.beat > CONFIG.LoopStallTime then
             print(("[DQR] Farm loop has not ticked in %.0fs - restarting.")
@@ -9910,7 +10018,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.12 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.13 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -9977,7 +10085,7 @@ end)
 --  Function keys are ours whether or not the game claims the input
 --  (gameProcessedEvent is true whenever its UI has focus).
 -- ============================================================
-UserInputService.InputBegan:Connect(function(inp, gpe)
+Farm.Track(UserInputService.InputBegan:Connect(function(inp, gpe)
     local k = inp.KeyCode
     local ours = k == Enum.KeyCode.F5 or k == Enum.KeyCode.F6 or k == Enum.KeyCode.F7
               or k == Enum.KeyCode.F8 or k == Enum.KeyCode.F9 or k == Enum.KeyCode.F10
@@ -10005,10 +10113,132 @@ UserInputService.InputBegan:Connect(function(inp, gpe)
     elseif k == Enum.KeyCode.F10 then
         LootDump()
     end
-end)
+end))
+
+-- ============================================================
+--  SELF-DESTRUCT
+--  Everything stops and everything goes back, as if the script had
+--  never run: see CONFIG.SelfDestructOnJoin. Each step is on its own,
+--  so one that fails cannot stop the rest.
+-- ============================================================
+function Farm.SelfDestruct(why)
+    if Farm.dead then return end
+    pcall(rawprint, "[DQR] SELF-DESTRUCT: " .. tostring(why) .. " - shutting down and undoing everything.")
+    -- 1. Stop: the farm, and every loop (they all check Farm.dead).
+    Farm.dead, Farm.Running = true, false
+    pcall(function() Nav.goal, Nav.face = nil, nil end)
+    -- 2. Movement back to you: controls on, camera yours, AutoRotate and
+    -- jumping back, the move binding gone.
+    pcall(Nav.Stop)
+    pcall(function() RunService:UnbindFromRenderStep("DQR_Move") end)
+    pcall(function()
+        local h = GetHuman()
+        if h then
+            h:Move(Vector3.zero, false)
+            h.AutoRotate = true
+            h:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+            h.AutoJumpEnabled = true
+        end
+        local cam = workspace.CurrentCamera
+        if cam then
+            cam.CameraType = Enum.CameraType.Custom
+            if h then cam.CameraSubject = h end
+        end
+    end)
+    -- 3. Every hook unhooked.
+    for _, c in ipairs(Farm.conns) do pcall(function() c:Disconnect() end) end
+    table.clear(Farm.conns)
+    -- 4. The map: walls, floors, decoration, terrain colours.
+    pcall(Look.RestoreMap)
+    pcall(function()
+        local T = workspace:FindFirstChildOfClass("Terrain")
+        if T and Farm.terrainCols then
+            for m, col in pairs(Farm.terrainCols) do
+                pcall(function() T:SetMaterialColor(m, col) end)
+            end
+        end
+    end)
+    -- 5. Everything else it changed: graphics, lighting, effects, textures,
+    -- armour and weapon, name / level labels.
+    for o, props in pairs(Farm.undo) do
+        for prop, v in pairs(props) do pcall(function() o[prop] = v end) end
+    end
+    table.clear(Farm.undo)
+    pcall(function()
+        local q = Farm.quality
+        if q then
+            if q.render ~= nil then settings().Rendering.QualityLevel = q.render end
+            if q.saved ~= nil then game:GetService("UserGameSettings").SavedQualityLevel = q.saved end
+        end
+    end)
+    -- 6. Spell animations back.
+    pcall(Look.UnhideAnims)
+    -- 7. Everything it made: markers, pillars, labels, range ring, path
+    -- dots, hitbox, baseplate, floor studs - and the log window.
+    pcall(ClearDest)
+    for _, root in ipairs({workspace, LP:FindFirstChildOfClass("PlayerGui")}) do
+        pcall(function()
+            for _, o in ipairs(root:GetDescendants()) do
+                if o.Name:sub(1, 4) == "DQR_" then pcall(function() o:Destroy() end) end
+            end
+        end)
+    end
+    pcall(function() if LogGui then LogGui:Destroy() end end)
+    pcall(function()
+        local gethui = Env("gethui")
+        local h = typeof(gethui) == "function" and gethui()
+        local g = h and h:FindFirstChild("DQR_LOG")
+        if g then g:Destroy() end
+    end)
+    LogGui, LogBox, LogScroll, LogCount = nil, nil, nil, nil
+    -- 8. FPS cap back.
+    if CONFIG.SelfDestructFps ~= nil then pcall(function()
+        local cap = Env("setfpscap")
+        if typeof(cap) ~= "function" then cap = getgenv().setfpscap end
+        if typeof(cap) == "function" then cap(CONFIG.SelfDestructFps) end
+    end) end
+    -- 9. The console helpers.
+    pcall(function()
+        local g, keys = getgenv(), {}
+        for k in pairs(g) do
+            if type(k) == "string" and k:sub(1, 4) == "DQR_" then keys[#keys + 1] = k end
+        end
+        for _, k in ipairs(keys) do g[k] = nil end
+    end)
+    pcall(rawprint, "[DQR] Self-destruct done. Re-execute the script to use it again.")
+end
+
+-- Who does NOT set it off: you, SelfDestructIgnore, CarryFor, friends.
+function Farm.JoinAllowed(pl)
+    if pl == LP then return true end
+    local n, d = pl.Name:lower(), pl.DisplayName:lower()
+    for _, list in ipairs({CONFIG.SelfDestructIgnore or {}, CONFIG.CarryFor or {}}) do
+        for _, v in ipairs(list) do
+            local l = tostring(v):lower()
+            if l == n or l == d then return true end
+        end
+    end
+    if CONFIG.SelfDestructIgnoreFriends then
+        local ok, f = pcall(function() return LP:IsFriendsWith(pl.UserId) end)
+        if ok and f then return true end
+    end
+    return false
+end
+
+Farm.Track(Players.PlayerAdded:Connect(function(pl)
+    if not CONFIG.SelfDestructOnJoin or Farm.dead then return end
+    task.spawn(function()
+        if Farm.JoinAllowed(pl) then
+            print(("[DQR] %s joined - on the ignore list, carrying on."):format(pl.Name))
+            return
+        end
+        Farm.SelfDestruct(pl.Name .. " joined the server")
+    end)
+end))
 
 -- Console helpers.
 getgenv = getgenv or function() return _G end
+getgenv().DQR_SelfDestruct = function() Farm.SelfDestruct("by hand") end
 getgenv().DQR_Dump    = DumpGui
 getgenv().DQR_Lobby   = InLobby
 getgenv().DQR_Queue   = RunLobbyFlow
