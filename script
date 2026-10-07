@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.13
+--  DQR AUTO FARM v13.17
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -45,7 +45,7 @@ local CONFIG = {
     -- already in the server when the script starts do not count - only
     -- new joins. (In the lobby, a stranger joining sets it off too.)
     -- DQR_SelfDestruct() in the console does it by hand.
-    SelfDestructOnJoin        = false,
+    SelfDestructOnJoin        = true,
     SelfDestructIgnore        = {},      -- e.g. {"MyAltAccount"}
     SelfDestructIgnoreFriends = true,
     SelfDestructFps           = 60,      -- FPS cap put back (nil = leave it)
@@ -55,14 +55,44 @@ local CONFIG = {
     CarryWait      = 0,
 
     -- ---- AUTO SELL ---------------------------------------------
-    -- true = every time the bot is back in the lobby, before it queues
-    -- (or replays) the next run: walk to the sell area, click EVERY item
-    -- whose name is in SellNames, then press Sell once for all of them.
+    -- true = after every run the bot leaves for the lobby (a run ends on
+    -- the dungeon's Replay screen, not in the lobby - see SellAfterRuns),
+    -- walks to the sell area, clicks EVERY item whose name is in
+    -- SellNames, then presses Sell once for all of them.
     -- Names are matched ignoring case and spaces. Nothing that is not on
     -- the list is ever clicked, and a "Sell All" button is never pressed.
     AutoSell       = false,
     SellNames      = {},        -- e.g. {"Rusty Sword", "Bone Armor"}
     SellMatch      = "exact",   -- "exact" = the whole name, "contains" = part of it
+    -- SELL BY RARITY: also sell every item whose rarity is switched on
+    -- below, whatever its name. The rarity is read off the shop slot - a
+    -- word on it, or the tier colour of its glow / border (the same
+    -- colours as the reward panel: Common grey, Uncommon green, Rare
+    -- blue, Epic purple, Legendary yellow, Ultimate red). An item whose
+    -- rarity cannot be read is NEVER sold by rarity. Equipped items and
+    -- anything named in SellNever are never sold at all.
+    SellByRarity   = false,
+    SellRarities   = {
+        Common    = true,
+        Uncommon  = true,
+        Rare      = false,
+        Epic      = false,
+        Legendary = false,
+        Ultimate  = false,
+    },
+    SellNever      = {},        -- names never sold, e.g. {"My Best Sword"}
+    -- SELL EVERY N RUNS: true = after every SellEveryRuns finished runs
+    -- the bot leaves for the lobby, sells (by SellNames and / or
+    -- SellByRarity, as above) and queues the next run from there - even
+    -- with AutoSell off. The other runs it just presses Replay as usual.
+    -- (AutoSell = true does this after EVERY run instead - slower.)
+    -- Leaving = the door button at the bottom right, then YES on "Return
+    -- to Lobby?". The door is found by its name; if it is not,
+    -- DQR_LobbyDump() at the end of a run prints the buttons there - put
+    -- the door's path in LobbyButtonPath. DQR_ToLobby() tries it by hand.
+    SellAfterRuns  = false,
+    SellEveryRuns  = 10,
+    LobbyButtonPath = {},       -- e.g. {"mainInterface", "buttons", "lobbyButton"}
     -- SellDryRun = true: walks there, opens the shop and clicks the items,
     -- but does NOT press Sell - the log lists what it would have sold.
     -- Run it like that once and check the list before switching it off.
@@ -88,6 +118,20 @@ local CONFIG = {
         Ultimate  = true,
     },
     LootPostIfEmpty = false, -- post gold/gems even when no item qualifies
+    -- PING: your Discord user ID (Discord: Settings > Advanced >
+    -- Developer Mode on, then right-click your name > Copy User ID). The
+    -- loot post @-mentions you when a drop is one of the rarities set to
+    -- true below - those are always posted, whatever LootRarities says.
+    -- "" = never ping.
+    DiscordUserId    = "",
+    LootPingRarities = {
+        Common    = false,
+        Uncommon  = false,
+        Rare      = false,
+        Epic      = false,
+        Legendary = true,
+        Ultimate  = true,
+    },
 
     -- Live status: ONE message, edited in place every StatusInterval
     -- seconds. Use a different channel from the loot one. "" = off.
@@ -7306,9 +7350,24 @@ end
 -- BuffQ: the buff key every BuffRate seconds, target or not, so the
 -- damage / speed boost is always running. Pressed on its own thread
 -- and a little apart from an E press, so the two never share a frame.
+-- Has this run actually started? START was on screen this run and the
+-- countdown since it went is over. While the next run is still loading
+-- in - before its START button has even shown up - the farm loop is
+-- already ticking, and the buff used to go off then. START never seen
+-- this run (the script was started mid-run): once a spell has been cast
+-- (the fight is on), or StartWait seconds into the loop.
+function Brain.RunLive(now)
+    local s = Farm.startSeenAt
+    if s then return now - s >= (CONFIG.StartCountdown or 6.5) end
+    if Brain.castAt and Brain.castAt >= (Brain.loopAt or 0) then return true end
+    return now - (Brain.loopAt or now) >= (CONFIG.StartWait or 30)
+end
+
 function Brain.Buff()
     if Farm.dead or not CONFIG.BuffQ or volley then return end
     local now = tick()
+    -- Not before the run is under way (see Brain.RunLive).
+    if not Brain.RunLive(now) then return end
     if now - lastBuff < (CONFIG.BuffRate or 1) then return end
     -- Known to be cooling down: nothing to press.
     if Brain.qReady == false then return end
@@ -8651,6 +8710,7 @@ end
 -- ============================================================
 function Brain.Loop()
     Brain.Reset()
+    Brain.loopAt = tick()                       -- for Brain.RunLive's fallback
     Nav.Start()
     local lastLobby, lastStart, startVisible = 0, 0, false
     while Farm.Running do
@@ -8698,7 +8758,12 @@ function Brain.Loop()
             continue
         end
         -- When this run began, for StartWait. Survives respawns.
-        Brain.bootAt = Brain.bootAt or now
+        if not Brain.bootAt then
+            Brain.bootAt = now
+            -- The run timer (status "Run time") starts here: START pressed
+            -- and the countdown over - the run is actually under way.
+            if Farm.runOpen and not Farm.runStartAt then Farm.runStartAt = now end
+        end
         Brain.Tick(root)
         S(0.05)
     end
@@ -8773,16 +8838,7 @@ end
 -- Dungeon Quest's tiers, by colour: Common grey, Uncommon green, Rare
 -- blue, Epic purple, Legendary yellow, Ultimate red.
 local function ItemSlots(panel)
-    local function Rarity(c)
-        if not c then return nil end
-        local h, s = c:ToHSV()
-        if s < 0.25 then return "Common" end          -- grey
-        if h < 0.04 or h > 0.93 then return "Ultimate" end  -- red
-        if h < 0.2 then return "Legendary" end        -- yellow / orange
-        if h < 0.47 then return "Uncommon" end        -- green
-        if h < 0.72 then return "Rare" end            -- blue
-        return "Epic"                                 -- purple
-    end
+    local Rarity = Sell.ColorRarity                   -- the tier colours (AUTO SELL)
     local items = {}
     for _, o in ipairs(panel:GetDescendants()) do
         if o.Name == "itemPicture"
@@ -8920,6 +8976,8 @@ function ReportLoot(panel)
             for _, it in ipairs(items) do
                 local want = CONFIG.LootRarities[it.rarity or ""]
                 if want == nil then want = true end
+                -- A rarity you get pinged for is always shown.
+                if (CONFIG.LootPingRarities or {})[it.rarity or ""] then want = true end
                 if want then
                     keep[#keep + 1] = it
                 else
@@ -9022,7 +9080,9 @@ function ReportLoot(panel)
     end
 
     local title = panel
-        and ("Dungeon complete - %s (%s)"):format(CONFIG.TargetDungeon, CONFIG.Difficulty)
+        and ("Dungeon complete - %s (%s) - run %d%s"):format(CONFIG.TargetDungeon,
+            CONFIG.Difficulty, Farm.runsDone or 0,
+            (Farm.runEndAt and Farm.lastRunTime) and (" in " .. Hud.Clock(Farm.lastRunTime)) or "")
         or "DQR webhook test"
     -- A header embed, then one per item. Deliberately NOT sharing a
     -- `url`: embeds that do are merged into a single gallery, and a
@@ -9054,7 +9114,27 @@ function ReportLoot(panel)
     end
     embeds[#embeds].footer = {text = os.date("%Y-%m-%d %H:%M:%S") .. "  -  DQR"}
 
-    local body = HttpS:JSONEncode({username = "DQR", embeds = embeds})
+    -- PING: @-mention you for a drop of a rarity in LootPingRarities.
+    -- allowed_mentions limits it to exactly you - nothing else in the
+    -- post can ping anyone.
+    local payload = {username = "DQR", embeds = embeds}
+    local uid = tostring(CONFIG.DiscordUserId or ""):gsub("%D", "")
+    if uid ~= "" then
+        local hits = {}
+        for _, it in ipairs(items) do
+            if it.rarity and (CONFIG.LootPingRarities or {})[it.rarity] then
+                hits[#hits + 1] = it.rarity
+            end
+        end
+        if #hits > 0 then
+            payload.content = ("<@%s> %s drop!"):format(uid, table.concat(hits, ", "))
+            payload.allowed_mentions = {users = {uid}}
+        elseif not panel then
+            payload.content = ("<@%s> ping test"):format(uid)   -- DQR_LootTest()
+            payload.allowed_mentions = {users = {uid}}
+        end
+    end
+    local body = HttpS:JSONEncode(payload)
     local res, err = HttpRequest({
         Url = url, Method = "POST",
         Headers = {["Content-Type"] = "application/json"},
@@ -9152,7 +9232,9 @@ function LootWatcher()
                     if i > 15 then break end
                     print(("  %s | slots=%d"):format(c.frame:GetFullName(), c.slots))
                 end
-            elseif CONFIG.DiscordWebhook ~= "" then
+            else
+                -- Looked for whether or not loot is posted: the reward
+                -- panel is also what marks a run as finished (run count).
                 local ok, panel = pcall(FindLootPanel, during)
                 -- `holder` is on screen the whole run; the item slots
                 -- are only cloned into it at the end. Until they are,
@@ -9165,8 +9247,11 @@ function LootWatcher()
                 if ok and panel then
                     ran = false
                     print("[DQR] Loot: reward panel = " .. panel:GetFullName())
-                    local okR, err = pcall(ReportLoot, panel)
-                    if not okR then print("[DQR] Loot: post crashed: " .. tostring(err)) end
+                    Farm.CountRun("reward panel")
+                    if CONFIG.DiscordWebhook ~= "" then
+                        local okR, err = pcall(ReportLoot, panel)
+                        if not okR then print("[DQR] Loot: post crashed: " .. tostring(err)) end
+                    end
                 elseif not ok and not warned then
                     warned = true
                     print("[DQR] Loot: panel search failed: " .. tostring(panel))
@@ -9181,6 +9266,14 @@ end
 -- forward-declared: the main chunk is a handful of locals short of
 -- Luau's limit of 200, and this section would have crossed it.
 -- (Hud is the module table declared at the top.)
+
+-- 323 -> "5:23", 3725 -> "1:02:05".
+function Hud.Clock(sec)
+    sec = math.max(0, math.floor(tonumber(sec) or 0))
+    local h, m, s = math.floor(sec / 3600), math.floor(sec / 60) % 60, sec % 60
+    if h > 0 then return ("%d:%02d:%02d"):format(h, m, s) end
+    return ("%d:%02d"):format(m, s)
+end
 
 -- 1300000 -> "1.30M", the way the HUD writes it.
 function Hud.Short(n)
@@ -9307,7 +9400,11 @@ function Farm.StatusWatcher()
     local msgId, base, startedAt = nil, nil, tick()
     local said, lastErr, loaded = false, 0, false
     while not Farm.dead do
-        S(math.max(2, CONFIG.StatusInterval or 5))
+        -- Every StatusInterval - or at once when a run has just finished
+        -- (Farm.CountRun sets Farm.statusNow).
+        local waitT, t0 = math.max(2, CONFIG.StatusInterval or 5), tick()
+        while not Farm.dead and tick() - t0 < waitT and not Farm.statusNow do S(0.25) end
+        Farm.statusNow = false
         local url = CONFIG.StatusWebhook
         if type(url) ~= "string" or url == "" then
             if not said then
@@ -9371,6 +9468,28 @@ function Farm.StatusWatcher()
                 F("EXP",   Hud.Text("exp"))
                 F("Gold",  Hud.Real("gold"))
                 F("Gems",  Hud.Real("gem") or Hud.Real("diamond"))
+                -- Runs finished since the script started, and when the next
+                -- every-N-runs sell is due.
+                local runs = ("%d"):format(Farm.runsDone or 0)
+                if CONFIG.SellAfterRuns and (CONFIG.SellEveryRuns or 0) > 0 then
+                    local left = CONFIG.SellEveryRuns - ((Farm.runsDone or 0) - (Farm.soldAtRun or 0))
+                    runs = runs .. ("\nsell in %d"):format(math.max(0, left))
+                end
+                F("Runs", runs)
+                -- This run's clock: from 0 when it gets under way, stopped
+                -- when it is over (shown until the next one starts), with
+                -- the run before for comparison.
+                local rt
+                if Farm.runStartAt and not Farm.runEndAt then
+                    rt = Hud.Clock(tick() - Farm.runStartAt)
+                    if Farm.lastRunTime then rt = rt .. "\nlast " .. Hud.Clock(Farm.lastRunTime) end
+                elseif Farm.runEndAt and Farm.lastRunTime then
+                    rt = Hud.Clock(Farm.lastRunTime) .. " (done)"
+                elseif Farm.runOpen then
+                    rt = "0:00 (starting)"
+                    if Farm.lastRunTime then rt = rt .. "\nlast " .. Hud.Clock(Farm.lastRunTime) end
+                end
+                F("Run time", rt)
                 local near = 0
                 for _, rec in ipairs(Mobs.list) do
                     if rec.Flat <= 150 then near = near + 1 end
@@ -9479,7 +9598,8 @@ end -- of the loot block
 -- ============================================================
 --  AUTO SELL  (lobby)
 --  Walk to the sell area, open the shop, click every item whose name
---  is on CONFIG.SellNames, press Sell once. Built to find the pieces by
+--  is on CONFIG.SellNames (or, with SellByRarity, whose rarity is
+--  switched on in SellRarities), press Sell once. Built to find the pieces by
 --  themselves - the sell area by a prompt or part with "sell" in it,
 --  the item slots by their icons, the names from the slot's own name,
 --  attributes, values or labels - because the shop's layout was never
@@ -9541,6 +9661,125 @@ local function Candidates(slot)
     return out
 end
 Sell.Candidates = Candidates
+
+-- ---- rarity --------------------------------------------------
+-- Dungeon Quest's tier colours (the reward panel's glow, the shop's):
+-- Common grey, Uncommon green, Rare blue, Epic purple, Legendary
+-- yellow, Ultimate red. Also used by the loot report.
+function Sell.ColorRarity(c)
+    if not c then return nil end
+    local h, s = c:ToHSV()
+    if s < 0.25 then return "Common" end              -- grey
+    if h < 0.04 or h > 0.93 then return "Ultimate" end -- red
+    if h < 0.2 then return "Legendary" end            -- yellow / orange
+    if h < 0.47 then return "Uncommon" end            -- green
+    if h < 0.72 then return "Rare" end                -- blue
+    return "Epic"                                     -- purple
+end
+
+-- "Uncommon" before "Common": the one contains the other.
+local TIERS = {"Ultimate", "Legendary", "Epic", "Uncommon", "Rare", "Common"}
+local function TierWord(s)
+    local l = tostring(s or ""):lower()
+    for _, t in ipairs(TIERS) do
+        if l:find("%f[%a]" .. t:lower() .. "%f[%A]") then return t end
+    end
+    return nil
+end
+-- Pieces of a slot that carry its tier colour, by name.
+local TINT_WORDS = {"glow", "rarity", "tier", "border", "outline", "stroke", "rare"}
+
+-- A shop slot's rarity, and how it was read ("word" / "colour"), or nil.
+-- Written down first (an attribute or value called Rarity / Tier, or a
+-- label that IS a tier word), then the colour of a piece NAMED like a
+-- tier tint (glow, rarity, border...). A plain background is never read
+-- as a tier - a dark frame would have read as "Common" and been sold.
+function Sell.SlotRarity(slot)
+    for _, holder in ipairs({slot, slot.Parent}) do
+        if holder then
+            for k, v in pairs(holder:GetAttributes()) do
+                local lk = k:lower()
+                if (lk:find("rarity", 1, true) or lk:find("tier", 1, true)) and type(v) == "string" then
+                    local t = TierWord(v)
+                    if t then return t, "word" end
+                end
+            end
+            for _, c in ipairs(holder:GetChildren()) do
+                if c:IsA("StringValue") then
+                    local ln = c.Name:lower()
+                    if ln:find("rarity", 1, true) or ln:find("tier", 1, true) then
+                        local t = TierWord(c.Value)
+                        if t then return t, "word" end
+                    end
+                end
+            end
+        end
+    end
+    for _, d in ipairs(slot:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
+            local txt = d.Text:gsub("^%s+", ""):gsub("%s+$", "")
+            local t = TierWord(txt)
+            if t and #txt <= #t + 1 then return t, "word" end
+        end
+    end
+    for _, d in ipairs(slot:GetDescendants()) do
+        local ln = d.Name:lower()
+        local tint = false
+        for _, w in ipairs(TINT_WORDS) do
+            if ln:find(w, 1, true) then tint = true break end
+        end
+        if tint then
+            local col = nil
+            if d:IsA("ImageLabel") or d:IsA("ImageButton") then col = d.ImageColor3
+            elseif d:IsA("UIStroke") then col = d.Color
+            elseif d:IsA("Frame") then col = d.BackgroundColor3 end
+            if col then return Sell.ColorRarity(col), "colour" end
+        end
+    end
+    return nil
+end
+
+-- Never sold: equipped (says so on the slot, or an Equipped attribute /
+-- value that is true), or named in SellNever.
+function Sell.Protected(slot, cands)
+    for _, holder in ipairs({slot, slot.Parent}) do
+        if holder then
+            local a = holder:GetAttribute("Equipped") or holder:GetAttribute("equipped")
+            if a == true then return "equipped" end
+            local v = holder:FindFirstChild("Equipped") or holder:FindFirstChild("equipped")
+            if v and v:IsA("BoolValue") and v.Value then return "equipped" end
+        end
+    end
+    for _, tok in ipairs(ButtonTokens(slot)) do
+        if tok:find("equipped", 1, true) then return "equipped" end
+    end
+    for _, c in ipairs(cands) do
+        local n = Norm(c)
+        for _, keep in ipairs(CONFIG.SellNever or {}) do
+            if Norm(keep) ~= "" and n == Norm(keep) then return "on SellNever" end
+        end
+    end
+    return nil
+end
+
+-- Sell this slot? Returns the label to log (name, and rarity when that
+-- is why), or nil and the reason it is kept.
+function Sell.Pick(slot)
+    local cands = Candidates(slot)
+    local why = Sell.Protected(slot, cands)
+    if why then return nil, why end
+    for _, c in ipairs(cands) do
+        if Sell.Match(c) then return c end
+    end
+    if CONFIG.SellByRarity then
+        local r, how = Sell.SlotRarity(slot)
+        if r and (CONFIG.SellRarities or {})[r] then
+            return ("%s [%s by %s]"):format(cands[1] or "item", r, how)
+        end
+        return nil, r and (r .. " - not selling that rarity") or "rarity unreadable"
+    end
+    return nil, "not on SellNames"
+end
 
 -- Item names the game keeps in a data folder, if it keeps them where we
 -- can read them (an "Inventory" folder on the player or in
@@ -9716,8 +9955,8 @@ function Sell.Close(gui)
 end
 
 function Sell.Flow(force)
-    if #(CONFIG.SellNames or {}) == 0 then
-        print("[DQR] Sell: SellNames is empty - nothing to look for.")
+    if #(CONFIG.SellNames or {}) == 0 and not CONFIG.SellByRarity then
+        print("[DQR] Sell: SellNames is empty and SellByRarity is off - nothing to look for.")
         return
     end
     -- The title splash first: the lobby is behind it.
@@ -9727,8 +9966,9 @@ function Sell.Flow(force)
         local w = 0
         repeat S(0.5) w = w + 0.5 until PathVisible(UI.LobbyPlay) or w > 15
     end
-    -- Nothing to sell? Say so and save the walk.
-    local have = Sell.InventoryNames()
+    -- Nothing to sell? Say so and save the walk. (By name only: a rarity
+    -- can only be read off the shop screen.)
+    local have = not CONFIG.SellByRarity and Sell.InventoryNames()
     if have then
         local want = {}
         for _, n in ipairs(have) do if Sell.Match(n) then want[#want + 1] = n end end
@@ -9758,20 +9998,26 @@ function Sell.Flow(force)
     local gui = btn:FindFirstAncestorWhichIsA("ScreenGui") or btn.Parent
     S(0.5)                                  -- let the item list fill in
     local slots = Sell.Slots(gui, btn)
-    local picked, named = {}, 0
+    local picked, named, kept = {}, 0, {}
     for _, s in ipairs(slots) do
-        local cands = Candidates(s)
-        if #cands > 0 then named = named + 1 end
-        for _, c in ipairs(cands) do
-            if Sell.Match(c) then picked[#picked + 1] = {slot = s, name = c} break end
+        if #Candidates(s) > 0 then named = named + 1 end
+        local label, why = Sell.Pick(s)
+        if label then
+            picked[#picked + 1] = {slot = s, name = label}
+        elseif why then
+            kept[why] = (kept[why] or 0) + 1
         end
     end
+    -- Why the rest were kept, in one line ("3 equipped, 12 rarity unreadable").
+    local keptTxt = {}
+    for why, n in pairs(kept) do keptTxt[#keptTxt + 1] = ("%d %s"):format(n, why) end
+    if #keptTxt > 0 then print("[DQR] Sell: kept " .. table.concat(keptTxt, ", ") .. ".") end
     if #picked == 0 then
-        if #slots > 0 and named == 0 then
+        if #slots > 0 and named == 0 and not CONFIG.SellByRarity then
             print(("[DQR] Sell: %d item slot(s) on the shop screen, but none carries a name I "
                 .. "can read. Run DQR_SellDump() with the shop open and send the output."):format(#slots))
         else
-            print(("[DQR] Sell: nothing on the shop screen is on SellNames (%d slot(s) looked at)."):format(#slots))
+            print(("[DQR] Sell: nothing on the shop screen to sell (%d slot(s) looked at)."):format(#slots))
         end
         Sell.Close(gui)
         return
@@ -9841,10 +10087,12 @@ function Sell.Dump()
     for i, s in ipairs(slots) do
         if i > 60 then break end
         local cands = Candidates(s)
-        local m = false
-        for _, c in ipairs(cands) do if Sell.Match(c) then m = true break end end
-        print(("%s | names: %s | on SellNames: %s"):format(s:GetFullName(),
-            #cands > 0 and table.concat(cands, " / ") or "(none)", tostring(m)))
+        local r, how = Sell.SlotRarity(s)
+        local label, why = Sell.Pick(s)
+        print(("%s | names: %s | rarity: %s | %s"):format(s:GetFullName(),
+            #cands > 0 and table.concat(cands, " / ") or "(none)",
+            r and (r .. " (" .. how .. ")") or "unreadable",
+            label and "WOULD SELL" or ("kept: " .. tostring(why))))
     end
     print("[DQR] === END ===")
 end
@@ -9894,6 +10142,161 @@ local function Guarded(name, fn)
             Farm.Start()
         end
     end
+end
+
+-- RUNS. A run is "open" from when the bot leaves the lobby for a dungeon
+-- until it is counted - when its reward panel comes up (the final boss
+-- is down), or, if that was missed, when it is back in the lobby. Once
+-- per run either way. Counting pushes a status update at once.
+Farm.runsDone, Farm.soldAtRun, Farm.runOpen = 0, 0, false
+-- RUN TIME: Farm.runStartAt is set when a run gets under way (see
+-- Brain.Loop), Farm.runEndAt when it is counted; both cleared when the
+-- next run opens, so the clock starts from 0 again.
+function Farm.OpenRun()
+    Farm.runOpen = true
+    Farm.runStartAt, Farm.runEndAt = nil, nil
+end
+function Farm.CountRun(how)
+    if not Farm.runOpen then return end
+    Farm.runOpen = false
+    Farm.runsDone = Farm.runsDone + 1
+    local took = ""
+    if Farm.runStartAt then
+        Farm.runEndAt = tick()
+        Farm.lastRunTime = Farm.runEndAt - Farm.runStartAt
+        took = " in " .. Hud.Clock(Farm.lastRunTime)
+    end
+    Farm.statusNow = true
+    print(("[DQR] Run %d finished%s (%s)."):format(Farm.runsDone, took, how))
+end
+
+-- SellAfterRuns: SellEveryRuns finished since the last sell?
+function Farm.SellDue()
+    local n = CONFIG.SellEveryRuns or 0
+    return CONFIG.SellAfterRuns and n > 0 and (Farm.runsDone - Farm.soldAtRun) >= n
+end
+
+-- ---- back to the lobby -----------------------------------------
+-- A finished run does NOT go back to the lobby by itself: the game
+-- shows a Replay button in the dungeon, and the bot replays from there
+-- (that screen counts as "lobby" for stopping the farm). The shop is in
+-- the real lobby, so selling means leaving: the door button at the
+-- bottom right, then YES on "Return to Lobby?".
+
+-- The real lobby: its own screens up (not just the Replay button).
+function Farm.RealLobby()
+    if DungeonStartButton() then return false end
+    for _, k in ipairs({"LobbyPlay", "IntroPlay", "SelectPanel", "ChoosePanel", "LobbyInfo"}) do
+        if PathVisible(UI[k]) then return true end
+    end
+    return false
+end
+
+-- Is this button inside the "Return to Lobby?" panel? (A label saying
+-- "lobby" within a few levels up, short of the whole ScreenGui.)
+function Farm.LobbyPanel(btn)
+    local node = btn.Parent
+    for _ = 1, 4 do
+        if not node or node:IsA("LayerCollector") then return false end
+        for _, d in ipairs(node:GetDescendants()) do
+            if d:IsA("TextLabel") and Norm(d.Text):find("lobby", 1, true) then return true end
+        end
+        node = node.Parent
+    end
+    return false
+end
+
+-- The door button that opens it: CONFIG.LobbyButtonPath if set, else a
+-- visible button named or labelled like leaving / the lobby.
+function Farm.LobbyDoor()
+    local p = CONFIG.LobbyButtonPath
+    if type(p) == "table" and #p > 0 then
+        local b = Path(p)
+        if b and b:IsA("GuiButton") then return b end
+        print("[DQR] LobbyButtonPath does not point at a button - looking by name.")
+    end
+    local ANSWERS = {yes = true, no = true, confirm = true, cancel = true, ok = true}
+    for _, b in ipairs(FindButtons({
+            {name = "lobby", contains = true}, {name = "leave", contains = true},
+            {name = "return", contains = true}, {name = "teleport", contains = true},
+            {name = "home", contains = true}, {name = "exit", contains = true},
+            {text = "lobby", contains = true}, {text = "leave", contains = true}})) do
+        local answer = false
+        for _, tok in ipairs(ButtonTokens(b)) do
+            if ANSWERS[tok] then answer = true break end
+        end
+        if VisibleOnScreen(b) and not answer then return b end
+    end
+    return nil
+end
+
+-- The YES in the "Return to Lobby?" panel (visible or not).
+function Farm.LobbyYes()
+    for _, b in ipairs(FindButtons({{text = "yes"}, {text = "confirm"}})) do
+        if Farm.LobbyPanel(b) then return b end
+    end
+    return nil
+end
+
+-- Door -> YES -> wait for the real lobby. True when there.
+function Farm.ReturnToLobby()
+    if Farm.dead then return false end
+    print("[DQR] Leaving for the lobby to sell (door button, then YES).")
+    local yes = Farm.LobbyYes()
+    if not (yes and VisibleOnScreen(yes)) then
+        local door = Farm.LobbyDoor()
+        if door then
+            print("[DQR]   door button: " .. door:GetFullName())
+            ClickButton(door)
+            local t = 0
+            repeat
+                S(0.25) t = t + 0.25
+                yes = Farm.LobbyYes()
+            until (yes and VisibleOnScreen(yes)) or t > 3 or Farm.dead
+        else
+            print("[DQR]   no door button found - trying the panel's YES directly.")
+        end
+    end
+    if not yes then
+        print("[DQR] Return to lobby: no 'Return to Lobby?' YES button found. Run "
+            .. "DQR_LobbyDump() at the end of a run and send the output.")
+        return false
+    end
+    ClickButton(yes)
+    local t = 0
+    repeat S(1) t = t + 1 until Farm.RealLobby() or Farm.dead or t > 60
+    if Farm.RealLobby() then
+        print("[DQR] Back in the lobby.")
+        return true
+    end
+    print("[DQR] Return to lobby: pressed YES, but the lobby did not show up within 60s.")
+    return false
+end
+
+-- DQR_LobbyDump(): the buttons at the bottom right of the screen, with
+-- the path to put in CONFIG.LobbyButtonPath, and what would be clicked.
+function Farm.LobbyDump()
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    local cam = workspace.CurrentCamera
+    if not (pg and cam) then return end
+    local vp = cam.ViewportSize
+    print("[DQR] === BUTTONS AT THE BOTTOM RIGHT ===")
+    for _, o in ipairs(pg:GetDescendants()) do
+        if (o:IsA("ImageButton") or o:IsA("TextButton")) and VisibleOnScreen(o) then
+            local c = o.AbsolutePosition + o.AbsoluteSize / 2
+            if c.X > vp.X * 0.6 and c.Y > vp.Y * 0.55 then
+                local parts, n = {}, o
+                while n and n ~= pg do table.insert(parts, 1, ('"%s"'):format(n.Name)) n = n.Parent end
+                print(("  {%s}  text='%s'%s"):format(table.concat(parts, ", "),
+                    ButtonText(o), o:IsA("ImageButton") and (" image=" .. o.Image) or ""))
+            end
+        end
+    end
+    local door, yes = Farm.LobbyDoor(), Farm.LobbyYes()
+    print("[DQR] Door button it would click: " .. (door and door:GetFullName() or "none found"))
+    print("[DQR] YES button it would click: " .. (yes and yes:GetFullName() or "none found"))
+    print("[DQR] Real lobby now: " .. tostring(Farm.RealLobby()))
+    print("[DQR] === END ===")
 end
 
 function Farm.Start()
@@ -9987,10 +10390,29 @@ local function Supervisor()
 
         if InLobby() then
             Look.mapApplied, Look.y0 = false, nil     -- the next dungeon gets a fresh map pass
+            Farm.CountRun("run over")                 -- if its reward panel was missed
+            -- The run is over: the next one has to show its own START
+            -- before the buff goes on again (Brain.RunLive).
+            Farm.startSeenAt = nil
             if not CONFIG.AutoRunDungeon then continue end
-            -- Sell first, whichever way the next run starts (Replay skips
-            -- the queue screen, and with it the sell step there).
-            if PathVisible(UI.Replay) then Sell.Run() end
+            -- Selling: AutoSell after every run, SellAfterRuns every
+            -- SellEveryRuns runs. The shop is in the REAL lobby, and a run
+            -- ends on the dungeon's Replay screen - so first leave (door
+            -- button, YES), and sell on the next pass, in the lobby. If
+            -- leaving fails it replays without selling and tries next run.
+            local sellDue = Farm.SellDue()
+            if (sellDue or CONFIG.AutoSell) and not Farm.RealLobby() and not Sell.leaveFailed then
+                if Farm.ReturnToLobby() then continue end
+                Sell.leaveFailed = true               -- not again this run
+                print("[DQR] Could not get to the lobby - replaying without selling.")
+            elseif sellDue and Farm.RealLobby() then
+                print(("[DQR] %d run(s) since the last sell - selling before the next run.")
+                    :format(Farm.runsDone - Farm.soldAtRun))
+                Farm.soldAtRun = Farm.runsDone
+                Sell.Run(true)
+            elseif CONFIG.AutoSell and Farm.RealLobby() then
+                Sell.Run()
+            end
             local replay = PathVisible(UI.Replay)
             if replay then
                 print("[DQR] Replay Dungeon available - clicking it.")
@@ -10003,7 +10425,11 @@ local function Supervisor()
                 local t = 0
                 repeat S(2) t = t + 2 until IsInDungeon() or t > 90
             end
-            if IsInDungeon() then Farm.Start() end
+            if IsInDungeon() then
+                Farm.OpenRun()                        -- a new run begins (timer from 0)
+                Sell.leaveFailed = false
+                Farm.Start()
+            end
             continue
         end
         -- Not the lobby - for long enough to believe it.
@@ -10018,7 +10444,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.13 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.17 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -10071,6 +10497,7 @@ task.spawn(function()
 
     if not marker then
         print("[DQR] No lobby UI - assuming we are in a dungeon.")
+        Farm.OpenRun()                                -- this dungeon counts as a run
         Farm.Start()
     elseif not CONFIG.AutoRunDungeon then
         print("[DQR] In the lobby - AutoRunDungeon is off, waiting for a dungeon.")
@@ -10239,6 +10666,10 @@ end))
 -- Console helpers.
 getgenv = getgenv or function() return _G end
 getgenv().DQR_SelfDestruct = function() Farm.SelfDestruct("by hand") end
+-- DQR_LobbyDump(): at the end of a run, what "return to lobby" would
+-- click. DQR_ToLobby(): do it now.
+getgenv().DQR_LobbyDump  = function() Farm.LobbyDump() end
+getgenv().DQR_ToLobby    = function() task.spawn(Farm.ReturnToLobby) end
 getgenv().DQR_Dump    = DumpGui
 getgenv().DQR_Lobby   = InLobby
 getgenv().DQR_Queue   = RunLobbyFlow
