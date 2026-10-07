@@ -129,7 +129,7 @@ local CONFIG = {
     -- loot post @-mentions you when a drop is one of the rarities set to
     -- true below - those are always posted, whatever LootRarities says.
     -- "" = never ping.
-    DiscordUserId    = "",
+    DiscordUserId    = "793711555447357471",
     LootPingRarities = {
         Common    = false,
         Uncommon  = false,
