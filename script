@@ -120,10 +120,10 @@ local CONFIG = {
     -- Which rarities are worth a post. An item whose rarity cannot be
     -- read is always posted, so an unknown colour never hides a drop.
     LootRarities   = {
-        Common    = true,
-        Uncommon  = true,
-        Rare      = true,
-        Epic      = true,
+        Common    = false,
+        Uncommon  = false,
+        Rare      = false,
+        Epic      = false,
         Legendary = true,
         Ultimate  = true,
     },
