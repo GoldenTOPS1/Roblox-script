@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.25
+--  DQR AUTO FARM v13.26
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -9882,6 +9882,9 @@ function Farm.StatusWatcher()
                     local left = CONFIG.SellEveryRuns - ((Farm.runsDone or 0) - (Farm.soldAtRun or 0))
                     runs = runs .. ("\nsell in %d"):format(math.max(0, left))
                 end
+                -- Wins / losses: awards at the end = a win; "Dungeon failed",
+                -- or no awards before the next run = a loss.
+                runs = runs .. ("\n%d W / %d L"):format(Farm.runsWon or 0, Farm.runsLost or 0)
                 F("Runs", runs)
                 -- This run's clock: from 0 when it gets under way, stopped
                 -- when it is over (shown until the next one starts), with
@@ -9897,7 +9900,8 @@ function Farm.StatusWatcher()
                     if Farm.lastRunTime then rt = rt .. "\nlast " .. Hud.Clock(Farm.lastRunTime) end
                 end
                 F("Run time", rt)
-                F("Deaths", ("%d this run"):format(Farm.runDeaths or 0))
+                F("Deaths", ("%d this run\n%d overall"):format(Farm.runDeaths or 0,
+                    Farm.deathsTotal or 0))
                 local near = 0
                 for _, rec in ipairs(Mobs.list) do
                     if rec.Flat <= 150 then near = near + 1 end
@@ -10624,7 +10628,7 @@ function Farm.SaveRuns()
     local ok, data = pcall(function()
         return HttpService:JSONEncode({runs = Farm.runsDone, soldAt = Farm.soldAtRun,
             last = Farm.lastRunTime, parked = Farm.parked, won = Farm.runsWon,
-            lost = Farm.runsLost, at = os.time()})
+            lost = Farm.runsLost, deaths = Farm.deathsTotal, at = os.time()})
     end)
     if not ok then return end
     local wf = Env("writefile")
@@ -10651,6 +10655,7 @@ function Farm.LoadRuns()
     Farm.soldAtRun = math.min(tonumber(t.soldAt) or 0, Farm.runsDone)
     Farm.lastRunTime = tonumber(t.last)
     Farm.runsWon, Farm.runsLost = tonumber(t.won) or 0, tonumber(t.lost) or 0
+    Farm.deathsTotal = tonumber(t.deaths) or 0
     if type(t.parked) == "string" and t.parked ~= "" then
         Farm.parked = t.parked
         print(("[DQR] Still parked after a %s - no new runs (DQR_Resume() carries on)."):format(t.parked))
@@ -10678,8 +10683,12 @@ function Farm.HookDeaths(char)
     Farm.Track(hum.Died:Connect(function()
         if Farm.dead or not Farm.runOpen then return end
         Farm.runDeaths = (Farm.runDeaths or 0) + 1
+        -- Overall too, saved straight away: it carries across servers.
+        Farm.deathsTotal = (Farm.deathsTotal or 0) + 1
+        pcall(Farm.SaveRuns)
         Farm.statusNow = true
-        print(("[DQR] Died - %d death(s) this run."):format(Farm.runDeaths))
+        print(("[DQR] Died - %d death(s) this run, %d overall."):format(Farm.runDeaths,
+            Farm.deathsTotal))
     end))
 end
 if LP.Character then task.spawn(Farm.HookDeaths, LP.Character) end
@@ -10703,7 +10712,31 @@ function Farm.CountRun(how)
     end
     pcall(Farm.SaveRuns)
     Farm.statusNow = true
-    print(("[DQR] Run %d finished%s (%s)."):format(Farm.runsDone, took, how))
+    print(("[DQR] Run %d %s%s (%s) - %d W / %d L."):format(Farm.runsDone,
+        how == "reward panel" and "won" or "lost", took, how, Farm.runsWon or 0, Farm.runsLost or 0))
+end
+
+-- DUNGEON FAILED: while a run is open, once a second, any label on screen
+-- that says the dungeon / run failed counts the run as a loss at once
+-- (else it would only count when the next run comes round).
+function Farm.FailWatcher()
+    while not Farm.dead do
+        S(1)
+        if Farm.runOpen then pcall(function()
+            local pg = LP:FindFirstChildOfClass("PlayerGui")
+            for _, o in ipairs(pg and pg:GetDescendants() or {}) do
+                if o:IsA("TextLabel") and not (LogGui and o:IsDescendantOf(LogGui)) then
+                    local t = Norm(o.Text)
+                    if (t:find("dungeonfailed", 1, true) or t:find("runfailed", 1, true)
+                        or t:find("missionfailed", 1, true) or t:match("^failed!?$"))
+                    and VisibleOnScreen(o) then
+                        Farm.CountRun("dungeon failed")
+                        return
+                    end
+                end
+            end
+        end) end
+    end
 end
 
 -- SellAfterRuns: SellEveryRuns finished since the last sell?
@@ -11014,7 +11047,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.25 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.26 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -11045,6 +11078,7 @@ task.spawn(function()
     task.spawn(StartWatcher)
     task.spawn(VanityWatcher)
     task.spawn(LootWatcher)
+    task.spawn(Farm.FailWatcher)
 
     -- PlayerGui is still filling in right after injection: sample for
     -- a few seconds before deciding there is no lobby.
@@ -11314,13 +11348,16 @@ getgenv().DQR_Resume     = function()
     Farm.statusNow = true
     print("[DQR] Resumed - the next run starts as usual.")
 end
-getgenv().DQR_ResetRuns  = function()
+-- DQR_ResetStats() / DQR_ResetRuns(): runs, wins / losses and overall
+-- deaths back to 0 ("resetstats" or "resetruns" in the command box).
+getgenv().DQR_ResetStats = function()
     Farm.runsDone, Farm.soldAtRun, Farm.lastRunTime = 0, 0, nil
-    Farm.runsWon, Farm.runsLost = 0, 0
+    Farm.runsWon, Farm.runsLost, Farm.deathsTotal = 0, 0, 0
     pcall(Farm.SaveRuns)
     Farm.statusNow = true
-    print("[DQR] Run count reset to 0.")
+    print("[DQR] Stats reset: 0 runs, 0 W / 0 L, 0 deaths.")
 end
+getgenv().DQR_ResetRuns  = getgenv().DQR_ResetStats
 getgenv().DQR_ToLobby    = function() task.spawn(Farm.ReturnToLobby) end
 getgenv().DQR_Dump    = DumpGui
 getgenv().DQR_Lobby   = InLobby
