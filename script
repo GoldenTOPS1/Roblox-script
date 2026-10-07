@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.18
+--  DQR AUTO FARM v13.19
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -93,6 +93,11 @@ local CONFIG = {
     -- the door's path in LobbyButtonPath. DQR_ToLobby() tries it by hand.
     SellAfterRuns  = false,
     SellEveryRuns  = 10,
+    -- The run count (status webhook, SellEveryRuns) is saved to a file,
+    -- so it carries on across servers - every Replay is a new one. It
+    -- starts again from 0 after this many hours with no run (0 = never).
+    -- DQR_ResetRuns() in the console zeroes it by hand.
+    RunsResetHours = 6,
     LobbyButtonPath = {},       -- e.g. {"mainInterface", "buttons", "lobbyButton"}
     -- SellDryRun = true: walks there, opens the shop and clicks the items,
     -- but does NOT press Sell - the log lists what it would have sold.
@@ -514,6 +519,10 @@ local CONFIG = {
     SmartMobRadius = 10,
     SmartClimbCost = 1.5,    -- extra cost per stud climbed
     ShowPath       = true,   -- small dots along the planned route
+    -- Straighten every route into as few straight legs as the ground
+    -- allows - up stairs too (the bot used to weave left and right up a
+    -- flight, between the pathfinder's waypoints). false = as planned.
+    SmoothPath     = true,
     PathMinDist    = 12,
     RepathDist     = 8,
     WaypointReach  = 4,
@@ -6366,11 +6375,64 @@ function Nav.HopClear(a, b, rp)
 end
 
 -- A straight leg the smoothing may keep.
+-- v13.19: a leg that climbs or drops (stairs, a ramp) is fine when the
+-- ground under it FOLLOWS it. The old rule turned down any leg with more
+-- than JumpMax of height in it - meant for walls - so a route up a
+-- flight of stairs was never straightened, and the bot weaved between
+-- the pathfinder's left-right waypoints all the way up.
 function Nav.LegOK(a, b, hazList)
-    if math.abs(a.Y - b.Y) > CONFIG.JumpMax then return false end
-    if not LineClear(a, b) or not GroundOnPath(a, b) then return false end
+    local dy, flat = b.Y - a.Y, FlatDist(a, b)
+    if math.abs(dy) > 2 then
+        -- Not steeper than about 50 degrees, and walkable all the way.
+        if math.abs(dy) > math.max(CONFIG.JumpMax, flat * 1.2) then return false end
+        if not LineClear(a, b) or not Nav.SlopeOK(a, b) then return false end
+    else
+        if not LineClear(a, b) or not GroundOnPath(a, b) then return false end
+    end
     if hazList and #hazList > 0 and Haz.OnPath(a, b, hazList) then return false end
     return true
+end
+
+-- Along a climbing / dropping leg, every 2 studs: floor under it, the
+-- line at standing height over that floor (not floating over a gap, not
+-- cutting into a step), and no step up taller than 3.
+function Nav.SlopeOK(a, b)
+    local rp = RayParams(true)
+    local n = math.max(1, math.ceil(FlatDist(a, b) / 2))
+    local prev = a.Y
+    for k = 1, n do
+        local p = a:Lerp(b, k / n)
+        local y = Nav.Probe(p.X, p.Z, p.Y - 3, rp)
+        if not y or math.abs(y - p.Y) > 3 or y - prev > 3 then return false end
+        prev = y
+    end
+    return true
+end
+
+-- Straighten any route: from each point, the furthest later one (up to
+-- 12 on, 40 studs) a straight leg reaches cleanly - stairs included.
+-- Jump waypoints are never skipped. Used on every route, whichever
+-- planner made it.
+function Nav.Smooth(from, wps)
+    if CONFIG.SmoothPath == false or not wps or #wps < 2 then return wps end
+    local live = #Haz.shapes > 0 and Haz.Live(Haz.shapes) or nil
+    local pts = {{Position = from}}
+    for _, w in ipairs(wps) do pts[#pts + 1] = w end
+    local out, i = {}, 1
+    while i < #pts do
+        local j = math.min(#pts, i + 12)
+        while j > i + 1 do
+            local ok = (pts[j].Position - pts[i].Position).Magnitude <= 40
+            for k = i + 1, j - 1 do
+                if pts[k].Action == Enum.PathWaypointAction.Jump then ok = false break end
+            end
+            if ok and Nav.LegOK(pts[i].Position, pts[j].Position, live) then break end
+            j = j - 1
+        end
+        out[#out + 1] = pts[j]
+        i = j
+    end
+    return out
 end
 
 -- Does walking `wps` from `from` (the first `n` legs) step into a
@@ -6806,6 +6868,7 @@ local function Worker(myGen)
                 local forced = Nav.force
                 Nav.force = false
                 local wps = ComputePath(pos, goal)
+                if wps then wps = Nav.Smooth(pos, wps) end
                 if wps and not forced and #Nav.queue > 0 and Nav.KeepOld(pos, goal, wps) then
                     -- The route in hand still gets there about as well:
                     -- keep it. Swapping to a route that starts off the
@@ -6918,8 +6981,10 @@ local function Heartbeat(dt)
         if wp then
             step = wp.Position
             local rise = wp.Position.Y - pos.Y
-            if rise > CONFIG.JumpMax then
-                -- Taller than a jump: a wall the route misjudged.
+            -- Taller than a jump AND steep: a wall the route misjudged. (A
+            -- straightened leg up a flight of stairs rises more than a
+            -- jump too, but over a long way - that one is walked.)
+            if rise > CONFIG.JumpMax and rise > FlatDist(wp.Position, pos) * 1.2 then
                 table.remove(Nav.queue, 1)
                 Nav.force, wpStuck = true, 0
             elseif CONFIG.AllowJump and (wp.Action == Enum.PathWaypointAction.Jump or rise > 3) then
@@ -10150,6 +10215,46 @@ end
 -- is down), or, if that was missed, when it is back in the lobby. Once
 -- per run either way. Counting pushes a status update at once.
 Farm.runsDone, Farm.soldAtRun, Farm.runOpen = 0, 0, false
+
+-- KEPT ACROSS SERVERS (v13.19). Every Replay is a new dungeon server, and
+-- the script starts afresh in each one - so the count was back to 0
+-- after every run (and SellAfterRuns could never reach 10). Saved to a
+-- file (and the executor's shared table as a fallback) after each run,
+-- read back at start. After RunsResetHours without a run, it starts
+-- again from 0 - a new session.
+Farm.RUNS_KEY = "DQR_runs.txt"
+function Farm.SaveRuns()
+    local ok, data = pcall(function()
+        return HttpService:JSONEncode({runs = Farm.runsDone, soldAt = Farm.soldAtRun,
+            last = Farm.lastRunTime, at = os.time()})
+    end)
+    if not ok then return end
+    local wf = Env("writefile")
+    if typeof(wf) == "function" then pcall(wf, Farm.RUNS_KEY, data) end
+    pcall(function() getgenv().DQR_Runs = data end)
+end
+function Farm.LoadRuns()
+    local raw
+    local rf = Env("readfile")
+    if typeof(rf) == "function" then
+        local ok, v = pcall(rf, Farm.RUNS_KEY)
+        if ok and type(v) == "string" then raw = v end
+    end
+    if not raw then pcall(function() raw = getgenv().DQR_Runs end) end
+    if type(raw) ~= "string" then return end
+    local ok, t = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not ok or type(t) ~= "table" then return end
+    local hours = CONFIG.RunsResetHours or 0
+    if hours > 0 and os.time() - (tonumber(t.at) or 0) > hours * 3600 then
+        print(("[DQR] Run count: last run over %dh ago - starting a new count."):format(hours))
+        return
+    end
+    Farm.runsDone = tonumber(t.runs) or 0
+    Farm.soldAtRun = math.min(tonumber(t.soldAt) or 0, Farm.runsDone)
+    Farm.lastRunTime = tonumber(t.last)
+    print(("[DQR] Run count carried over: %d run(s) so far."):format(Farm.runsDone))
+end
+pcall(Farm.LoadRuns)
 -- RUN TIME: Farm.runStartAt is set when a run gets under way (see
 -- Brain.Loop), Farm.runEndAt when it is counted; both cleared when the
 -- next run opens, so the clock starts from 0 again.
@@ -10167,6 +10272,7 @@ function Farm.CountRun(how)
         Farm.lastRunTime = Farm.runEndAt - Farm.runStartAt
         took = " in " .. Hud.Clock(Farm.lastRunTime)
     end
+    pcall(Farm.SaveRuns)
     Farm.statusNow = true
     print(("[DQR] Run %d finished%s (%s)."):format(Farm.runsDone, took, how))
 end
@@ -10410,6 +10516,7 @@ local function Supervisor()
                 print(("[DQR] %d run(s) since the last sell - selling before the next run.")
                     :format(Farm.runsDone - Farm.soldAtRun))
                 Farm.soldAtRun = Farm.runsDone
+                pcall(Farm.SaveRuns)                  -- the next server knows it sold
                 Sell.Run(true)
             elseif CONFIG.AutoSell and Farm.RealLobby() then
                 Sell.Run()
@@ -10445,7 +10552,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.18 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.19 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -10682,6 +10789,12 @@ getgenv().DQR_SelfDestruct = function() Farm.SelfDestruct("by hand") end
 -- DQR_LobbyDump(): at the end of a run, what "return to lobby" would
 -- click. DQR_ToLobby(): do it now.
 getgenv().DQR_LobbyDump  = function() Farm.LobbyDump() end
+getgenv().DQR_ResetRuns  = function()
+    Farm.runsDone, Farm.soldAtRun, Farm.lastRunTime = 0, 0, nil
+    pcall(Farm.SaveRuns)
+    Farm.statusNow = true
+    print("[DQR] Run count reset to 0.")
+end
 getgenv().DQR_ToLobby    = function() task.spawn(Farm.ReturnToLobby) end
 getgenv().DQR_Dump    = DumpGui
 getgenv().DQR_Lobby   = InLobby
