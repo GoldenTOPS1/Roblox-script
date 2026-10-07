@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.24
+--  DQR AUTO FARM v13.25
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -128,6 +128,15 @@ local CONFIG = {
         Ultimate  = true,
     },
     LootPostIfEmpty = false, -- post gold/gems even when no item qualifies
+    -- The post is ONE card: Loot (every item, best first, with a rarity
+    -- dot, name and kind), Earned, Banked, Bag, Session (W / L), the run's
+    -- time and deaths, and the best item's picture. LootRarities above
+    -- decides whether a run is posted at all.
+    -- Item names: the reward screen shows pictures only, so each one is
+    -- looked up in the game's own item data, else by the picture's name
+    -- on Roblox. Learned names are kept in DQR_items.txt. false = rarity
+    -- only, no look-ups.
+    LootNames      = true,
     -- PING: your Discord user ID (Discord: Settings > Advanced >
     -- Developer Mode on, then right-click your name > Copy User ID). The
     -- loot post @-mentions you when a drop is one of the rarities set to
@@ -9014,7 +9023,7 @@ local function ItemSlots(panel)
             if id then
                 local glow = o.Parent and o.Parent:FindFirstChild("glow")
                 local col = glow and glow:IsA("ImageLabel") and glow.ImageColor3 or nil
-                items[#items + 1] = {id = id, color = col, rarity = Rarity(col)}
+                items[#items + 1] = {id = id, color = col, rarity = Rarity(col), slot = o.Parent}
             end
         end
     end
@@ -9118,8 +9127,240 @@ local function CollectLoot(panel)
     return icons, names, viewports
 end
 
--- Post the panel's contents. With no panel, posts a test message so
--- the URL can be checked without finishing a run.
+-- ---- item names --------------------------------------------------
+-- The reward panel shows pictures only, so each item is looked up by its
+-- picture's asset id: (1) anything written on its slot; (2) the game's
+-- own item data in ReplicatedStorage - a value or attribute holding that
+-- picture, or an item-data ModuleScript (read once per server); (3) the
+-- name the picture was uploaded under on Roblox. Found names (with the
+-- item's kind and sell value, when the data has them) are cached and
+-- saved to DQR_items.txt, so each item is only looked up once ever.
+-- CONFIG.LootNames = false skips (2) and (3).
+Hud.itemCache, Hud.ITEMS_KEY = {}, "DQR_items.txt"
+function Hud.LoadItemCache()
+    if Hud.cacheLoaded then return end
+    Hud.cacheLoaded = true
+    local rf = Env("readfile")
+    if typeof(rf) ~= "function" then return end
+    local ok, raw = pcall(rf, Hud.ITEMS_KEY)
+    if not ok or type(raw) ~= "string" then return end
+    local ok2, t = pcall(function() return HttpService:JSONDecode(raw) end)
+    if ok2 and type(t) == "table" then
+        for id, v in pairs(t) do
+            if type(v) == "table" and type(v.name) == "string" then Hud.itemCache[tostring(id)] = v end
+        end
+    end
+end
+function Hud.SaveItemCache()
+    local wf = Env("writefile")
+    if typeof(wf) ~= "function" then return end
+    pcall(function() wf(Hud.ITEMS_KEY, HttpService:JSONEncode(Hud.itemCache)) end)
+end
+
+-- "weapons" / "WeaponData" -> "Weapon", "armors" -> "Armour", "abilities"
+-- -> "Spell"; anything else short and wordy, capitalised; else nil.
+function Hud.KindLabel(s)
+    if type(s) ~= "string" or s == "" then return nil end
+    local l = s:lower()
+    if l:find("weapon", 1, true) or l:find("sword", 1, true) then return "Weapon" end
+    if l:find("armo", 1, true) or l:find("helm", 1, true) then return "Armour" end
+    if l:find("spell", 1, true) or l:find("abilit", 1, true) or l:find("skill", 1, true) then return "Spell" end
+    if l:find("pet", 1, true) then return "Pet" end
+    if #s <= 16 and not s:find("[%d_]") then return (s:gsub("^%l", string.upper)) end
+    return nil
+end
+
+-- An uploaded picture's name as an item name: "Mjolnir_Icon.png" ->
+-- "Mjolnir". Nil when nothing item-like is left ("Image", "12345").
+function Hud.CleanName(n)
+    if type(n) ~= "string" then return nil end
+    n = n:gsub("%.%a%a%a%a?$", ""):gsub("(%l)(%u)", "%1 %2"):gsub("[_%-]+", " ")
+    local JUNK = {icon = true, image = true, img = true, thumbnail = true, thumb = true,
+                  render = true, picture = true, pic = true, decal = true, item = true, new = true}
+    local words = {}
+    for w in n:gmatch("%S+") do
+        if not JUNK[w:lower()] and not w:match("^%d+$") then words[#words + 1] = w end
+    end
+    n = table.concat(words, " ")
+    if #n < 3 or not n:find("%a%a") then return nil end
+    return n
+end
+
+-- The game's item data, read once per server: asset id -> {name, kind,
+-- value}. Only keys named like a picture (image / icon / thumb...) are
+-- looked at, so a price is never taken for one.
+function Hud.BuildItemIndex()
+    if Hud.index then return Hud.index end
+    if Hud.indexing then
+        local t0 = tick()
+        while Hud.indexing and tick() - t0 < 10 do S(0.25) end
+        return Hud.index or {}
+    end
+    Hud.indexing = true
+    local idx, budget, modules = {}, 0, 0
+    local IMGKEY = {"image", "icon", "thumb", "picture", "texture", "decal", "img"}
+    local function ImgKey(k)
+        if type(k) ~= "string" then return false end
+        local l = k:lower()
+        for _, w in ipairs(IMGKEY) do if l:find(w, 1, true) then return true end end
+        return false
+    end
+    local function Note(v, name, kind, value)
+        if type(name) ~= "string" or name == "" then return end
+        for id in tostring(v):gmatch("%d%d%d%d%d%d+") do
+            if not idx[id] then
+                idx[id] = {name = name, kind = Hud.KindLabel(kind), value = tonumber(value)}
+            end
+        end
+    end
+    local RS = game:GetService("ReplicatedStorage")
+    -- 1. A value or attribute holding the picture, named by its holder.
+    for _, o in ipairs(RS:GetDescendants()) do
+        budget = budget + 1
+        if budget % 2000 == 0 then task.wait() end
+        pcall(function()
+            if o:IsA("ValueBase") and ImgKey(o.Name) and o.Parent then
+                local h = o.Parent
+                Note(o.Value, h:GetAttribute("DisplayName") or h.Name,
+                    h:GetAttribute("Type") or (h.Parent and h.Parent.Name),
+                    h:GetAttribute("SellPrice") or h:GetAttribute("Value"))
+            end
+            for k, v in pairs(o:GetAttributes()) do
+                if ImgKey(k) then
+                    Note(v, o:GetAttribute("DisplayName") or o:GetAttribute("Name") or o.Name,
+                        o:GetAttribute("Type") or o:GetAttribute("Category") or (o.Parent and o.Parent.Name),
+                        o:GetAttribute("SellPrice") or o:GetAttribute("Value") or o:GetAttribute("Price"))
+                end
+            end
+        end)
+    end
+    -- 2. Item-data ModuleScripts (plain tables), walked.
+    local GOOD = {"item", "weapon", "armor", "armour", "spell", "abilit", "loot", "gear", "equip", "drop"}
+    local BAD = {"controller", "service", "handler", "client", "server", "gui", "manager",
+                 "remote", "network", "effect", "anim", "sound"}
+    local seen = {}
+    local function Field(t, keys)
+        for _, k in ipairs(keys) do
+            local v = rawget(t, k)
+            if v ~= nil then return v end
+        end
+        return nil
+    end
+    local function Walk(t, key, pkey, depth)
+        if depth > 7 or seen[t] or budget > 300000 then return end
+        seen[t] = true
+        for k, v in pairs(t) do
+            budget = budget + 1
+            if budget % 5000 == 0 then task.wait() end
+            if type(v) == "table" then
+                Walk(v, k, key, depth + 1)
+            elseif (type(v) == "string" or type(v) == "number") and ImgKey(k) then
+                local name = Field(t, {"name", "Name", "displayName", "DisplayName", "itemName", "ItemName"})
+                if type(name) ~= "string" and type(key) == "string" then name = key end
+                local kind = Field(t, {"type", "Type", "itemType", "ItemType", "category", "Category",
+                                       "class", "Class", "slot", "Slot"})
+                if type(kind) ~= "string" and type(pkey) == "string" then kind = pkey end
+                Note(v, name, kind, Field(t, {"sellPrice", "SellPrice", "sellValue", "SellValue",
+                                              "value", "Value", "price", "Price"}))
+            end
+        end
+    end
+    for _, m in ipairs(RS:GetDescendants()) do
+        if m:IsA("ModuleScript") and modules < 40 then
+            local l = m.Name:lower()
+            local good, bad = false, false
+            for _, w in ipairs(GOOD) do if l:find(w, 1, true) then good = true break end end
+            for _, w in ipairs(BAD) do if l:find(w, 1, true) then bad = true break end end
+            if good and not bad then
+                modules = modules + 1
+                local ok, data = pcall(require, m)
+                if ok and type(data) == "table" then pcall(Walk, data, m.Name, nil, 0) end
+            end
+        end
+    end
+    local n = 0
+    for _ in pairs(idx) do n = n + 1 end
+    print(("[DQR] Item names: %d item(s) found in the game's data (%d data module(s) read).")
+        :format(n, modules))
+    Hud.index, Hud.indexing = idx, false
+    return idx
+end
+
+-- {name, kind, value} for a reward slot's picture, or nil.
+function Hud.ItemInfo(id, slot)
+    Hud.LoadItemCache()
+    if Hud.itemCache[id] then return Hud.itemCache[id] end
+    local info = nil
+    -- 1. Written on the slot: a name attribute or value, or a label that
+    -- is a name (not "x1", not a tier word).
+    if slot then pcall(function()
+        for _, k in ipairs({"ItemName", "itemName", "DisplayName", "Name", "name"}) do
+            local v = slot:GetAttribute(k)
+            if type(v) == "string" and v:find("%a%a%a") then info = {name = v} return end
+        end
+        for _, d in ipairs(slot:GetDescendants()) do
+            if d:IsA("StringValue") and d.Value:find("%a%a%a") then info = {name = d.Value} return end
+            if d:IsA("TextLabel") then
+                local t = d.Text:gsub("^%s+", ""):gsub("%s+$", "")
+                local tl = t:lower()
+                if t:find("%a%a%a") and not tl:match("^x?%d") and not (CONFIG.LootRarities or {})[t]
+                and tl ~= "new" then
+                    info = {name = t}
+                    return
+                end
+            end
+        end
+    end) end
+    if not info and CONFIG.LootNames ~= false then
+        -- 2. The game's item data.
+        local ok, idx = pcall(Hud.BuildItemIndex)
+        if ok and idx then info = idx[id] end
+        -- 3. The picture's own name on Roblox.
+        if not info then
+            local res = HttpRequest({Url = "https://economy.roblox.com/v2/assets/" .. id .. "/details",
+                                     Method = "GET"})
+            if res and res.Body then
+                local okj, d = pcall(function() return HttpService:JSONDecode(res.Body) end)
+                local nm = okj and type(d) == "table" and Hud.CleanName(d.Name) or nil
+                if nm then info = {name = nm, guess = true} end
+            end
+        end
+    end
+    if info then
+        Hud.itemCache[id] = info
+        Hud.SaveItemCache()
+    end
+    return info
+end
+
+-- "12/300": a slots counter somewhere under an inventory / bag GUI.
+function Hud.BagText()
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    for _, o in ipairs(pg and pg:GetDescendants() or {}) do
+        if o:IsA("TextLabel") then
+            local a, b = o.Text:match("^%s*(%d+)%s*/%s*(%d+)%s*$")
+            if a and tonumber(b) >= 20 then
+                local n, depth = o.Parent, 0
+                while n and n ~= pg and depth < 8 do
+                    local l = n.Name:lower()
+                    if l:find("inventor", 1, true) or l:find("bag", 1, true)
+                    or l:find("backpack", 1, true) or l:find("storage", 1, true) then
+                        return ("%s/%s"):format(a, b)
+                    end
+                    n, depth = n.Parent, depth + 1
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Post the run. One card, laid out like:
+--   Haul value / Loot (n): dot  **Rarity** - Name *(Kind)* / Earned /
+--   Banked / Bag / Session (W / L) / Run (time, deaths), and the best
+--   item's picture under it.
+-- With no panel, posts a test card so the URL can be checked without
+-- finishing a run.
 function ReportLoot(panel)
     local url = CONFIG.DiscordWebhook
     if type(url) ~= "string" or not url:find("^https://") then
@@ -9127,193 +9368,167 @@ function ReportLoot(panel)
         return false
     end
     local HttpS = game:GetService("HttpService")
-    local icons, names, viewports = {}, {}, 0
-    local items, color = {}, nil
-    local dropped, hidden = 0, 0
+    local RANK = {Ultimate = 6, Legendary = 5, Epic = 4, Rare = 3, Uncommon = 2, Common = 1}
+    local DOT = {Ultimate = "\u{1F534}", Legendary = "\u{1F7E0}", Epic = "\u{1F7E3}",
+                 Rare = "\u{1F535}", Uncommon = "\u{1F7E2}", Common = "\u{26AA}"}
+    local items, icons, texts, viewports = {}, {}, {}, 0
     if panel then
         items = ItemSlots(panel)
-        dropped = #items
+        if #items == 0 then icons, texts, viewports = CollectLoot(panel) end
+    end
 
-        -- Rarity filter. An item whose rarity could not be read is
-        -- kept: a colour the script does not recognise should never
-        -- silently swallow a drop.
-        if dropped > 0 and type(CONFIG.LootRarities) == "table" then
-            local keep = {}
-            for _, it in ipairs(items) do
-                local want = CONFIG.LootRarities[it.rarity or ""]
-                if want == nil then want = true end
-                -- A rarity you get pinged for is always shown.
-                if (CONFIG.LootPingRarities or {})[it.rarity or ""] then want = true end
-                if want then
-                    keep[#keep + 1] = it
-                else
-                    hidden = hidden + 1
-                end
+    -- Worth a post? At least one item of a rarity switched on in
+    -- LootRarities (or one you are pinged for). An unreadable rarity
+    -- always counts - an unknown colour must never swallow a drop.
+    if panel and #items > 0 and type(CONFIG.LootRarities) == "table" and not CONFIG.LootPostIfEmpty then
+        local any = false
+        for _, it in ipairs(items) do
+            local want = CONFIG.LootRarities[it.rarity or ""]
+            if want == nil or want or (CONFIG.LootPingRarities or {})[it.rarity or ""] then
+                any = true
+                break
             end
-            items = keep
         end
-
-        if dropped > 0 then
-            -- One embed per item, so each picture carries its own
-            -- rarity: a merged gallery puts every icon in one block
-            -- with a single caption above it, and there is then no way
-            -- to tell which of three items was the Epic one.
-            for _, it in ipairs(items) do
-                icons[#icons + 1] = it.id
-                local c = it.color
-                if c and not color then
-                    color = math.floor(c.R * 255) * 65536
-                          + math.floor(c.G * 255) * 256 + math.floor(c.B * 255)
-                end
-            end
-            -- The gold (and anything else with a number) shown beside
-            -- the items, in rewardGuiHolder.Frame.
-            local side = panel.Parent and panel.Parent:FindFirstChild("Frame")
-            if side then
-                local seen = {}
-                for _, o in ipairs(side:GetDescendants()) do
-                    if o:IsA("TextLabel") and o.Text:find("%d") and not seen[o.Text] then
-                        seen[o.Text] = true
-                        local label = o.Parent and o.Parent.Name or "Reward"
-                        names[#names + 1] = ("%s: %s"):format(label, o.Text)
-                        if #names > 12 then break end
-                    end
-                end
-            end
-        else
-            icons, names, viewports = CollectLoot(panel)
+        if not any then
+            print(("[DQR] Loot: %d item(s) dropped, all filtered out by LootRarities - not posting.")
+                :format(#items))
+            return true
         end
     end
 
-    -- Everything that dropped was a rarity you have switched off.
-    -- Bail before the thumbnail lookup and the post: that is the whole
-    -- point of the filter, and it keeps the channel for real drops.
-    if panel and dropped > 0 and #items == 0 and not CONFIG.LootPostIfEmpty then
-        print(("[DQR] Loot: %d item(s) dropped, all filtered out by "
-            .. "LootRarities - not posting."):format(hidden))
-        return true
+    -- Best first, and names looked up.
+    table.sort(items, function(a, b) return (RANK[a.rarity or ""] or 0) > (RANK[b.rarity or ""] or 0) end)
+    local haul, lines, names = 0, {}, {}
+    for _, it in ipairs(items) do
+        local info = Hud.ItemInfo(it.id, it.slot)
+        it.name = info and info.name or nil
+        if info and info.value then haul = haul + info.value end
+        lines[#lines + 1] = ("%s **%s** - %s%s"):format(DOT[it.rarity or ""] or "\u{26AB}",
+            it.rarity or "Unknown", it.name or "*unknown item*",
+            (info and info.kind) and (" *(%s)*"):format(info.kind) or "")
+        names[#names + 1] = it.name or "?"
+    end
+    if #items == 0 and #icons > 0 then
+        lines[#lines + 1] = ("%d item picture(s) - rarity unreadable (press F10 on the reward screen)")
+            :format(#icons)
     end
 
-    -- Asset id -> a CDN picture URL Discord can fetch. The thumbnail
-    -- API answers for decals and images alike; the older
-    -- asset-thumbnail endpoint is the fallback if it does not.
-    local thumbs = {}
-    if #icons > 0 then
+    -- The picture: the best item's (or the first icon of the fallback scan).
+    local best = items[1] and items[1].id or icons[1]
+    local pic = nil
+    if best then
         local res = HttpRequest({
-            Url = "https://thumbnails.roblox.com/v1/assets?assetIds="
-                .. table.concat(icons, ",") .. "&size=420x420&format=Png",
+            Url = "https://thumbnails.roblox.com/v1/assets?assetIds=" .. best .. "&size=420x420&format=Png",
             Method = "GET",
         })
         if res and res.Body then
             local ok, data = pcall(function() return HttpS:JSONDecode(res.Body) end)
-            if ok and type(data) == "table" and type(data.data) == "table" then
-                for _, e in ipairs(data.data) do
-                    if e.imageUrl and e.imageUrl ~= "" then
-                        thumbs[tostring(e.targetId)] = e.imageUrl
-                    end
+            if ok and type(data) == "table" and type(data.data) == "table" and data.data[1]
+            and data.data[1].imageUrl and data.data[1].imageUrl ~= "" then
+                pic = data.data[1].imageUrl
+            end
+        end
+        pic = pic or ("https://www.roblox.com/asset-thumbnail/image?assetId=" .. best
+            .. "&width=420&height=420&format=png")
+    end
+
+    -- Earned: the panel's side frame (gold, gems, EXP).
+    local earned, seenE = {}, {}
+    local side = panel and panel.Parent and panel.Parent:FindFirstChild("Frame")
+    if side then
+        for _, o in ipairs(side:GetDescendants()) do
+            if o:IsA("TextLabel") and o.Text:find("%d") then
+                local nm = (o.Name .. " " .. (o.Parent and o.Parent.Name or "")):lower()
+                local what = (nm:find("gold") or nm:find("coin")) and "gold"
+                    or (nm:find("gem") or nm:find("diamond")) and "gems"
+                    or (nm:find("exp") or nm:find("xp")) and "EXP"
+                    or (o.Parent and o.Parent.Name or "reward")
+                local t = o.Text:gsub("^%s+", ""):gsub("%s+$", "")
+                if not t:find("^[%+%-]") then t = "+" .. t end
+                local line = t:lower():find(what:lower(), 1, true) and t or (t .. " " .. what)
+                if not seenE[line] and #earned < 6 then
+                    seenE[line] = true
+                    earned[#earned + 1] = line
                 end
             end
         end
-        for _, id in ipairs(icons) do
-            if not thumbs[id] then
-                thumbs[id] = "https://www.roblox.com/asset-thumbnail/image?assetId="
-                    .. id .. "&width=420&height=420&format=png"
-            end
-        end
+    end
+    for _, t in ipairs(texts) do
+        if #earned < 6 then earned[#earned + 1] = t end
     end
 
-    local desc = {}
+    -- Banked: your totals now.
+    local function Big(v)
+        local n = tonumber(v)
+        return n and Hud.Short(n) or v
+    end
+    local gold, gems = Hud.Real("gold"), Hud.Real("gem") or Hud.Real("diamond")
+    local banked = {}
+    if gold then banked[#banked + 1] = Big(gold) .. " gold" end
+    if gems then banked[#banked + 1] = Big(gems) .. " gems" end
+
+    local w, l = Farm.runsWon or 0, Farm.runsLost or 0
+    local fields = {}
+    local function Field(n, v)
+        if v and v ~= "" then fields[#fields + 1] = {name = n, value = v, inline = false} end
+    end
+    if haul > 0 then Field("Haul value", ("`%s` gold"):format(Hud.Short(haul))) end
     if panel then
-        if #items > 0 then
-            desc[#desc + 1] = ("**%d item%s**%s"):format(
-                #items, #items == 1 and "" or "s",
-                hidden > 0 and (" *(%d hidden by the rarity filter)*"):format(hidden) or "")
-        elseif hidden > 0 then
-            desc[#desc + 1] = ("*%d item%s dropped, all below your rarity filter.*")
-                :format(hidden, hidden == 1 and "" or "s")
-        end
-        desc[#desc + 1] = ("Deaths: %d"):format(Farm.runDeaths or 0)
-        if #names > 0 then
-            desc[#desc + 1] = table.concat(names, "\n")
-        elseif dropped == 0 then
-            desc[#desc + 1] = "(nothing readable on the panel - press F10 on the reward screen)"
-        end
-        if viewports > 0 and #icons == 0 then
-            desc[#desc + 1] = ("(%d item icon(s) are 3D previews - no picture possible)")
-                :format(viewports)
-        end
-    else
-        desc[#desc + 1] = "Webhook test from DQR - the URL works."
+        Field(("Loot (%d)"):format(#items), #lines > 0 and table.concat(lines, "\n") or "*nothing*")
     end
+    Field("Earned", table.concat(earned, "\n"))
+    Field("Banked", table.concat(banked, "\n"))
+    Field("Bag", Hud.BagText())
+    Field("Session", ("%d W / %d L   %d%%"):format(w, l, (w + l) > 0 and math.floor(w / (w + l) * 100 + 0.5) or 0))
+    Field("Run", ("%s  -  %d death%s"):format(
+        (Farm.runEndAt and Farm.lastRunTime) and Hud.Clock(Farm.lastRunTime) or "?",
+        Farm.runDeaths or 0, (Farm.runDeaths or 0) == 1 and "" or "s"))
 
-    local title = panel
-        and ("Dungeon complete - %s (%s) - run %d%s"):format(CONFIG.TargetDungeon,
-            CONFIG.Difficulty, Farm.runsDone or 0,
-            (Farm.runEndAt and Farm.lastRunTime) and (" in " .. Hud.Clock(Farm.lastRunTime)) or "")
-        or "DQR webhook test"
-    -- A header embed, then one per item. Deliberately NOT sharing a
-    -- `url`: embeds that do are merged into a single gallery, and a
-    -- gallery has one caption for all of its pictures.
-    local embeds = {{
-        title = title,
-        description = table.concat(desc, "\n"),
-        color = color or 5763719,
-    }}
-    for i, it in ipairs(items) do
-        if i > 9 then break end          -- Discord allows ten embeds
-        local c = it.color
-        local hex = c and ("#%02X%02X%02X"):format(c.R * 255, c.G * 255, c.B * 255)
-                      or "?"
-        embeds[#embeds + 1] = {
-            title = ("%d.  %s"):format(i, it.rarity or "Unknown rarity"),
-            description = hex,
-            color = c and (math.floor(c.R * 255) * 65536
-                         + math.floor(c.G * 255) * 256
-                         + math.floor(c.B * 255)) or 5763719,
-            image = thumbs[it.id] and {url = thumbs[it.id]} or nil,
-        }
-    end
-    -- The fallback scan has no per-item rarity, only a pile of icons.
-    if #items == 0 then
-        for i = 1, math.min(#icons, 4) do
-            embeds[#embeds + 1] = {image = {url = thumbs[icons[i]]}}
-        end
-    end
-    embeds[#embeds].footer = {text = os.date("%Y-%m-%d %H:%M:%S") .. "  -  DQR"}
+    local top = items[1]
+    local c = top and top.color
+    local embed = {
+        title = panel and ("%s (%s) - run %d"):format(CONFIG.TargetDungeon, CONFIG.Difficulty, Farm.runsDone or 0)
+                or "DQR webhook test",
+        description = (not panel) and "The URL works - a finished run posts a card like this." or nil,
+        color = c and (math.floor(c.R * 255) * 65536 + math.floor(c.G * 255) * 256 + math.floor(c.B * 255))
+                or 5763719,
+        fields = fields,
+        image = pic and {url = pic} or nil,
+        footer = {text = os.date("%Y-%m-%d %H:%M:%S") .. "  -  DQR"},
+    }
 
     -- PING: @-mention you for a drop of a rarity in LootPingRarities.
     -- allowed_mentions limits it to exactly you - nothing else in the
     -- post can ping anyone.
-    local payload = {username = "DQR", embeds = embeds}
+    local payload = {username = "DQR", embeds = {embed}}
     local uid = tostring(CONFIG.DiscordUserId or ""):gsub("%D", "")
     if uid ~= "" then
         local hits = {}
         for _, it in ipairs(items) do
             if it.rarity and (CONFIG.LootPingRarities or {})[it.rarity] then
-                hits[#hits + 1] = it.rarity
+                hits[#hits + 1] = it.rarity .. (it.name and (" " .. it.name) or "")
             end
         end
         if #hits > 0 then
-            payload.content = ("<@%s> %s drop!"):format(uid, table.concat(hits, ", "))
+            payload.content = ("<@%s> %s!"):format(uid, table.concat(hits, ", "))
             payload.allowed_mentions = {users = {uid}}
         elseif not panel then
             payload.content = ("<@%s> ping test"):format(uid)   -- DQR_LootTest()
             payload.allowed_mentions = {users = {uid}}
         end
     end
-    local body = HttpS:JSONEncode(payload)
     local res, err = HttpRequest({
         Url = url, Method = "POST",
         Headers = {["Content-Type"] = "application/json"},
-        Body = body,
+        Body = HttpS:JSONEncode(payload),
     })
     if not res then
         print("[DQR] Loot post failed: " .. tostring(err))
         return false
     end
     local code = res.StatusCode or res.Status or "?"
-    print(("[DQR] Loot posted (%s): %d item(s) shown, %d hidden, %d icon(s), %d preview(s).")
-        :format(tostring(code), #items, hidden, #icons, viewports))
+    print(("[DQR] Loot posted (%s): %s"):format(tostring(code),
+        #names > 0 and table.concat(names, ", ") or ("%d icon(s), %d preview(s)"):format(#icons, viewports)))
     return true
 end
 
@@ -9343,9 +9558,12 @@ function LootDump()
     print("[DQR] === LOOT PANEL: " .. panel:GetFullName() .. " ===")
     for i, it in ipairs(ItemSlots(panel)) do
         local c = it.color
-        print(("[Item %d] icon=%s rarity=%s glow=%s"):format(i, it.id,
+        local info = Hud.ItemInfo(it.id, it.slot)
+        print(("[Item %d] icon=%s rarity=%s glow=%s name=%s kind=%s"):format(i, it.id,
             tostring(it.rarity),
-            c and ("#%02X%02X%02X"):format(c.R * 255, c.G * 255, c.B * 255) or "none"))
+            c and ("#%02X%02X%02X"):format(c.R * 255, c.G * 255, c.B * 255) or "none",
+            info and tostring(info.name) .. (info.guess and " (picture's name)" or "") or "unknown",
+            info and tostring(info.kind) or "?"))
     end
     for _, o in ipairs(panel:GetDescendants()) do
         local extra = ""
@@ -10405,7 +10623,8 @@ Farm.RUNS_KEY = "DQR_runs.txt"
 function Farm.SaveRuns()
     local ok, data = pcall(function()
         return HttpService:JSONEncode({runs = Farm.runsDone, soldAt = Farm.soldAtRun,
-            last = Farm.lastRunTime, parked = Farm.parked, at = os.time()})
+            last = Farm.lastRunTime, parked = Farm.parked, won = Farm.runsWon,
+            lost = Farm.runsLost, at = os.time()})
     end)
     if not ok then return end
     local wf = Env("writefile")
@@ -10431,6 +10650,7 @@ function Farm.LoadRuns()
     Farm.runsDone = tonumber(t.runs) or 0
     Farm.soldAtRun = math.min(tonumber(t.soldAt) or 0, Farm.runsDone)
     Farm.lastRunTime = tonumber(t.last)
+    Farm.runsWon, Farm.runsLost = tonumber(t.won) or 0, tonumber(t.lost) or 0
     if type(t.parked) == "string" and t.parked ~= "" then
         Farm.parked = t.parked
         print(("[DQR] Still parked after a %s - no new runs (DQR_Resume() carries on)."):format(t.parked))
@@ -10468,6 +10688,13 @@ function Farm.CountRun(how)
     if not Farm.runOpen then return end
     Farm.runOpen = false
     Farm.runsDone = Farm.runsDone + 1
+    -- Session W / L (the loot post): finished with its reward panel = a
+    -- win; back on the Replay screen without one = a loss.
+    if how == "reward panel" then
+        Farm.runsWon = (Farm.runsWon or 0) + 1
+    else
+        Farm.runsLost = (Farm.runsLost or 0) + 1
+    end
     local took = ""
     if Farm.runStartAt then
         Farm.runEndAt = tick()
@@ -10787,7 +11014,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.24 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.25 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -11032,6 +11259,22 @@ getgenv().DQR_SelfDestruct = function() Farm.SelfDestruct("by hand") end
 -- DQR_LobbyDump(): at the end of a run, what "return to lobby" would
 -- click. DQR_ToLobby(): do it now.
 getgenv().DQR_LobbyDump  = function() Farm.LobbyDump() end
+-- DQR_Items(): re-read the game's item data and show what it found (for
+-- the loot post's names), plus the names already learned.
+getgenv().DQR_Items      = function()
+    Hud.index = nil
+    local idx = Hud.BuildItemIndex()
+    local shown = 0
+    for id, v in pairs(idx) do
+        if shown >= 15 then break end
+        shown = shown + 1
+        print(("  %s = %s%s"):format(id, tostring(v.name), v.kind and (" (" .. v.kind .. ")") or ""))
+    end
+    Hud.LoadItemCache()
+    local n = 0
+    for _ in pairs(Hud.itemCache) do n = n + 1 end
+    print(("[DQR] %d name(s) learned so far (DQR_items.txt)."):format(n))
+end
 -- The log window's command box. "resume", "dqr_resume" and "DQR_Resume()"
 -- all run DQR_Resume; one argument in brackets or after a space
 -- ("map off", DQR_Map("off")). Only the script's own DQR_ commands can be
@@ -11073,6 +11316,7 @@ getgenv().DQR_Resume     = function()
 end
 getgenv().DQR_ResetRuns  = function()
     Farm.runsDone, Farm.soldAtRun, Farm.lastRunTime = 0, 0, nil
+    Farm.runsWon, Farm.runsLost = 0, 0
     pcall(Farm.SaveRuns)
     Farm.statusNow = true
     print("[DQR] Run count reset to 0.")
