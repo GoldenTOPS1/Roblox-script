@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.22
+--  DQR AUTO FARM v13.24
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -134,6 +134,18 @@ local CONFIG = {
     -- true below - those are always posted, whatever LootRarities says.
     -- "" = never ping.
     DiscordUserId    = "793711555447357471",
+    -- RARE DROP: when a run drops one of RareDropRarities (read off the
+    -- reward panel, like the loot post):
+    --   RareDropLobby = true: after that run, leave for the lobby and stay
+    --     there - no more runs. DQR_Resume() in the console carries on.
+    --     Remembered across servers (the lobby is a new one).
+    --   RareDropStop = true: stop the script completely, the same way the
+    --     self-destruct does (everything stops and is put back), and ping
+    --     you. Re-executing afterwards runs normally again.
+    --   Both: back to the lobby first, then stop there.
+    RareDropLobby    = false,
+    RareDropStop     = false,
+    RareDropRarities = {Legendary = true, Ultimate = true},
     LootPingRarities = {
         Common    = false,
         Uncommon  = false,
@@ -964,7 +976,7 @@ local function BuildLogGui()
     local clearBtn = MkBtn("Clear",  -60, 52, Color3.fromRGB(70, 70, 80))
 
     LogScroll = Instance.new("ScrollingFrame")
-    LogScroll.Size                 = UDim2.new(1, -12, 1, -40)
+    LogScroll.Size                 = UDim2.new(1, -12, 1, -74)   -- room for the command box
     LogScroll.Position             = UDim2.new(0, 6, 0, 34)
     LogScroll.BackgroundColor3     = Color3.fromRGB(12, 12, 15)
     LogScroll.BorderSizePixel      = 0
@@ -989,6 +1001,49 @@ local function BuildLogGui()
     LogBox.TextEditable           = false
     LogBox.Text                   = ""
     LogBox.Parent                 = LogScroll
+
+    -- COMMAND BOX: type a command (resume, DQR_Resume(), help...) and
+    -- press Enter or Run - for when the executor's own console cannot be
+    -- typed in. See Farm.RunCommand.
+    local cmd = Instance.new("TextBox")
+    cmd.Name                   = "DQRui_cmd"
+    cmd.Size                   = UDim2.new(1, -76, 0, 28)
+    cmd.Position               = UDim2.new(0, 6, 1, -34)
+    cmd.BackgroundColor3       = Color3.fromRGB(28, 28, 34)
+    cmd.BorderSizePixel        = 0
+    cmd.Font                   = Enum.Font.Code
+    cmd.TextSize               = 13
+    cmd.TextColor3             = Color3.fromRGB(235, 240, 245)
+    cmd.PlaceholderText        = "> command, then Enter  (help = list)"
+    cmd.PlaceholderColor3      = Color3.fromRGB(110, 115, 125)
+    cmd.TextXAlignment         = Enum.TextXAlignment.Left
+    cmd.ClearTextOnFocus       = false
+    cmd.Text                   = ""
+    cmd.Parent                 = main
+    Instance.new("UICorner", cmd).CornerRadius = UDim.new(0, 6)
+    local pad = Instance.new("UIPadding", cmd)
+    pad.PaddingLeft = UDim.new(0, 8)
+    local runBtn = Instance.new("TextButton")
+    runBtn.Name             = "DQRui_run"
+    runBtn.Size             = UDim2.new(0, 58, 0, 28)
+    runBtn.Position         = UDim2.new(1, -64, 1, -34)
+    runBtn.BackgroundColor3 = Color3.fromRGB(45, 150, 90)
+    runBtn.BorderSizePixel  = 0
+    runBtn.Font             = Enum.Font.GothamBold
+    runBtn.TextSize         = 12
+    runBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+    runBtn.Text             = "Run"
+    runBtn.Parent           = main
+    Instance.new("UICorner", runBtn).CornerRadius = UDim.new(0, 6)
+    local function Submit()
+        local t = cmd.Text
+        cmd.Text = ""
+        if t:gsub("%s", "") ~= "" and Farm.RunCommand then
+            task.spawn(function() pcall(Farm.RunCommand, t) end)
+        end
+    end
+    Farm.Track(cmd.FocusLost:Connect(function(enter) if enter then Submit() end end))
+    Farm.Track(runBtn.MouseButton1Click:Connect(Submit))
 
     Farm.Track(copyBtn.MouseButton1Click:Connect(function()
         local all = table.concat(LOG, "\n")
@@ -9360,6 +9415,19 @@ function LootWatcher()
                     ran = false
                     print("[DQR] Loot: reward panel = " .. panel:GetFullName())
                     Farm.CountRun("reward panel")
+                    -- RARE DROP (RareDropLobby / RareDropStop): note it, and
+                    -- save it - the lobby is another server. The Supervisor
+                    -- acts on it instead of replaying (Farm.HandleParked).
+                    if CONFIG.RareDropLobby or CONFIG.RareDropStop then
+                        for _, it in ipairs(ItemSlots(panel)) do
+                            if it.rarity and (CONFIG.RareDropRarities or {})[it.rarity] then
+                                Farm.parked = it.rarity .. " drop"
+                                pcall(Farm.SaveRuns)
+                                print(("[DQR] %s! No more runs after this one."):format(Farm.parked))
+                                break
+                            end
+                        end
+                    end
                     if CONFIG.DiscordWebhook ~= "" then
                         local okR, err = pcall(ReportLoot, panel)
                         if not okR then print("[DQR] Loot: post crashed: " .. tostring(err)) end
@@ -9563,7 +9631,10 @@ function Farm.StatusWatcher()
 
                 -- What it is doing: the brain's own description.
                 local doing
-                if dead then                   doing = "Dead - waiting to respawn"
+                if Farm.parked then
+                    doing = ("Parked after a %s - no more runs (DQR_Resume() carries on)")
+                        :format(Farm.parked)
+                elseif dead then               doing = "Dead - waiting to respawn"
                 elseif InLobby() then          doing = "In the lobby"
                 elseif lobbyFlowActive then    doing = "Queueing a dungeon"
                 elseif not Farm.Running then   doing = "Idle"
@@ -9720,7 +9791,8 @@ end
 -- Sent with HttpRequest's `force`: everything else is blocked by then.
 -- Re-executing the script picks the same status message up again and
 -- writes the live status over the notice.
-function Hud.SelfDestructNotice(why)
+function Hud.SelfDestructNotice(why, title)
+    title = title or "SELF-DESTRUCT ACTIVATED"
     local HttpS = game:GetService("HttpService")
     local stamp = os.date("%Y-%m-%d %H:%M:%S")
     -- Read before the first yield: the self-destruct clears the shared
@@ -9738,7 +9810,7 @@ function Hud.SelfDestructNotice(why)
                 Url = surl .. "/messages/" .. sid, Method = "PATCH",
                 Headers = {["Content-Type"] = "application/json"},
                 Body = HttpS:JSONEncode({embeds = {{
-                    title = "SELF-DESTRUCT ACTIVATED",
+                    title = title,
                     description = ("**%s.**\n\nThe script shut itself down and undid "
                         .. "everything it changed. It is no longer running.\n\n"
                         .. "**Manual reset required** - re-execute the script to start "
@@ -9753,7 +9825,7 @@ function Hud.SelfDestructNotice(why)
         local payload = {
             username = "DQR",
             content = (uid ~= "" and ("<@%s> "):format(uid) or "")
-                .. ("**DQR self-destruct activated** - %s. Manual reset required."):format(why),
+                .. ("**DQR %s** - %s. Manual reset required."):format(title:lower(), why),
         }
         if uid ~= "" then payload.allowed_mentions = {users = {uid}} end
         pcall(function()
@@ -10333,7 +10405,7 @@ Farm.RUNS_KEY = "DQR_runs.txt"
 function Farm.SaveRuns()
     local ok, data = pcall(function()
         return HttpService:JSONEncode({runs = Farm.runsDone, soldAt = Farm.soldAtRun,
-            last = Farm.lastRunTime, at = os.time()})
+            last = Farm.lastRunTime, parked = Farm.parked, at = os.time()})
     end)
     if not ok then return end
     local wf = Env("writefile")
@@ -10359,6 +10431,10 @@ function Farm.LoadRuns()
     Farm.runsDone = tonumber(t.runs) or 0
     Farm.soldAtRun = math.min(tonumber(t.soldAt) or 0, Farm.runsDone)
     Farm.lastRunTime = tonumber(t.last)
+    if type(t.parked) == "string" and t.parked ~= "" then
+        Farm.parked = t.parked
+        print(("[DQR] Still parked after a %s - no new runs (DQR_Resume() carries on)."):format(t.parked))
+    end
     print(("[DQR] Run count carried over: %d run(s) so far."):format(Farm.runsDone))
 end
 pcall(Farm.LoadRuns)
@@ -10506,6 +10582,34 @@ function Farm.ReturnToLobby()
     return false
 end
 
+-- RARE DROP: what the Supervisor does instead of the next run while
+-- Farm.parked is set. RareDropLobby: leave for the lobby (once - if that
+-- fails, it stays put rather than replay). RareDropStop: then stop the
+-- script completely, like the self-destruct, with its own notice - and
+-- clear the flag first, so re-executing afterwards farms normally.
+-- Lobby only: stay idle there until DQR_Resume().
+function Farm.HandleParked()
+    local why = Farm.parked
+    if CONFIG.RareDropLobby and not Farm.RealLobby() and not Farm.parkLeaveTried then
+        Farm.parkLeaveTried = true
+        print(("[DQR] %s - leaving for the lobby and staying there."):format(why))
+        if Farm.ReturnToLobby() then return end
+        print("[DQR] Could not get to the lobby - staying here instead of replaying.")
+    end
+    if CONFIG.RareDropStop then
+        Farm.parked = nil
+        pcall(Farm.SaveRuns)
+        Farm.SelfDestruct(why .. " - script stopped", "STOPPED - " .. why:upper())
+        return
+    end
+    if not Farm.parkSaid then
+        Farm.parkSaid = true
+        Farm.statusNow = true
+        print(("[DQR] Parked: %s. No more runs - DQR_Resume() in the console carries on.")
+            :format(why))
+    end
+end
+
 -- DQR_LobbyDump(): the buttons at the bottom right of the screen, with
 -- the path to put in CONFIG.LobbyButtonPath, and what would be clicked.
 function Farm.LobbyDump()
@@ -10627,6 +10731,11 @@ local function Supervisor()
             -- The run is over: the next one has to show its own START
             -- before the buff goes on again (Brain.RunLive).
             Farm.startSeenAt = nil
+            -- A rare drop (RareDropLobby / RareDropStop): no next run.
+            if Farm.parked then
+                pcall(Farm.HandleParked)
+                continue
+            end
             if not CONFIG.AutoRunDungeon then continue end
             -- Selling: AutoSell after every run, SellAfterRuns every
             -- SellEveryRuns runs. The shop is in the REAL lobby, and a run
@@ -10678,7 +10787,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.22 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.24 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -10782,7 +10891,9 @@ end))
 --  never run: see CONFIG.SelfDestructOnJoin. Each step is on its own,
 --  so one that fails cannot stop the rest.
 -- ============================================================
-function Farm.SelfDestruct(why)
+-- `title`: what the Discord notice is headed (default "SELF-DESTRUCT
+-- ACTIVATED"; a rare-drop stop passes its own).
+function Farm.SelfDestruct(why, title)
     if Farm.dead then return end
     pcall(rawprint, "[DQR] SELF-DESTRUCT: " .. tostring(why) .. " - shutting down and undoing everything.")
     -- 1. Stop: the farm, and every loop (they all check Farm.dead).
@@ -10792,7 +10903,7 @@ function Farm.SelfDestruct(why)
     -- notice, and a ping. Its own thread - it reads what it needs before
     -- the cleanup below clears it, then sends.
     if CONFIG.SelfDestructNotify ~= false then
-        task.spawn(function() pcall(Hud.SelfDestructNotice, tostring(why)) end)
+        task.spawn(function() pcall(Hud.SelfDestructNotice, tostring(why), title) end)
     end
     -- 2. Movement back to you: controls on, camera yours, AutoRotate and
     -- jumping back, the move binding gone.
@@ -10921,6 +11032,45 @@ getgenv().DQR_SelfDestruct = function() Farm.SelfDestruct("by hand") end
 -- DQR_LobbyDump(): at the end of a run, what "return to lobby" would
 -- click. DQR_ToLobby(): do it now.
 getgenv().DQR_LobbyDump  = function() Farm.LobbyDump() end
+-- The log window's command box. "resume", "dqr_resume" and "DQR_Resume()"
+-- all run DQR_Resume; one argument in brackets or after a space
+-- ("map off", DQR_Map("off")). Only the script's own DQR_ commands can be
+-- run from here - nothing else. "help" lists them.
+function Farm.RunCommand(text)
+    local s = text:gsub("^%s+", ""):gsub("%s+$", "")
+    print("> " .. s)
+    local name, arg = s:match("^([%w_]+)%s*%(%s*[\"']?(.-)[\"']?%s*%)%s*;?$")
+    if not name then name, arg = s:match("^([%w_]+)%s*(.*)$") end
+    if not name then
+        print("[DQR] Not a command - type help for the list.")
+        return
+    end
+    local key = name:lower():gsub("^dqr_", "")
+    local g = getgenv()
+    local list = {}
+    for k, v in pairs(g) do
+        if type(k) == "string" and k:sub(1, 4) == "DQR_" and type(v) == "function" then
+            list[#list + 1] = k:sub(5)
+            if k:sub(5):lower() == key then
+                local ok, err = pcall(v, (arg and arg ~= "") and arg or nil)
+                if not ok then print("[DQR] " .. k .. " failed: " .. tostring(err)) end
+                return
+            end
+        end
+    end
+    if key ~= "help" then print(("[DQR] No command '%s'."):format(name)) end
+    table.sort(list)
+    print("[DQR] Commands: " .. table.concat(list, ", "))
+    print("[DQR] e.g.  resume  |  resetruns  |  tolobby  |  lobbydump  |  sell  |  selfdestruct")
+end
+
+-- DQR_Resume(): after a rare drop parked the bot, carry on farming.
+getgenv().DQR_Resume     = function()
+    Farm.parked, Farm.parkSaid, Farm.parkLeaveTried = nil, nil, nil
+    pcall(Farm.SaveRuns)
+    Farm.statusNow = true
+    print("[DQR] Resumed - the next run starts as usual.")
+end
 getgenv().DQR_ResetRuns  = function()
     Farm.runsDone, Farm.soldAtRun, Farm.lastRunTime = 0, 0, nil
     pcall(Farm.SaveRuns)
