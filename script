@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.28
+--  DQR AUTO FARM v13.29
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -294,6 +294,15 @@ local CONFIG = {
     RangeFireColor = Color3.fromRGB(200, 255, 60),
     RangeThick     = 0.35,   -- studs wide the line is drawn
     RangeSegments  = 72,     -- more = smoother circle
+    -- MINIMAP: a square at the top right of the screen (drag it by its
+    -- "MAP" strip): you (white arrow) in the middle, your E range (green
+    -- ring), mobs (red dots; boss = bigger purple; your target outlined),
+    -- other players (white), hazards in their real shapes (red = live,
+    -- orange = warning), safe zones (green), the planned route (blue).
+    Minimap        = false,
+    MinimapSize    = 180,    -- pixels across
+    MinimapRange   = 80,     -- studs from you to the edge
+    MinimapRotate  = true,   -- turns with the camera (up = where you look); false = north up
     -- Face the middle of the pack instead of the one mob targeted, so
     -- a fan or cone spell lands on all of them.
     AimAtPack      = true,
@@ -5211,6 +5220,301 @@ function Look.Range(show)
     end
 end
 Farm.Track(RunService.Heartbeat:Connect(function() pcall(Look.Range, Farm.Running) end))
+end
+
+-- ---- minimap (CONFIG.Minimap) -------------------------------
+-- A square at the top right of the screen (drag it by its title strip),
+-- redrawn ten times a second: you (white arrow, pointing the way you
+-- face) in the middle, your E range (green ring), mobs (red dots; a
+-- boss bigger and purple; the target outlined white; one past the edge
+-- sits faded on the rim, pointing the way to it), other players (white
+-- dots), hazards in their real shapes (red = live, orange = warning),
+-- safe zones (green outline), and the planned route (small blue dots).
+-- Turns with the camera (up = where you look) unless MinimapRotate is
+-- false (then up = north). A CanvasGroup, so turned shapes are clipped
+-- at its edge too (a plain frame does not clip rotated children).
+do
+local MM = {pool = {}, used = 0}
+Look.mm = MM
+
+-- Pooled pieces: a Frame, or a TextLabel for the arrow. Reused every
+-- draw; whatever is left over is hidden.
+local function Item(text)
+    MM.used = MM.used + 1
+    local o = MM.pool[MM.used]
+    local want = text and "TextLabel" or "Frame"
+    if not o or not o.Parent or o.ClassName ~= want then
+        if o then o:Destroy() end
+        o = Instance.new(want)
+        o.BorderSizePixel, o.AnchorPoint = 0, Vector2.new(0.5, 0.5)
+        o.Parent = MM.map
+        MM.pool[MM.used] = o
+    end
+    o.Visible, o.Rotation = true, 0
+    return o
+end
+
+-- Fill, round or square, and an outline (or not).
+local function Style(o, round, fill, fillT, stroke, thick)
+    o.BackgroundColor3, o.BackgroundTransparency = fill or Color3.new(1, 1, 1), fillT or 0
+    local c = o:FindFirstChild("c")
+    if round and not c then
+        c = Instance.new("UICorner")
+        c.Name, c.CornerRadius = "c", UDim.new(0.5, 0)
+        c.Parent = o
+    elseif not round and c then
+        c:Destroy()
+    end
+    local s = o:FindFirstChild("s")
+    if stroke then
+        if not s then
+            s = Instance.new("UIStroke")
+            s.Name = "s"
+            s.Parent = o
+        end
+        s.Color, s.Thickness = stroke, thick or 1
+    elseif s then
+        s:Destroy()
+    end
+end
+
+function Look.MinimapBuild()
+    if MM.gui and MM.gui.Parent then return end
+    local parent
+    local gethui = Env("gethui")
+    if typeof(gethui) == "function" then
+        local ok, h = pcall(gethui)
+        if ok then parent = h end
+    end
+    parent = parent or LP:FindFirstChildOfClass("PlayerGui")
+    if not parent then return end
+    local size = CONFIG.MinimapSize or 180
+    local gui = Instance.new("ScreenGui")
+    gui.Name, gui.ResetOnSpawn, gui.IgnoreGuiInset = "DQR_Minimap", false, true
+    gui.DisplayOrder, gui.ZIndexBehavior = 9998, Enum.ZIndexBehavior.Sibling
+    local holder = Instance.new("Frame")
+    holder.Name = "holder"
+    holder.AnchorPoint = Vector2.new(1, 0)
+    holder.Position = UDim2.new(1, -12, 0, 12)
+    holder.Size = UDim2.fromOffset(size, size + 18)
+    holder.BackgroundColor3, holder.BackgroundTransparency = Color3.fromRGB(18, 18, 22), 0.15
+    holder.BorderSizePixel = 0
+    holder.Parent = gui
+    Instance.new("UICorner", holder).CornerRadius = UDim.new(0, 8)
+    local stroke = Instance.new("UIStroke", holder)
+    stroke.Color, stroke.Thickness = Color3.fromRGB(70, 130, 180), 1.5
+    local bar = Instance.new("TextLabel")
+    bar.Name = "bar"
+    bar.Size = UDim2.new(1, 0, 0, 18)
+    bar.BackgroundTransparency = 1
+    bar.Font, bar.TextSize = Enum.Font.GothamBold, 11
+    bar.TextColor3 = Color3.fromRGB(120, 200, 255)
+    bar.Text = "MAP"
+    bar.Active = true
+    bar.Parent = holder
+    local ok, map = pcall(Instance.new, "CanvasGroup")
+    if not ok then
+        map = Instance.new("Frame")
+        map.ClipsDescendants = true
+    end
+    map.Name = "map"
+    map.Position, map.Size = UDim2.new(0, 0, 0, 18), UDim2.new(1, 0, 1, -18)
+    map.BackgroundColor3, map.BackgroundTransparency = Color3.fromRGB(10, 12, 16), 0.1
+    map.BorderSizePixel = 0
+    map.Parent = holder
+    Instance.new("UICorner", map).CornerRadius = UDim.new(0, 8)
+    -- Drag by the title strip (mouse or touch).
+    local dragging, dragStart, startPos
+    Farm.Track(bar.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, i.Position, holder.Position
+        end
+    end))
+    Farm.Track(UserInputService.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - dragStart
+            holder.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                                        startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end))
+    Farm.Track(UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+    MM.gui, MM.map, MM.size = gui, map, size
+    MM.pool, MM.used = {}, 0
+    gui.Parent = parent
+end
+
+function Look.MinimapDraw()
+    local root, cam = GetRoot(), workspace.CurrentCamera
+    if not (root and cam and MM.map) then return end
+    local size = MM.size
+    local half = size / 2
+    local R = CONFIG.MinimapRange or 80
+    local s = half / R                                   -- pixels per stud
+    local me = root.Position
+    local lx, lz, rx, rz = 0, -1, 1, 0                   -- north up
+    if CONFIG.MinimapRotate ~= false then
+        local lv = cam.CFrame.LookVector
+        local f = Vector3.new(lv.X, 0, lv.Z)
+        if f.Magnitude > 0.01 then
+            f = f.Unit
+            lx, lz, rx, rz = f.X, f.Z, -f.Z, f.X
+        end
+    end
+    -- World (x, z) -> map pixel; a world direction -> on-map angle.
+    local function P(x, z)
+        local dx, dz = x - me.X, z - me.Z
+        return half + (dx * rx + dz * rz) * s, half - (dx * lx + dz * lz) * s
+    end
+    local function Ang(vx, vz)
+        return math.deg(math.atan2(-(vx * lx + vz * lz), vx * rx + vz * rz))
+    end
+    local function Seg(ax, az, bx, bz, w, col, tr, z)
+        local x1, y1 = P(ax, az)
+        local x2, y2 = P(bx, bz)
+        local len = math.sqrt((x2 - x1) ^ 2 + (y2 - y1) ^ 2)
+        if len < 0.5 then return end
+        local o = Item()
+        Style(o, false, col, tr)
+        o.Size = UDim2.fromOffset(len, math.max(2, w * s))
+        o.Position = UDim2.fromOffset((x1 + x2) / 2, (y1 + y2) / 2)
+        o.Rotation = math.deg(math.atan2(y2 - y1, x2 - x1))
+        o.ZIndex = z
+    end
+    MM.used = 0
+    local LIVE, WARN = Color3.fromRGB(255, 70, 70), Color3.fromRGB(255, 170, 60)
+
+    -- Hazards (the real footprints - not the look-ahead ghosts).
+    for _, h in ipairs(Haz.real or {}) do
+        if h.bx and FlatDist(Vector3.new(h.bx, 0, h.bz), me) - (h.br or 0) < R * 1.5 then
+            local col = h.warn and WARN or LIVE
+            if h.kind == "disc" or h.kind == "ball" then
+                local o = Item()
+                Style(o, true, col, 0.55, col, 1)
+                local d = math.max(3, h.r * 2 * s)
+                o.Size = UDim2.fromOffset(d, d)
+                o.Position = UDim2.fromOffset(P(h.x, h.z))
+                o.ZIndex = 1
+            elseif h.kind == "box" then
+                local o = Item()
+                Style(o, false, col, 0.55, col, 1)
+                o.Size = UDim2.fromOffset(math.max(2, h.hx * 2 * s), math.max(2, h.hz * 2 * s))
+                local c = h.cf.Position
+                o.Position = UDim2.fromOffset(P(c.X, c.Z))
+                local rv = h.cf.RightVector
+                o.Rotation = Ang(rv.X, rv.Z)
+                o.ZIndex = 1
+            elseif h.kind == "line" then
+                Seg(h.a.X, h.a.Z, h.b.X, h.b.Z, h.r * 2, col, 0.45, 1)
+            elseif h.kind == "arc" then
+                -- The band, as short straight pieces round its middle.
+                local m = h.r - h.band / 2
+                local n = h.dx and 12 or 24
+                local a0 = h.dx and (math.atan2(h.dz, h.dx) - math.pi / 2) or 0
+                local span = h.dx and math.pi or math.pi * 2
+                for i = 0, n - 1 do
+                    local t1, t2 = a0 + span * i / n, a0 + span * (i + 1) / n
+                    Seg(h.x + math.cos(t1) * m, h.z + math.sin(t1) * m,
+                        h.x + math.cos(t2) * m, h.z + math.sin(t2) * m, h.band, col, 0.5, 1)
+                end
+            end
+        end
+    end
+    -- Safe zones.
+    for _, zn in ipairs(Haz.safe or {}) do
+        local o = Item()
+        Style(o, true, Color3.fromRGB(80, 230, 110), 0.85, Color3.fromRGB(80, 230, 110), 1.5)
+        local d = math.max(4, zn.r * 2 * s)
+        o.Size = UDim2.fromOffset(d, d)
+        o.Position = UDim2.fromOffset(P(zn.c.X, zn.c.Z))
+        o.ZIndex = 2
+    end
+    -- Your E range.
+    do
+        local rr = Brain.rangeR or (CONFIG.AttackRange + CONFIG.CastSlack)
+        local o = Item()
+        Style(o, true, Color3.new(0, 0, 0), 1, CONFIG.RangeColor or Color3.fromRGB(60, 230, 80), 1.5)
+        o.Size = UDim2.fromOffset(rr * 2 * s, rr * 2 * s)
+        o.Position = UDim2.fromOffset(half, half)
+        o.ZIndex = 2
+    end
+    -- The planned route.
+    for i, wp in ipairs(Nav.queue or {}) do
+        if i > 20 then break end
+        local o = Item()
+        Style(o, true, Color3.fromRGB(90, 200, 255), 0.1)
+        o.Size = UDim2.fromOffset(3, 3)
+        o.Position = UDim2.fromOffset(P(wp.Position.X, wp.Position.Z))
+        o.ZIndex = 3
+    end
+    -- A dot, kept on the rim (faded) when it is past the edge.
+    local function Dot(pos, d, col, z, outline)
+        local x, y = P(pos.X, pos.Z)
+        local ox, oy = x - half, y - half
+        local dist = math.sqrt(ox * ox + oy * oy)
+        local edge = half - d / 2 - 1
+        local o = Item()
+        Style(o, true, col, dist > edge and 0.5 or 0, outline, outline and 1.5 or nil)
+        if dist > edge then x, y = half + ox / dist * edge, half + oy / dist * edge end
+        o.Size = UDim2.fromOffset(d, d)
+        o.Position = UDim2.fromOffset(x, y)
+        o.ZIndex = z
+    end
+    -- Other players.
+    for _, pl in ipairs(Players:GetPlayers()) do
+        local r = pl ~= LP and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart")
+        if r then Dot(r.Position, 5, Color3.new(1, 1, 1), 4) end
+    end
+    -- Mobs.
+    local tgt = Brain.target and Brain.target.Model
+    for _, rec in ipairs(Mobs.list or {}) do
+        pcall(function()
+            if rec.Humanoid.Health > 0 then
+                Dot(rec.Root.Position, rec.Boss and 10 or 6,
+                    rec.Boss and Color3.fromRGB(190, 80, 255) or Color3.fromRGB(235, 60, 60), 5,
+                    rec.Model == tgt and Color3.new(1, 1, 1) or nil)
+            end
+        end)
+    end
+    -- You.
+    do
+        local o = Item(true)
+        o.BackgroundTransparency = 1
+        o.Font, o.TextSize = Enum.Font.GothamBold, 16
+        o.TextColor3, o.TextStrokeTransparency = Color3.new(1, 1, 1), 0.3
+        o.Text = "\u{25B2}"
+        o.Size = UDim2.fromOffset(16, 16)
+        o.Position = UDim2.fromOffset(half, half)
+        local lv = root.CFrame.LookVector
+        o.Rotation = Ang(lv.X, lv.Z) + 90               -- the glyph points up (-90)
+        o.ZIndex = 6
+    end
+    for i = MM.used + 1, #MM.pool do
+        if MM.pool[i].Visible then MM.pool[i].Visible = false end
+    end
+end
+
+function Look.MinimapLoop()
+    while not Farm.dead do
+        S(0.1)
+        if CONFIG.Minimap then
+            pcall(Look.MinimapBuild)
+            if MM.gui and MM.gui.Parent then
+                MM.gui.Enabled = true
+                pcall(Look.MinimapDraw)
+            end
+        elseif MM.gui and MM.gui.Parent and MM.gui.Enabled then
+            MM.gui.Enabled = false
+        end
+    end
+end
+task.spawn(Look.MinimapLoop)
 end
 
 -- ---- spell animations ---------------------------------------
@@ -11143,7 +11447,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.28 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.29 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -11322,8 +11626,10 @@ function Farm.SelfDestruct(why, title)
     pcall(function()
         local gethui = Env("gethui")
         local h = typeof(gethui) == "function" and gethui()
-        local g = h and h:FindFirstChild("DQR_LOG")
-        if g then g:Destroy() end
+        -- The log window, the minimap - every GUI of ours in there.
+        for _, g in ipairs(h and h:GetChildren() or {}) do
+            if g.Name:sub(1, 4) == "DQR_" then pcall(function() g:Destroy() end) end
+        end
     end)
     LogGui, LogBox, LogScroll, LogCount = nil, nil, nil, nil
     -- 8. FPS cap back.
