@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.33
+--  DQR AUTO FARM v13.34
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -3241,6 +3241,9 @@ end
 
 -- In a dungeon = the lobby UI is gone and there are mobs about.
 local function IsInDungeon()
+    -- The lobby's server is never a dungeon - even while its screens are
+    -- hidden by the loading after START, when its NPCs pass for mobs.
+    if Farm.lobbyServer then return false end
     if InLobby() then return false end
     return #Mobs.Scan() >= 2
 end
@@ -11295,8 +11298,24 @@ end
 -- that says the dungeon / run failed counts the run as a loss at once
 -- (else it would only count when the next run comes round).
 function Farm.FailWatcher()
+    local lobbyStreak = 0
     while not Farm.dead do
         S(1)
+        -- THE LOBBY'S SERVER (v13.34). Its own screens up for 3 seconds
+        -- running: this server is the lobby, for as long as the script
+        -- runs here (a dungeon is another server, where the script starts
+        -- afresh). While loading into a dungeon after START, the lobby's
+        -- screens go and its NPCs pass for mobs - the bot took that for a
+        -- run, and a stranger joining the lobby set the self-destruct off.
+        -- 3 seconds: a dungeon flashes the lobby's Play button as it loads.
+        if not Farm.lobbyServer then
+            lobbyStreak = Farm.RealLobby() and lobbyStreak + 1 or 0
+            if lobbyStreak >= 3 then
+                Farm.lobbyServer = true
+                Farm.runOpen = false
+                print("[DQR] This server is the lobby - no runs, no self-destruct here.")
+            end
+        end
         if Farm.runOpen then pcall(function()
             local pg = LP:FindFirstChildOfClass("PlayerGui")
             for _, o in ipairs(pg and pg:GetDescendants() or {}) do
@@ -11534,6 +11553,10 @@ end
 function Farm.Start()
     if Farm.dead or Farm.Running then return end
     if Farm.restartAt and tick() < Farm.restartAt then return end
+    if Farm.lobbyServer then
+        print("[DQR] Not farming - this server is the lobby (still loading into the dungeon?).")
+        return
+    end
     if InLobby() then
         print("[DQR] Refusing to farm - lobby marker '" .. tostring(LobbyMarker())
             .. "' is on screen.")
@@ -11683,8 +11706,10 @@ local function Supervisor()
             end
             continue
         end
-        -- Not the lobby - for long enough to believe it.
-        if DungeonConfirmed() then
+        -- Not the lobby - for long enough to believe it. (Never on the
+        -- lobby's own server: its screens just vanish while it loads us
+        -- into the dungeon.)
+        if DungeonConfirmed() and not Farm.lobbyServer then
             print("[DQR] Idle outside the lobby - resuming farm.")
             Farm.Start()
         end
@@ -11695,7 +11720,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.33 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.34 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -11919,7 +11944,7 @@ end
 -- server - strangers join all the time), and not a loading screen the
 -- bot cannot place yet.
 function Farm.InRun()
-    if Farm.RealLobby() then return false end
+    if Farm.lobbyServer or Farm.RealLobby() then return false end
     if Farm.Running or Farm.runOpen then return true end
     if DungeonStartButton() or PathVisible(UI.Replay) then return true end
     return IsInDungeon()
