@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.34
+--  DQR AUTO FARM v13.35
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -11202,7 +11202,8 @@ function Farm.SaveRuns()
         return HttpService:JSONEncode({runs = Farm.runsDone, soldAt = Farm.soldAtRun,
             last = Farm.lastRunTime, parked = Farm.parked, won = Farm.runsWon,
             lost = Farm.runsLost, deaths = Farm.deathsTotal,
-            breakUntil = Farm.breakUntil, nextBreak = Farm.nextBreakAt, at = os.time()})
+            breakUntil = Farm.breakUntil, nextBreak = Farm.nextBreakAt,
+            lobbySig = Farm.lobbySig, dungeonSig = Farm.dungeonSig, at = os.time()})
     end)
     if not ok then return end
     local wf = Env("writefile")
@@ -11220,6 +11221,10 @@ function Farm.LoadRuns()
     if type(raw) ~= "string" then return end
     local ok, t = pcall(function() return HttpService:JSONDecode(raw) end)
     if not ok or type(t) ~= "table" then return end
+    -- What the lobby's and a dungeon's servers look like (Farm.ServerKind):
+    -- kept whatever the age - they do not change between sessions.
+    if type(t.lobbySig) == "table" then Farm.lobbySig = t.lobbySig end
+    if type(t.dungeonSig) == "table" then Farm.dungeonSig = t.dungeonSig end
     local hours = CONFIG.RunsResetHours or 0
     if hours > 0 and os.time() - (tonumber(t.at) or 0) > hours * 3600 then
         print(("[DQR] Run count: last run over %dh ago - starting a new count."):format(hours))
@@ -11297,6 +11302,63 @@ end
 -- DUNGEON FAILED: while a run is open, once a second, any label on screen
 -- that says the dungeon / run failed counts the run as a loss at once
 -- (else it would only count when the next run comes round).
+-- WHICH SERVER IS THIS, from the moment the script loads (v13.35). The
+-- lobby screens cannot tell while a loading screen is up - so the bot
+-- learns what the lobby's server and a dungeon's server look like: the
+-- place id, and whether it is a reserved server (the kind a game makes
+-- for a party; a lobby is a normal public one, or your own VIP one).
+-- Learned the first time each is certain (lobby screens for 3s / the
+-- dungeon's own START button), saved, and from then on a new server is
+-- recognised at once - unless the two look the same, then the screens
+-- alone decide, as before.
+function Farm.ServerSig()
+    local reserved = false
+    pcall(function() reserved = game.PrivateServerId ~= "" and game.PrivateServerOwnerId == 0 end)
+    return {place = game.PlaceId, reserved = reserved}
+end
+function Farm.ServerKind()
+    local L, D, cur = Farm.lobbySig, Farm.dungeonSig, Farm.ServerSig()
+    if type(L) ~= "table" or type(D) ~= "table" then return nil end
+    -- (JSON keeps numbers as numbers; compared loosely all the same.)
+    local function SamePlace(a, b) return tostring(a.place) == tostring(b.place) end
+    if SamePlace(L, D) and L.reserved == D.reserved then return nil end   -- cannot tell apart
+    -- Each dungeon may be its own place: a place id decides only when it
+    -- is the lobby's or that same dungeon's.
+    if not SamePlace(L, D) then
+        if SamePlace(cur, L) and (L.reserved ~= D.reserved and cur.reserved == L.reserved
+                                  or L.reserved == D.reserved) then
+            return "lobby"
+        end
+        if SamePlace(cur, D) then return "dungeon" end
+    end
+    if L.reserved ~= D.reserved then
+        return cur.reserved == L.reserved and "lobby" or "dungeon"
+    end
+    return nil
+end
+-- Called once the server's kind is certain: remember what it looks like.
+function Farm.LearnServer(kind)
+    local sig = Farm.ServerSig()
+    local key = kind == "lobby" and "lobbySig" or "dungeonSig"
+    local old = Farm[key]
+    if type(old) == "table" and tostring(old.place) == tostring(sig.place)
+    and old.reserved == sig.reserved then return end
+    Farm[key] = sig
+    pcall(Farm.SaveRuns)
+    print(("[DQR] Learned the %s's server: place %s, %s server."):format(kind,
+        tostring(sig.place), sig.reserved and "a reserved" or "a public / VIP"))
+end
+-- At load: a server already known to be the lobby is treated as one now.
+do
+    local ok, kind = pcall(Farm.ServerKind)
+    if ok and kind == "lobby" then
+        Farm.lobbyServer = true
+        print("[DQR] This server is the lobby (recognised by its server) - no runs, no self-destruct here.")
+    elseif ok and kind == "dungeon" then
+        Farm.dungeonServer = true
+    end
+end
+
 function Farm.FailWatcher()
     local lobbyStreak = 0
     while not Farm.dead do
@@ -11308,13 +11370,20 @@ function Farm.FailWatcher()
         -- screens go and its NPCs pass for mobs - the bot took that for a
         -- run, and a stranger joining the lobby set the self-destruct off.
         -- 3 seconds: a dungeon flashes the lobby's Play button as it loads.
-        if not Farm.lobbyServer then
+        if not Farm.lobbyServer and not Farm.dungeonServer then
             lobbyStreak = Farm.RealLobby() and lobbyStreak + 1 or 0
             if lobbyStreak >= 3 then
                 Farm.lobbyServer = true
                 Farm.runOpen = false
                 print("[DQR] This server is the lobby - no runs, no self-destruct here.")
+                pcall(Farm.LearnServer, "lobby")
             end
+        end
+        -- Certain this is a dungeon: its own START button (never the
+        -- lobby's - that one lives under queueGui and is excluded).
+        if not Farm.lobbyServer and not Farm.dungeonLearned and DungeonStartButton() then
+            Farm.dungeonLearned = true
+            pcall(Farm.LearnServer, "dungeon")
         end
         if Farm.runOpen then pcall(function()
             local pg = LP:FindFirstChildOfClass("PlayerGui")
@@ -11720,7 +11789,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.34 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.35 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
