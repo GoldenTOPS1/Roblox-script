@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.37
+--  DQR AUTO FARM v13.38
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -10778,15 +10778,25 @@ function Hud.HandleCommand(msg)
         Hud.Reply(msg.id, "Stopping the script for good (self-destruct). Re-execute it to use it again.")
         task.spawn(Farm.SelfDestruct, "stopped from Discord", "STOPPED FROM DISCORD")
         return
+    elseif cmd == "resetruns" or cmd == "resetstats" then
+        -- Runs, wins / losses and overall deaths back to 0, saved, and the
+        -- status post updated at once.
+        Farm.runsDone, Farm.soldAtRun, Farm.lastRunTime = 0, 0, nil
+        Farm.runsWon, Farm.runsLost, Farm.deathsTotal = 0, 0, 0
+        pcall(Farm.SaveRuns)
+        Farm.statusNow = true
+        print("[DQR] Stats reset from Discord.")
+        reply = "Stats reset: 0 runs, 0 W / 0 L, 0 deaths."
     elseif cmd == "help" then
         reply = table.concat({
             ("`%spause` - stop where it is, start nothing"):format(prefix),
             ("`%sresume` - carry on (also after a rare-drop park)"):format(prefix),
             ("`%sstatus` - what it is doing"):format(prefix),
             ("`%slobby` - leave for the lobby and stay there (paused)"):format(prefix),
+            ("`%sresetruns` - runs, W / L and deaths back to 0"):format(prefix),
             ("`%sstop` - shut the script down (self-destruct)"):format(prefix),
-            ("`%sbreaknow`, `%sendbreak`, `%ssell`, `%sresetstats` - and any command-box command")
-                :format(prefix, prefix, prefix, prefix),
+            ("`%sbreaknow`, `%sendbreak`, `%ssell` - and any command-box command")
+                :format(prefix, prefix, prefix),
         }, "\n")
     else
         -- Any command-box command (DQR_<name>).
@@ -12046,7 +12056,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.37 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.38 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
