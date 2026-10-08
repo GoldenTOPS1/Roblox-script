@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.35
+--  DQR AUTO FARM v13.36
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -181,6 +181,23 @@ local CONFIG = {
     -- seconds. Use a different channel from the loot one. "" = off.
     StatusWebhook  = "https://discord.com/api/webhooks/1552146166706339880/_taQGMvg1dmQxDhSWwxSzHGsasOjqNuK86WxwOYyx3QlZGQVdodTgqcXwGGq-H91B1Tg",
     StatusInterval = 5,
+
+    -- DISCORD COMMANDS: control the bot from a Discord channel with your
+    -- own bot - !pause, !resume, !status, !lobby (leave and stay paused),
+    -- !stop (self-destruct), !help, and any command-box command (!sell,
+    -- !breaknow, !endbreak, !resetstats...). Only YOUR messages
+    -- (DiscordUserId) are ever acted on. Checked every DiscordPollSeconds:
+    -- one small request, the same as the status post - no lag.
+    -- Set up: Discord Developer Portal > New Application > Bot: copy the
+    -- token, and turn ON "Message Content Intent". Invite the bot to your
+    -- server (View Channel, Read Message History, Send Messages), make a
+    -- private channel, right-click it > Copy Channel ID.
+    -- The token controls your bot: never share this script with it in.
+    -- "" = off.
+    DiscordBotToken       = "MTU1NzY5ODk4OTM2MzY5OTcxMg.GsgVc4.4HPH7K447Y3xDWcLr8LcbpuQh8zRkE4GUN0o0Q",
+    DiscordCommandChannel = "1557699970889683086",
+    DiscordCommandPrefix  = "!",
+    DiscordPollSeconds    = 4,
     -- How gold, gems and EXP are written in the status: "both" = short
     -- over full ("1.07T" / "1,070,000,000,000"), "short", or "full".
     StatusNumbers  = "both",
@@ -10399,7 +10416,9 @@ function Farm.StatusWatcher()
 
                 -- What it is doing: the brain's own description.
                 local doing
-                if Farm.parked then
+                if Farm.paused then
+                    doing = "PAUSED - !resume carries on"
+                elseif Farm.parked then
                     doing = ("Parked after a %s - no more runs (DQR_Resume() carries on)")
                         :format(Farm.parked)
                 elseif Farm.breakUntil and os.time() < Farm.breakUntil then
@@ -10630,6 +10649,205 @@ function Hud.SelfDestructNotice(why, title)
                 Body = HttpS:JSONEncode(payload),
             }, true)
         end)
+    end
+end
+
+-- ---- Discord commands (a private bot) ---------------------------
+-- Every DiscordPollSeconds the script asks Discord, with the bot's
+-- token, for new messages in DiscordCommandChannel. A message from YOU
+-- (DiscordUserId - nobody else's are ever acted on) that starts with the
+-- prefix is a command: !pause, !resume, !status, !lobby, !stop, !help,
+-- and any command-box command (!sell, !breaknow, !resetstats...). The bot
+-- answers in the channel. One small request on a background thread, the
+-- same as the status post: nothing the game waits on.
+-- Commands sent while the bot changes servers are still picked up (the
+-- last one read is saved), but none older than 2 minutes is ever run.
+
+-- Snowflake ids are 64-bit: kept as strings (a Lua number loses digits).
+function Hud.IdNewer(a, b)
+    a, b = tostring(a), tostring(b)
+    if #a ~= #b then return #a > #b end
+    return a > b
+end
+-- When a message id was made, in Unix seconds (Discord epoch + id >> 22).
+function Hud.IdTime(id)
+    local n = tonumber(id)
+    return n and (math.floor(n / 4194304) + 1420070400000) / 1000 or 0
+end
+
+function Hud.Discord(method, path, body)
+    local res = HttpRequest({
+        Url = "https://discord.com/api/v10" .. path, Method = method,
+        Headers = {["Authorization"] = "Bot " .. tostring(CONFIG.DiscordBotToken or ""),
+                   ["Content-Type"] = "application/json",
+                   ["User-Agent"] = "DiscordBot (DQR, 1.0)"},
+        Body = body and HttpService:JSONEncode(body) or nil,
+    })
+    if not res then return nil end
+    local ok, data = pcall(function() return HttpService:JSONDecode(res.Body or "") end)
+    return res.StatusCode or res.Status, ok and data or nil
+end
+
+function Hud.Reply(msgId, text)
+    local ch = tostring(CONFIG.DiscordCommandChannel or ""):gsub("%D", "")
+    Hud.Discord("POST", "/channels/" .. ch .. "/messages", {
+        content = tostring(text):sub(1, 1900),
+        message_reference = msgId and {message_id = msgId, fail_if_not_exists = false} or nil,
+        allowed_mentions = {parse = {}},
+    })
+end
+
+-- !status: what it is doing, in a few lines.
+function Hud.StatusText()
+    local h = GetHuman()
+    local doing = Farm.paused and "Paused"
+        or Farm.parked and ("Parked after a " .. Farm.parked)
+        or (Farm.breakUntil and os.time() < Farm.breakUntil)
+            and ("On a break - back in " .. Hud.Clock(Farm.breakUntil - os.time()))
+        or Farm.Running and tostring(Brain.state)
+        or "Idle"
+    local lines = {("**Doing:** %s"):format(doing)}
+    if h then
+        lines[#lines + 1] = ("**HP:** %s / %s"):format(Hud.Short(h.Health), Hud.Short(h.MaxHealth))
+    end
+    lines[#lines + 1] = ("**Runs:** %d  (%d W / %d L)"):format(Farm.runsDone or 0,
+        Farm.runsWon or 0, Farm.runsLost or 0)
+    if Farm.runStartAt then
+        local t = Farm.runEndAt and Farm.lastRunTime or (tick() - Farm.runStartAt)
+        lines[#lines + 1] = ("**This run:** %s, %d death(s)"):format(Hud.Clock(t), Farm.runDeaths or 0)
+    end
+    local g = Hud.Real("gold")
+    if g then lines[#lines + 1] = "**Gold:** " .. (tonumber(g) and Hud.Short(tonumber(g)) or g) end
+    return table.concat(lines, "\n")
+end
+
+function Hud.HandleCommand(msg)
+    local prefix = CONFIG.DiscordCommandPrefix or "!"
+    local text = tostring(msg.content or "")
+    if text:sub(1, #prefix) ~= prefix then return end
+    local body = text:sub(#prefix + 1):gsub("^%s+", ""):gsub("%s+$", "")
+    local cmd, arg = body:match("^(%S+)%s*(.*)$")
+    if not cmd then return end
+    cmd = cmd:lower()
+    print("[DQR] Discord command: " .. text)
+    local reply
+    if cmd == "pause" then
+        Farm.paused = true
+        pcall(Farm.SaveRuns)
+        if Farm.Running then Farm.Stop() end
+        reply = ("Paused - standing still, starting nothing. `%sresume` carries on."):format(prefix)
+    elseif cmd == "resume" or cmd == "unpause" then
+        Farm.paused = false
+        Farm.parked, Farm.parkSaid, Farm.parkLeaveTried = nil, nil, nil
+        pcall(Farm.SaveRuns)
+        Farm.statusNow = true
+        reply = "Resumed."
+    elseif cmd == "status" then
+        reply = Hud.StatusText()
+    elseif cmd == "lobby" or cmd == "tolobby" then
+        -- Leave and STAY: paused, or the next run would be queued at once.
+        Farm.paused = true
+        pcall(Farm.SaveRuns)
+        if Farm.Running then Farm.Stop() end
+        task.spawn(Farm.ReturnToLobby)
+        reply = ("Leaving for the lobby and staying there (paused). `%sresume` carries on."):format(prefix)
+    elseif cmd == "stop" or cmd == "selfdestruct" then
+        Hud.Reply(msg.id, "Stopping the script for good (self-destruct). Re-execute it to use it again.")
+        task.spawn(Farm.SelfDestruct, "stopped from Discord", "STOPPED FROM DISCORD")
+        return
+    elseif cmd == "help" then
+        reply = table.concat({
+            ("`%spause` - stop where it is, start nothing"):format(prefix),
+            ("`%sresume` - carry on (also after a rare-drop park)"):format(prefix),
+            ("`%sstatus` - what it is doing"):format(prefix),
+            ("`%slobby` - leave for the lobby and stay there (paused)"):format(prefix),
+            ("`%sstop` - shut the script down (self-destruct)"):format(prefix),
+            ("`%sbreaknow`, `%sendbreak`, `%ssell`, `%sresetstats` - and any command-box command")
+                :format(prefix, prefix, prefix, prefix),
+        }, "\n")
+    else
+        -- Any command-box command (DQR_<name>).
+        local fn
+        for k, v in pairs(getgenv()) do
+            if type(k) == "string" and k:sub(1, 4) == "DQR_" and type(v) == "function"
+            and k:sub(5):lower() == cmd then
+                fn = v
+                break
+            end
+        end
+        if fn then
+            local ok, err = pcall(fn, arg ~= "" and arg or nil)
+            reply = ok and ("Ran `%s`."):format(cmd) or ("`%s` failed: %s"):format(cmd, tostring(err))
+        else
+            reply = ("Unknown command `%s` - `%shelp` lists them."):format(cmd, prefix)
+        end
+    end
+    if reply then Hud.Reply(msg.id, reply) end
+end
+
+function Hud.PollCommands(ch, uid)
+    local now = tick()
+    -- First look in this server: carry on from the last message read
+    -- (saved), else from the newest one - nothing already there is run.
+    if not Hud.cmdLast then
+        Hud.cmdLast = Farm.cmdLast
+        if not Hud.cmdLast then
+            local code, data = Hud.Discord("GET", ("/channels/%s/messages?limit=1"):format(ch))
+            if code == 200 and type(data) == "table" then
+                Hud.cmdLast = data[1] and tostring(data[1].id) or "0"
+            else
+                if now - (Hud.cmdErrAt or 0) > 60 then
+                    Hud.cmdErrAt = now
+                    print(("[DQR] Discord commands: cannot read the channel (%s) - check the "
+                        .. "bot token, the channel id, and that the bot can see that channel.")
+                        :format(tostring(code)))
+                end
+                return
+            end
+        end
+        print("[DQR] Discord commands: listening.")
+    end
+    local code, data = Hud.Discord("GET", ("/channels/%s/messages?limit=10&after=%s"):format(ch, Hud.cmdLast))
+    if code == 429 then
+        S(tonumber(type(data) == "table" and data.retry_after) or 5)
+        return
+    end
+    if code ~= 200 or type(data) ~= "table" then return end
+    table.sort(data, function(a, b) return Hud.IdNewer(b.id, a.id) end)   -- oldest first
+    for _, msg in ipairs(data) do
+        local id = tostring(msg.id)
+        if Hud.IdNewer(id, Hud.cmdLast) then
+            Hud.cmdLast, Farm.cmdLast = id, id
+            pcall(Farm.SaveRuns)
+            local author = msg.author and tostring(msg.author.id) or ""
+            if author == uid and os.time() - Hud.IdTime(id) < 120 then
+                if tostring(msg.content or "") == "" and not Hud.emptySaid then
+                    Hud.emptySaid = true
+                    print("[DQR] Discord commands: your message arrived empty - turn on MESSAGE "
+                        .. "CONTENT INTENT for the bot (Developer Portal > Bot).")
+                end
+                pcall(Hud.HandleCommand, msg)
+            end
+        end
+    end
+end
+
+function Hud.CommandWatcher()
+    local said = false
+    while not Farm.dead do
+        S(math.max(2, tonumber(CONFIG.DiscordPollSeconds) or 4))
+        local ch = tostring(CONFIG.DiscordCommandChannel or ""):gsub("%D", "")
+        local uid = tostring(CONFIG.DiscordUserId or ""):gsub("%D", "")
+        if tostring(CONFIG.DiscordBotToken or "") ~= "" and ch ~= "" then
+            if uid == "" then
+                if not said then
+                    said = true
+                    print("[DQR] Discord commands: set DiscordUserId - commands are only taken from you.")
+                end
+            else
+                pcall(Hud.PollCommands, ch, uid)
+            end
+        end
     end
 end
 
@@ -11203,7 +11421,8 @@ function Farm.SaveRuns()
             last = Farm.lastRunTime, parked = Farm.parked, won = Farm.runsWon,
             lost = Farm.runsLost, deaths = Farm.deathsTotal,
             breakUntil = Farm.breakUntil, nextBreak = Farm.nextBreakAt,
-            lobbySig = Farm.lobbySig, dungeonSig = Farm.dungeonSig, at = os.time()})
+            lobbySig = Farm.lobbySig, dungeonSig = Farm.dungeonSig,
+            paused = Farm.paused or nil, cmdLast = Farm.cmdLast, at = os.time()})
     end)
     if not ok then return end
     local wf = Env("writefile")
@@ -11225,6 +11444,13 @@ function Farm.LoadRuns()
     -- kept whatever the age - they do not change between sessions.
     if type(t.lobbySig) == "table" then Farm.lobbySig = t.lobbySig end
     if type(t.dungeonSig) == "table" then Farm.dungeonSig = t.dungeonSig end
+    -- Paused stays paused (until resumed), and Discord commands carry on
+    -- from the last one read - whatever the age.
+    if t.paused == true then
+        Farm.paused = true
+        print("[DQR] Still PAUSED - !resume in Discord, or resume in the command box.")
+    end
+    if type(t.cmdLast) == "string" then Farm.cmdLast = t.cmdLast end
     local hours = CONFIG.RunsResetHours or 0
     if hours > 0 and os.time() - (tonumber(t.at) or 0) > hours * 3600 then
         print(("[DQR] Run count: last run over %dh ago - starting a new count."):format(hours))
@@ -11621,6 +11847,7 @@ end
 
 function Farm.Start()
     if Farm.dead or Farm.Running then return end
+    if Farm.paused then return end                   -- !pause / pause: until resumed
     if Farm.restartAt and tick() < Farm.restartAt then return end
     if Farm.lobbyServer then
         print("[DQR] Not farming - this server is the lobby (still loading into the dungeon?).")
@@ -11675,7 +11902,8 @@ local function StartWatcher()
     while not Farm.dead do
         S(1.5)
         -- Never the lobby party screen's start: see DungeonStartButton.
-        local b = DungeonStartButton()
+        -- Not while paused either.
+        local b = not Farm.paused and DungeonStartButton()
         if b then
             print("[DQR] In-dungeon START visible - clicking.")
             ClickButton(b)
@@ -11702,6 +11930,12 @@ end
 local function Supervisor()
     while not Farm.dead do
         S(4)
+        -- Paused (!pause, or "pause" in the command box): nothing starts,
+        -- nothing is queued or replayed until resumed.
+        if Farm.paused then
+            if Farm.Running then Farm.Stop() end
+            continue
+        end
         if Farm.Running and tick() - Farm.beat > CONFIG.LoopStallTime then
             print(("[DQR] Farm loop has not ticked in %.0fs - restarting.")
                 :format(tick() - Farm.beat))
@@ -11789,7 +12023,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.35 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.36 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -11821,6 +12055,7 @@ task.spawn(function()
     task.spawn(VanityWatcher)
     task.spawn(LootWatcher)
     task.spawn(Farm.FailWatcher)
+    task.spawn(Hud.CommandWatcher)                    -- Discord commands (if set up)
 
     -- PlayerGui is still filling in right after injection: sample for
     -- a few seconds before deciding there is no lobby.
@@ -12102,9 +12337,18 @@ end
 -- DQR_Resume(): after a rare drop parked the bot, carry on farming.
 getgenv().DQR_Resume     = function()
     Farm.parked, Farm.parkSaid, Farm.parkLeaveTried = nil, nil, nil
+    Farm.paused = false
     pcall(Farm.SaveRuns)
     Farm.statusNow = true
     print("[DQR] Resumed - the next run starts as usual.")
+end
+-- DQR_Pause(): stand still and start nothing until resumed (also !pause).
+getgenv().DQR_Pause      = function()
+    Farm.paused = true
+    pcall(Farm.SaveRuns)
+    if Farm.Running then Farm.Stop() end
+    Farm.statusNow = true
+    print("[DQR] Paused - resume carries on.")
 end
 -- DQR_ResetStats() / DQR_ResetRuns(): runs, wins / losses and overall
 -- deaths back to 0 ("resetstats" or "resetruns" in the command box).
