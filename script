@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.36
+--  DQR AUTO FARM v13.37
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -12,6 +12,11 @@
 --  Lobby queue, Carry Mode, Discord loot + live status.
 --  (F5 farm / F6 gui dump / F7 log / F8 mob diag / F9 hazard diag /
 --   F10 loot panel)
+--  PRIVATE SETTINGS: the webhooks, bot token and Discord ids are NOT
+--  in this file. Set them in your autoexec before loading it:
+--      getgenv().DQR_SETTINGS = {DiscordWebhook = "...", StatusWebhook = "...",
+--          DiscordUserId = "...", DiscordBotToken = "...", DiscordCommandChannel = "..."}
+--  Any other CONFIG setting can be set there too.
 -- ============================================================
 
 local CONFIG = {
@@ -127,7 +132,7 @@ local CONFIG = {
     -- ---- DISCORD -----------------------------------------------
     -- Loot: each finished run posts its drops here. "" = off.
     -- DQR_LootTest() in the console sends a test post.
-    DiscordWebhook = "https://discord.com/api/webhooks/1551757053096362044/1G7sFx_N2JIec7uGvZZoSc2jldRWB704U0R4u4o4Ccs4ElPZ4wMDauZDKv0WZmwaY8Z1",
+    DiscordWebhook = "",   -- private: set in DQR_SETTINGS (see the top of the file)
     -- The reward panel, as found on 2026-09-21. {} = detect it again.
     LootPanelPath  = {"rewardGuiHolder", "holder"},
     -- Which rarities are worth a post. An item whose rarity cannot be
@@ -155,7 +160,7 @@ local CONFIG = {
     -- loot post @-mentions you when a drop is one of the rarities set to
     -- true below - those are always posted, whatever LootRarities says.
     -- "" = never ping.
-    DiscordUserId    = "793711555447357471",
+    DiscordUserId    = "",   -- private: set in DQR_SETTINGS
     -- RARE DROP: when a run drops one of RareDropRarities (read off the
     -- reward panel, like the loot post):
     --   RareDropLobby = true: after that run, leave for the lobby and stay
@@ -179,7 +184,7 @@ local CONFIG = {
 
     -- Live status: ONE message, edited in place every StatusInterval
     -- seconds. Use a different channel from the loot one. "" = off.
-    StatusWebhook  = "https://discord.com/api/webhooks/1552146166706339880/_taQGMvg1dmQxDhSWwxSzHGsasOjqNuK86WxwOYyx3QlZGQVdodTgqcXwGGq-H91B1Tg",
+    StatusWebhook  = "",   -- private: set in DQR_SETTINGS
     StatusInterval = 5,
 
     -- DISCORD COMMANDS: control the bot from a Discord channel with your
@@ -194,8 +199,8 @@ local CONFIG = {
     -- private channel, right-click it > Copy Channel ID.
     -- The token controls your bot: never share this script with it in.
     -- "" = off.
-    DiscordBotToken       = "MTU1NzY5ODk4OTM2MzY5OTcxMg.GsgVc4.4HPH7K447Y3xDWcLr8LcbpuQh8zRkE4GUN0o0Q",
-    DiscordCommandChannel = "1557699970889683086",
+    DiscordBotToken       = "",   -- private: set in DQR_SETTINGS
+    DiscordCommandChannel = "",   -- private: set in DQR_SETTINGS
     DiscordCommandPrefix  = "!",
     DiscordPollSeconds    = 4,
     -- How gold, gems and EXP are written in the status: "both" = short
@@ -642,6 +647,24 @@ local CONFIG = {
     HazardTTL      = 0.1,
     ThreatTTL      = 0.1,
 }
+
+-- PRIVATE SETTINGS. Anything in getgenv().DQR_SETTINGS, set in your
+-- autoexec BEFORE this script loads, replaces the CONFIG value of the
+-- same name - so the webhooks, the bot token and your ids never have to
+-- be in this file (or on GitHub). Any CONFIG key works the same way.
+pcall(function()
+    local mine = getgenv and getgenv().DQR_SETTINGS
+    if type(mine) == "table" then
+        local n = 0
+        for k, v in pairs(mine) do
+            if type(k) == "string" then
+                CONFIG[k] = v
+                n = n + 1
+            end
+        end
+        print(("[DQR] Private settings: %d value(s) applied."):format(n))
+    end
+end)
 
 -- Melee classes sit at the edge of their own reach; casters stand
 -- back and lean on Q/E. Casters now hold further out, the way the
@@ -12023,7 +12046,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.36 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.37 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
