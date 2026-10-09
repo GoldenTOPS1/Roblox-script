@@ -71,7 +71,7 @@ local CONFIG = {
     -- SellNames, then presses Sell once for all of them.
     -- Names are matched ignoring case and spaces. Nothing that is not on
     -- the list is ever clicked, and a "Sell All" button is never pressed.
-    AutoSell       = false,
+    AutoSell       = true,
     SellNames      = {},        -- e.g. {"Rusty Sword", "Bone Armor"}
     SellMatch      = "exact",   -- "exact" = the whole name, "contains" = part of it
     -- SELL BY RARITY: also sell every item whose rarity is switched on
@@ -81,7 +81,7 @@ local CONFIG = {
     -- blue, Epic purple, Legendary yellow, Ultimate red). An item whose
     -- rarity cannot be read is NEVER sold by rarity. Equipped items and
     -- anything named in SellNever are never sold at all.
-    SellByRarity   = false,
+    SellByRarity   = true,
     SellRarities   = {
         Common    = true,
         Uncommon  = true,
