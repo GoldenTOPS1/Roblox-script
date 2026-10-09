@@ -82,11 +82,11 @@ local CONFIG = {
     -- there.) Only if a shop has no such buttons is the rarity read off
     -- each slot instead - then an item whose rarity cannot be read is
     -- NEVER sold, nor anything equipped or named in SellNever.
-    SellByRarity   = true,
+    SellByRarity   = false,
     SellRarities   = {
         Common    = true,
         Uncommon  = true,
-        Rare      = true,
+        Rare      = false,
         Epic      = false,
         Legendary = false,
         Ultimate  = false,
@@ -101,7 +101,7 @@ local CONFIG = {
     -- to Lobby?". The door is found by its name; if it is not,
     -- DQR_LobbyDump() at the end of a run prints the buttons there - put
     -- the door's path in LobbyButtonPath. DQR_ToLobby() tries it by hand.
-    SellAfterRuns  = true,
+    SellAfterRuns  = false,
     SellEveryRuns  = 10,
     -- The run count (status webhook, SellEveryRuns) is saved to a file,
     -- so it carries on across servers - every Replay is a new one. It
@@ -125,7 +125,7 @@ local CONFIG = {
     -- SellDryRun = true: walks there, opens the shop and clicks the items,
     -- but does NOT press Sell - the log lists what it would have sold.
     -- Run it like that once and check the list before switching it off.
-    SellDryRun     = false,
+    SellDryRun     = true,
     -- Where the sell area is, if it is not found by itself (the log will
     -- say): a Vector3, e.g. Vector3.new(120, 5, -40). nil = find it.
     -- (The lobby's sell area, read with selldump on 2026-10-08: the shop
