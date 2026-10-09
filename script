@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.38
+--  DQR AUTO FARM v13.39
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -74,13 +74,14 @@ local CONFIG = {
     AutoSell       = true,
     SellNames      = {},        -- e.g. {"Rusty Sword", "Bone Armor"}
     SellMatch      = "exact",   -- "exact" = the whole name, "contains" = part of it
-    -- SELL BY RARITY: also sell every item whose rarity is switched on
-    -- below, whatever its name. The rarity is read off the shop slot - a
-    -- word on it, or the tier colour of its glow / border (the same
-    -- colours as the reward panel: Common grey, Uncommon green, Rare
-    -- blue, Epic purple, Legendary yellow, Ultimate red). An item whose
-    -- rarity cannot be read is NEVER sold by rarity. Equipped items and
-    -- anything named in SellNever are never sold at all.
+    -- SELL BY RARITY: sell every item whose rarity is switched on below.
+    -- Done with the shop's own rarity buttons ("Common (4)", "Uncommon
+    -- (3)"... after "Deselect All"), which select all items of that
+    -- rarity - the game decides what is sellable. (Dungeon Quest's shop
+    -- slots carry no item names, so SellNames cannot match anything
+    -- there.) Only if a shop has no such buttons is the rarity read off
+    -- each slot instead - then an item whose rarity cannot be read is
+    -- NEVER sold, nor anything equipped or named in SellNever.
     SellByRarity   = true,
     SellRarities   = {
         Common    = true,
@@ -127,7 +128,9 @@ local CONFIG = {
     SellDryRun     = true,
     -- Where the sell area is, if it is not found by itself (the log will
     -- say): a Vector3, e.g. Vector3.new(120, 5, -40). nil = find it.
-    SellSpot       = nil,
+    -- (The lobby's sell area, read with selldump on 2026-10-08: the shop
+    -- opens when you walk in - there is no prompt to find it by.)
+    SellSpot       = Vector3.new(-77, 4, 1010),
 
     -- ---- DISCORD -----------------------------------------------
     -- Loot: each finished run posts its drops here. "" = off.
@@ -11290,13 +11293,42 @@ function Sell.Flow(force)
     S(0.5)                                  -- let the item list fill in
     local slots = Sell.Slots(gui, btn)
     local picked, named, kept = {}, 0, {}
-    for _, s in ipairs(slots) do
-        if #Candidates(s) > 0 then named = named + 1 end
-        local label, why = Sell.Pick(s)
-        if label then
-            picked[#picked + 1] = {slot = s, name = label}
-        elseif why then
-            kept[why] = (kept[why] or 0) + 1
+    -- BY RARITY, THE SHOP'S OWN WAY (v13.39). Dungeon Quest's shop has a
+    -- button per rarity - "Common (4)", "Uncommon (3)"... - that selects
+    -- every item of it, and "Deselect All". Its slots carry no names and
+    -- no readable tier, so those buttons are the way: Deselect All, then
+    -- each rarity switched on in SellRarities that has any.
+    local byButtons = false
+    if CONFIG.SellByRarity then
+        local rb, deselect = Sell.RarityButtons()
+        if next(rb) then
+            byButtons = true
+            if deselect then
+                ClickButton(deselect)
+                S(0.3)
+            end
+            for _, tier in ipairs({"Common", "Uncommon", "Rare", "Epic", "Legendary", "Ultimate"}) do
+                local e = rb[tier]
+                if e and e.n > 0 and (CONFIG.SellRarities or {})[tier] then
+                    ClickButton(e.btn)
+                    S(0.3)
+                    picked[#picked + 1] = {name = ("%d %s"):format(e.n, tier), count = e.n}
+                elseif e and e.n > 0 then
+                    kept[tier .. " (not selling that rarity)"] = e.n
+                end
+            end
+        end
+    end
+    -- Otherwise one slot at a time: by name, or a tier read off the slot.
+    if not byButtons then
+        for _, s in ipairs(slots) do
+            if #Candidates(s) > 0 then named = named + 1 end
+            local label, why = Sell.Pick(s)
+            if label then
+                picked[#picked + 1] = {slot = s, name = label, count = 1}
+            elseif why then
+                kept[why] = (kept[why] or 0) + 1
+            end
         end
     end
     -- Why the rest were kept, in one line ("3 equipped, 12 rarity unreadable").
@@ -11313,15 +11345,19 @@ function Sell.Flow(force)
         Sell.Close(gui)
         return
     end
-    -- Click them all first...
-    local list = {}
+    -- Click them all first (the rarity buttons above did their own)...
+    local list, total = {}, 0
     for _, p in ipairs(picked) do
-        pcall(ScrollIntoView, p.slot)
-        ClickButton(p.slot)
+        if p.slot then
+            pcall(ScrollIntoView, p.slot)
+            ClickButton(p.slot)
+            S(0.25)
+        end
         list[#list + 1] = p.name
-        S(0.25)
+        total = total + (p.count or 1)
     end
-    print(("[DQR] Sell: selected %d item(s): %s"):format(#picked, table.concat(list, ", ")))
+    print(("[DQR] Sell: selected %d item(s): %s%s"):format(total, table.concat(list, ", "),
+        byButtons and " (with the shop's rarity buttons)" or ""))
     if CONFIG.SellDryRun then
         print("[DQR] Sell: SellDryRun is on - NOT pressing Sell. Check the list above, then set "
             .. "SellDryRun = false.")
@@ -11340,9 +11376,32 @@ function Sell.Flow(force)
         end
         if conf then ClickButton(conf) break end
     end
-    print(("[DQR] Sell: sold %d item(s)."):format(#picked))
+    print(("[DQR] Sell: sold %d item(s)."):format(total))
     S(0.5)
     Sell.Close(gui)
+end
+
+-- The shop's select-by-rarity buttons: rarity -> {btn, n} (n from the
+-- "Common (4)" text), and its "Deselect All" button.
+function Sell.RarityButtons()
+    local out, deselect = {}, nil
+    local tiers = {common = "Common", uncommon = "Uncommon", rare = "Rare", epic = "Epic",
+                   legendary = "Legendary", ultimate = "Ultimate"}
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    for _, b in ipairs(pg and pg:GetDescendants() or {}) do
+        if (b:IsA("TextButton") or b:IsA("ImageButton")) and VisibleOnScreen(b)
+        and not (LogGui and b:IsDescendantOf(LogGui)) then
+            for _, tok in ipairs(ButtonTokens(b)) do
+                local word, n = tok:match("^(%a+)%((%d+)%)$")
+                if word and tiers[word] and not out[tiers[word]] then
+                    out[tiers[word]] = {btn = b, n = tonumber(n)}
+                elseif tok == "deselectall" then
+                    deselect = b
+                end
+            end
+        end
+    end
+    return out, deselect
 end
 
 -- Once per lobby visit (and never twice within 30 seconds). `force` runs
@@ -11371,6 +11430,18 @@ function Sell.Dump()
     print("[DQR] Inventory data: " .. (have and (folder:GetFullName() .. " - " .. #have .. " item(s)") or "none readable"))
     local btn = Sell.FindButton()
     print("[DQR] Sell button: " .. (btn and btn:GetFullName() or "not on screen"))
+    -- The shop's own select-by-rarity buttons, and what SellByRarity would do.
+    local rb, deselect = Sell.RarityButtons()
+    local tiersTxt = {}
+    for _, tier in ipairs({"Common", "Uncommon", "Rare", "Epic", "Legendary", "Ultimate"}) do
+        local e = rb[tier]
+        if e then
+            tiersTxt[#tiersTxt + 1] = ("%s %d%s"):format(tier, e.n,
+                (CONFIG.SellByRarity and (CONFIG.SellRarities or {})[tier] and e.n > 0) and " (WOULD SELL)" or "")
+        end
+    end
+    print("[DQR] Rarity buttons: " .. (#tiersTxt > 0 and table.concat(tiersTxt, ", ") or "none found")
+        .. (deselect and " | Deselect All found" or ""))
     local gui = btn and (btn:FindFirstAncestorWhichIsA("ScreenGui") or btn.Parent)
     if not gui then return end
     local slots = Sell.Slots(gui, btn)
@@ -12056,7 +12127,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.38 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.39 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
