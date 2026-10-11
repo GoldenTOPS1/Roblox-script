@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.47
+--  DQR AUTO FARM v13.48
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -10632,6 +10632,17 @@ function Hud.Clock(sec)
     if h > 0 then return ("%d:%02d:%02d"):format(h, m, s) end
     return ("%d:%02d"):format(m, s)
 end
+-- 9060 -> "2 hours 31 minutes" (and "1 day 3 hours 5 minutes").
+function Hud.Duration(sec)
+    sec = math.max(0, math.floor(tonumber(sec) or 0))
+    local d, h, m = math.floor(sec / 86400), math.floor(sec / 3600) % 24, math.floor(sec / 60) % 60
+    local function P(n, word) return ("%d %s%s"):format(n, word, n == 1 and "" or "s") end
+    local out = {}
+    if d > 0 then out[#out + 1] = P(d, "day") end
+    if d > 0 or h > 0 then out[#out + 1] = P(h, "hour") end
+    out[#out + 1] = P(m, "minute")
+    return table.concat(out, " ")
+end
 
 -- 1300000 -> "1.30M", the way the HUD writes it.
 function Hud.Short(n)
@@ -10803,7 +10814,7 @@ function Hud.DeleteMsg(url, id)
 end
 
 function Farm.StatusWatcher()
-    local msgId, base, startedAt = nil, nil, tick()
+    local msgId, base = nil, nil
     local said, lastErr, loaded = false, 0, false
     while not Farm.dead do
         -- Every StatusInterval - or at once when a run has just finished
@@ -10811,6 +10822,9 @@ function Farm.StatusWatcher()
         local waitT, t0 = math.max(2, CONFIG.StatusInterval or 5), tick()
         while not Farm.dead and tick() - t0 < waitT and not Farm.statusNow do S(0.25) end
         Farm.statusNow = false
+        -- Saved at least every 30s (v13.48): the uptime carries over to the
+        -- next server from the last save, so it loses no more than that.
+        if not Farm.dead and tick() - (Farm.savedAt or 0) > 30 then pcall(Farm.SaveRuns) end
         local url = CONFIG.StatusWebhook
         if type(url) ~= "string" or url == "" then
             if not said then
@@ -10949,8 +10963,9 @@ function Farm.StatusWatcher()
                         h.MaxHealth > 0 and h.Health / h.MaxHealth * 100 or 0,
                         tgt.Dist))
                 end
-                local up = tick() - startedAt
-                F("Uptime", ("%dh %02dm"):format(up / 3600, (up % 3600) / 60))
+                -- v13.48: the script's whole running time, across servers
+                -- (Farm.Uptime) - "Run time" above is this run's.
+                F("Uptime", Hud.Duration(Farm.Uptime()))
 
                 local lvl = Hud.Real("level") or Hud.Real("lvl")
                 local col = 5763719
@@ -11165,6 +11180,7 @@ function Hud.StatusText()
     if g then lines[#lines + 1] = "**Gold:** " .. (tonumber(g) and Hud.Short(tonumber(g)) or g) end
     local okBag, bag = pcall(Hud.BagText)
     if okBag and bag then lines[#lines + 1] = "**Bag:** " .. bag end
+    lines[#lines + 1] = "**Uptime:** " .. Hud.Duration(Farm.Uptime())
     return table.concat(lines, "\n")
 end
 
@@ -12119,9 +12135,18 @@ Farm.runsDone, Farm.soldAtRun, Farm.runOpen = 0, 0, false
 -- read back at start. After RunsResetHours without a run, it starts
 -- again from 0 - a new session.
 Farm.RUNS_KEY = "DQR_runs.txt"
+-- UPTIME (v13.48): how long the script has been running in all, across
+-- servers - each run is a new server where it starts afresh, so it is
+-- saved with the run count: what earlier servers ran (upBase) plus this
+-- one. Time between servers (loading) counts; time the script was not
+-- running at all does not. Back to 0 with the run count (RunsResetHours).
+Farm.upBase, Farm.upAt = 0, tick()
+function Farm.Uptime() return Farm.upBase + (tick() - Farm.upAt) end
 function Farm.SaveRuns()
+    Farm.savedAt = tick()
     local ok, data = pcall(function()
         return HttpService:JSONEncode({runs = Farm.runsDone, soldAt = Farm.soldAtRun,
+            up = math.floor(Farm.Uptime()),
             last = Farm.lastRunTime, parked = Farm.parked, won = Farm.runsWon,
             lost = Farm.runsLost, deaths = Farm.deathsTotal,
             breakUntil = Farm.breakUntil, nextBreak = Farm.nextBreakAt,
@@ -12166,6 +12191,10 @@ function Farm.LoadRuns()
         print(("[DQR] Run count: last run over %dh ago - starting a new count."):format(hours))
         return
     end
+    -- Uptime carried on: the gap since the last save counts when it is
+    -- loading between servers (up to 10 min) - longer, the script was off.
+    local gap = os.time() - (tonumber(t.at) or os.time())
+    Farm.upBase = (tonumber(t.up) or 0) + ((gap >= 0 and gap <= 600) and gap or 0)
     Farm.runsDone = tonumber(t.runs) or 0
     Farm.soldAtRun = math.min(tonumber(t.soldAt) or 0, Farm.runsDone)
     Farm.lastRunTime = tonumber(t.last)
@@ -12916,7 +12945,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.47 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.48 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
