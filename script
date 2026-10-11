@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.42
+--  DQR AUTO FARM v13.43
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -10726,6 +10726,8 @@ function Farm.StatusWatcher()
                 elseif Farm.breakUntil and os.time() < Farm.breakUntil then
                     doing = ("On a break - back in %s"):format(Hud.Clock(Farm.breakUntil - os.time()))
                 elseif dead then               doing = "Dead - waiting to respawn"
+                elseif Farm.leaving then       doing = "Leaving for the lobby to sell (!sellnow)"
+                elseif Farm.selling then       doing = "Selling (!sellnow)"
                 elseif InLobby() then          doing = "In the lobby"
                 elseif lobbyFlowActive then    doing = "Queueing a dungeon"
                 elseif not Farm.Running then   doing = "Idle"
@@ -11007,6 +11009,8 @@ function Hud.StatusText()
     local h = GetHuman()
     local doing = Farm.paused and "Paused"
         or Farm.parked and ("Parked after a " .. Farm.parked)
+        or Farm.leaving and "Leaving for the lobby to sell"
+        or Farm.selling and "Selling"
         or (Farm.breakUntil and os.time() < Farm.breakUntil)
             and ("On a break - back in " .. Hud.Clock(Farm.breakUntil - os.time()))
         or Farm.Running and tostring(Brain.state)
@@ -11056,6 +11060,10 @@ function Hud.HandleCommand(msg)
         if Farm.Running then Farm.Stop() end
         task.spawn(Farm.ReturnToLobby)
         reply = ("Leaving for the lobby and staying there (paused). `%sresume` carries on."):format(prefix)
+    elseif cmd == "sellnow" then
+        -- To the lobby now, sell, carry on farming (Farm.SellNow). A late
+        -- reply if leaving fails.
+        reply = Farm.SellNow(function(text) Hud.Reply(msg.id, text) end)
     elseif cmd == "stop" or cmd == "selfdestruct" then
         Hud.Reply(msg.id, "Stopping the script for good (self-destruct). Re-execute it to use it again.")
         task.spawn(Farm.SelfDestruct, "stopped from Discord", "STOPPED FROM DISCORD")
@@ -11075,6 +11083,7 @@ function Hud.HandleCommand(msg)
             ("`%sresume` - carry on (also after a rare-drop park)"):format(prefix),
             ("`%sstatus` - what it is doing"):format(prefix),
             ("`%slobby` - leave for the lobby and stay there (paused)"):format(prefix),
+            ("`%ssellnow` - go to the lobby now, sell, then carry on farming"):format(prefix),
             ("`%sresetruns` - runs, W / L and deaths back to 0"):format(prefix),
             ("`%sstop` - shut the script down (self-destruct)"):format(prefix),
             ("`%sbreaknow`, `%sendbreak`, `%ssell` - and any command-box command")
@@ -11805,7 +11814,8 @@ function Farm.SaveRuns()
             lost = Farm.runsLost, deaths = Farm.deathsTotal,
             breakUntil = Farm.breakUntil, nextBreak = Farm.nextBreakAt,
             lobbySig = Farm.lobbySig, dungeonSig = Farm.dungeonSig,
-            paused = Farm.paused or nil, cmdLast = Farm.cmdLast, at = os.time()})
+            paused = Farm.paused or nil, cmdLast = Farm.cmdLast,
+            sellNow = Farm.sellNow or nil, at = os.time()})
     end)
     if not ok then return end
     local wf = Env("writefile")
@@ -11834,6 +11844,11 @@ function Farm.LoadRuns()
         print("[DQR] Still PAUSED - !resume in Discord, or resume in the command box.")
     end
     if type(t.cmdLast) == "string" then Farm.cmdLast = t.cmdLast end
+    -- A !sellnow on its way to the lobby (whatever the age).
+    if t.sellNow == true then
+        Farm.sellNow = true
+        print("[DQR] Sell now (!sellnow) still to do - selling in the lobby before the next run.")
+    end
     local hours = CONFIG.RunsResetHours or 0
     if hours > 0 and os.time() - (tonumber(t.at) or 0) > hours * 3600 then
         print(("[DQR] Run count: last run over %dh ago - starting a new count."):format(hours))
@@ -12078,6 +12093,7 @@ end
 
 -- SellAfterRuns: SellEveryRuns finished since the last sell?
 function Farm.SellDue()
+    if Farm.sellNow then return true end          -- !sellnow (Farm.SellNow)
     local n = CONFIG.SellEveryRuns or 0
     return CONFIG.SellAfterRuns and n > 0 and (Farm.runsDone - Farm.soldAtRun) >= n
 end
@@ -12185,6 +12201,60 @@ function Farm.ReturnToLobby()
     return false
 end
 
+-- SELL NOW (v13.43: !sellnow in Discord, "sellnow" in the command box).
+-- To the lobby now - mid-run too - sell, then carry on farming. The
+-- lobby is another server where the script starts afresh, so the order
+-- is saved (Farm.sellNow, with the run count): it makes Farm.SellDue()
+-- true there until the sell is done. If leaving fails, the order stands
+-- and it sells when the run is over instead. `say` gets a late word
+-- (the Discord reply) if leaving fails; the return value is the reply.
+function Farm.SellNow(say)
+    say = say or print
+    local note = ""
+    if #(CONFIG.SellNames or {}) == 0 and not CONFIG.SellByRarity then
+        note = " Note: SellByRarity is off and SellNames is empty - nothing is set to be sold."
+    elseif CONFIG.SellDryRun then
+        note = " Note: SellDryRun is on - it opens the shop and picks, but does NOT press Sell."
+    end
+    if Farm.RealLobby() then
+        if lobbyFlowActive or Farm.selling then
+            Farm.sellNow = true
+            pcall(Farm.SaveRuns)
+            return "Busy in the lobby right now (queueing / selling) - selling as soon as it can." .. note
+        end
+        -- Here already: sell at once (the Supervisor waits for it), then
+        -- the next run is queued as usual.
+        Farm.sellNow, Farm.soldAtRun = nil, Farm.runsDone
+        pcall(Farm.SaveRuns)
+        task.spawn(function()
+            Farm.selling = true
+            local ok, err = pcall(Sell.Run, true)
+            Farm.selling = nil
+            if not ok then print("[DQR] Sell now failed: " .. tostring(err)) end
+        end)
+        return "In the lobby - selling now, then back to farming." .. note
+    end
+    Farm.sellNow = true
+    pcall(Farm.SaveRuns)
+    Farm.statusNow = true
+    if Farm.leaving then return "Already on the way to the lobby to sell." .. note end
+    -- Stand still and keep the Supervisor from restarting the farm while
+    -- the door / YES are pressed.
+    Farm.leaving = true
+    if Farm.Running then Farm.Stop() end
+    print("[DQR] Sell now: leaving for the lobby.")
+    task.spawn(function()
+        local ok, went = pcall(Farm.ReturnToLobby)
+        Farm.leaving = nil
+        if not (ok and went) and not Farm.dead then
+            print("[DQR] Sell now: could not leave - selling when this run is over instead.")
+            say("Could not get to the lobby (see the log - the door button may not be "
+                .. "recognised). It will sell when this run is over instead.")
+        end
+    end)
+    return "Leaving for the lobby to sell, then back to farming." .. note
+end
+
 -- BREAKS (TakeBreaks). Every BreakEveryMin-BreakEveryMax minutes (random
 -- each time) the bot takes a break once the run in progress is over:
 -- it leaves for the lobby, waits BreakMin-BreakMax minutes there (random),
@@ -12232,7 +12302,7 @@ function Farm.OnBreak()
     end
     if Farm.RealLobby() then
         if Farm.SellDue() then
-            Farm.soldAtRun = Farm.runsDone
+            Farm.soldAtRun, Farm.sellNow = Farm.runsDone, nil
             pcall(Farm.SaveRuns)
             Sell.Run(true)
         elseif CONFIG.AutoSell then
@@ -12390,6 +12460,9 @@ local function Supervisor()
             if Farm.Running then Farm.Stop() end
             continue
         end
+        -- !sellnow: on the way out to the lobby, or selling there - no
+        -- restarting the farm or queueing a run meanwhile.
+        if Farm.leaving or Farm.selling then continue end
         if Farm.Running and tick() - Farm.beat > CONFIG.LoopStallTime then
             print(("[DQR] Farm loop has not ticked in %.0fs - restarting.")
                 :format(tick() - Farm.beat))
@@ -12441,9 +12514,10 @@ local function Supervisor()
                 Farm.statusNow = true
                 print("[DQR] Could not get to the lobby - replaying without selling.")
             elseif sellDue and Farm.RealLobby() then
-                print(("[DQR] %d run(s) since the last sell - selling before the next run.")
+                print(Farm.sellNow and "[DQR] Selling now (!sellnow) before the next run."
+                    or ("[DQR] %d run(s) since the last sell - selling before the next run.")
                     :format(Farm.runsDone - Farm.soldAtRun))
-                Farm.soldAtRun = Farm.runsDone
+                Farm.soldAtRun, Farm.sellNow = Farm.runsDone, nil
                 pcall(Farm.SaveRuns)                  -- the next server knows it sold
                 Sell.Run(true)
             elseif CONFIG.AutoSell and Farm.RealLobby() then
@@ -12482,7 +12556,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.42 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.43 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -12777,7 +12851,7 @@ function Farm.RunCommand(text)
     if key ~= "help" then print(("[DQR] No command '%s'."):format(name)) end
     table.sort(list)
     print("[DQR] Commands: " .. table.concat(list, ", "))
-    print("[DQR] e.g.  resume  |  resetruns  |  tolobby  |  lobbydump  |  sell  |  selfdestruct")
+    print("[DQR] e.g.  resume  |  resetruns  |  tolobby  |  lobbydump  |  sellnow  |  selfdestruct")
 end
 
 -- DQR_EndBreak(): cut a break short (the next run is queued straight
@@ -12844,6 +12918,9 @@ getgenv().DQR_State      = function() return Brain.state end
 -- DQR_Sell(): run the sell now, even with AutoSell off (SellDryRun obeyed).
 getgenv().DQR_SellDump   = function() Sell.Dump() end
 getgenv().DQR_Sell       = function() task.spawn(Sell.Run, true) end
+-- DQR_SellNow() / "sellnow": to the lobby now (mid-run too), sell, then
+-- carry on farming - the same as !sellnow in Discord.
+getgenv().DQR_SellNow    = function() print("[DQR] " .. Farm.SellNow()) end
 getgenv().DQR_BossBar    = function() return Mobs.BossBar() end
 getgenv().DQR_Profile    = function() Prof.Apply() return Prof.name end
 -- DQR_Map("off") puts the map back; DQR_Map("flat") / ("hide") applies it.
