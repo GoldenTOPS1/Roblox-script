@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.46
+--  DQR AUTO FARM v13.47
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -97,6 +97,23 @@ local CONFIG = {
         Legendary = false,
         Ultimate  = false,
     },
+    -- SPELLS: the shop lists spells (abilities) in with the gear, and its
+    -- rarity buttons pick both. SellSpells = false keeps every spell;
+    -- true sells the spells of the rarities on in SellSpellRarities - a
+    -- list of their own, so Epic spells can go while Epic gear (above)
+    -- stays. When the two lists differ the bot reads each slot's rarity
+    -- off the shop's buttons and clicks slot by slot, and checks the
+    -- selection before pressing Sell (if it cannot tell, it sells only
+    -- the rarities that go for both).
+    SellSpells     = false,
+    SellSpellRarities = {
+        Common    = true,
+        Uncommon  = true,
+        Rare      = true,
+        Epic      = true,
+        Legendary = false,
+        Ultimate  = false,
+    },
     SellNever      = {},        -- names never sold, e.g. {"My Best Sword"}
     -- SELL EVERY N RUNS: true = after every SellEveryRuns finished runs
     -- the bot leaves for the lobby, sells (by SellNames and / or
@@ -107,8 +124,8 @@ local CONFIG = {
     -- to Lobby?". The door is found by its name; if it is not,
     -- DQR_LobbyDump() at the end of a run prints the buttons there - put
     -- the door's path in LobbyButtonPath. DQR_ToLobby() tries it by hand.
-    SellAfterRuns  = false,
-    SellEveryRuns  = 10,
+    SellAfterRuns  = true,
+    SellEveryRuns  = 30,
     -- The run count (status webhook, SellEveryRuns) is saved to a file,
     -- so it carries on across servers - every Replay is a new one. It
     -- starts again from 0 after this many hours with no run (0 = never).
@@ -11644,6 +11661,85 @@ function Sell.Slots(gui, sellBtn)
     return out
 end
 
+-- SPELLS (v13.47, SellSpells). The shop lists spells with the gear - one
+-- list, no tab - and each slot says what it is ("weapon", "chest",
+-- "ability"): an ability is a spell.
+Sell.SPELL_WORDS = {"ability", "spell"}
+function Sell.IsSpell(slot)
+    for _, c in ipairs(Candidates(slot)) do
+        local n = Norm(c)
+        for _, w in ipairs(Sell.SPELL_WORDS) do
+            if n:find(w, 1, true) then return true end
+        end
+    end
+    return false
+end
+-- How a slot looks right now, as one string: shown / colour / see-through
+-- of every piece of it (and of the frame it sits in), so "selected" can be
+-- told from "not" by comparing - whatever the shop draws to show it.
+function Sell.SlotSig(slot)
+    local root = slot
+    if slot.Parent and slot.Parent:IsA("GuiObject") and not slot.Parent:IsA("ScrollingFrame") then
+        root = slot.Parent
+    end
+    local parts = {}
+    local function Add(o)
+        if o:IsA("GuiObject") then
+            parts[#parts + 1] = ("%s%s%.2f"):format(o.Visible and "1" or "0",
+                tostring(o.BackgroundColor3), o.BackgroundTransparency)
+            if o:IsA("ImageLabel") or o:IsA("ImageButton") then
+                parts[#parts + 1] = ("%s%s%.2f"):format(o.Image, tostring(o.ImageColor3), o.ImageTransparency)
+            elseif o:IsA("TextLabel") or o:IsA("TextButton") then
+                parts[#parts + 1] = o.Text .. tostring(o.TextColor3)
+            end
+        elseif o:IsA("UIStroke") then
+            parts[#parts + 1] = ("%s%s%.2f"):format(tostring(o.Enabled), tostring(o.Color), o.Transparency)
+        end
+    end
+    Add(root)
+    for _, d in ipairs(root:GetDescendants()) do Add(d) end
+    return table.concat(parts, "|")
+end
+-- Which rarity each slot is. The slots do not say, but the shop's rarity
+-- buttons know: Deselect All, press one, and the slots whose look changed
+-- are that rarity. Trusted only if exactly the button's own count changed
+-- ("Epic (3)" = 3 slots) - and nothing changes while nothing is pressed.
+-- Returns slot -> tier and the look of each slot unselected; or nil and
+-- why not. Leaves everything deselected.
+function Sell.LearnTiers(slots, rb, deselect)
+    if not deselect then return nil, "no Deselect All button" end
+    ClickButton(deselect)
+    S(0.4)
+    local base = {}
+    for _, s in ipairs(slots) do base[s] = Sell.SlotSig(s) end
+    S(0.3)
+    for _, s in ipairs(slots) do
+        if Sell.SlotSig(s) ~= base[s] then return nil, "the slots keep changing look by themselves" end
+    end
+    local tierOf = {}
+    for _, tier in ipairs({"Common", "Uncommon", "Rare", "Epic", "Legendary", "Ultimate"}) do
+        local e = rb[tier]
+        if e and e.n > 0 then
+            ClickButton(e.btn)
+            S(0.4)
+            local hit = {}
+            for _, s in ipairs(slots) do
+                if Sell.SlotSig(s) ~= base[s] then hit[#hit + 1] = s end
+            end
+            ClickButton(deselect)
+            S(0.4)
+            if #hit ~= e.n then
+                return nil, ("%s (%d) changed %d slot(s)"):format(tier, e.n, #hit)
+            end
+            for _, s in ipairs(hit) do
+                if tierOf[s] then return nil, "a slot answered to two rarities" end
+                tierOf[s] = tier
+            end
+        end
+    end
+    return tierOf, nil, base
+end
+
 -- Close the shop: its X / Close / Back button, if it has one.
 function Sell.Close(gui)
     for _, d in ipairs(gui and gui:GetDescendants() or {}) do
@@ -11724,23 +11820,79 @@ function Sell.Flow(force)
     -- every item of it, and "Deselect All". Its slots carry no names and
     -- no readable tier, so those buttons are the way: Deselect All, then
     -- each rarity switched on in SellRarities that has any.
-    local byButtons = false
+    local byButtons, sigBase, bySlots = false, nil, false
     if Sell.ByRarity() then
         local rb, deselect = Sell.RarityButtons()
         if next(rb) then
             byButtons = true
-            if deselect then
-                ClickButton(deselect)
-                S(0.3)
+            -- SPELLS (v13.47): gear goes by SellRarities, spells by
+            -- SellSpellRarities - and only with SellSpells on.
+            local itemR, spellR = CONFIG.SellRarities or {}, CONFIG.SellSpellRarities or {}
+            local function Want(tier, spell)
+                if spell then return CONFIG.SellSpells == true and spellR[tier] == true end
+                return itemR[tier] == true
             end
-            for _, tier in ipairs({"Common", "Uncommon", "Rare", "Epic", "Legendary", "Ultimate"}) do
-                local e = rb[tier]
-                if e and e.n > 0 and (CONFIG.SellRarities or {})[tier] then
-                    ClickButton(e.btn)
+            local spells = 0
+            for _, s in ipairs(slots) do
+                if Sell.IsSpell(s) then spells = spells + 1 end
+            end
+            -- A rarity button picks gear AND spells. Where the two lists
+            -- disagree on a rarity that is here (Epic spells yes, Epic gear
+            -- no), it has to go slot by slot - knowing each slot's rarity.
+            local split = false
+            if spells > 0 then
+                for tier, e in pairs(rb) do
+                    if e.n > 0 and Want(tier, true) ~= Want(tier, false) then split = true break end
+                end
+            end
+            local tierOf, why = nil, nil
+            if split then
+                tierOf, why, sigBase = Sell.LearnTiers(slots, rb, deselect)
+                if tierOf then
+                    print(("[DQR] Sell: %d spell(s) among %d slot(s) - read every slot's rarity off "
+                        .. "the shop's buttons; picking slot by slot."):format(spells, #slots))
+                else
+                    sigBase = nil
+                    print(("[DQR] Sell: could not tell which slot is which rarity (%s) - selling only "
+                        .. "the rarities that go for BOTH gear and spells."):format(tostring(why)))
+                end
+            end
+            if tierOf then
+                bySlots = true                   -- clicked one by one below
+                for _, s in ipairs(slots) do
+                    local tier, spell = tierOf[s], Sell.IsSpell(s)
+                    local cands = Candidates(s)
+                    local what = spell and "spell" or (cands[1] or "item")
+                    local prot = Sell.Protected(s, cands)
+                    local why2
+                    if not tier then
+                        why2 = "rarity unknown"
+                    elseif prot then
+                        why2 = prot
+                    elseif Want(tier, spell) then
+                        picked[#picked + 1] = {slot = s, name = tier .. " " .. what, count = 1}
+                    else
+                        why2 = ("%s %s (not selling)"):format(tier, spell and "spell" or "gear")
+                    end
+                    if why2 then kept[why2] = (kept[why2] or 0) + 1 end
+                end
+            else
+                if deselect then
+                    ClickButton(deselect)
                     S(0.3)
-                    picked[#picked + 1] = {name = ("%d %s"):format(e.n, tier), count = e.n}
-                elseif e and e.n > 0 then
-                    kept[tier .. " (not selling that rarity)"] = e.n
+                end
+                for _, tier in ipairs({"Common", "Uncommon", "Rare", "Epic", "Legendary", "Ultimate"}) do
+                    local e = rb[tier]
+                    -- No spells here: gear's list decides. Spells here: only
+                    -- a rarity that goes for both (the button takes both).
+                    local go = Want(tier, false) and (spells == 0 or Want(tier, true))
+                    if e and e.n > 0 and go then
+                        ClickButton(e.btn)
+                        S(0.3)
+                        picked[#picked + 1] = {name = ("%d %s"):format(e.n, tier), count = e.n}
+                    elseif e and e.n > 0 then
+                        kept[tier .. " (not selling that rarity)"] = e.n
+                    end
                 end
             end
         end
@@ -11783,7 +11935,28 @@ function Sell.Flow(force)
         total = total + (p.count or 1)
     end
     print(("[DQR] Sell: selected %d item(s): %s%s"):format(total, table.concat(list, ", "),
-        byButtons and " (with the shop's rarity buttons)" or ""))
+        bySlots and " (slot by slot)" or byButtons and " (with the shop's rarity buttons)" or ""))
+    -- Slot by slot (spells split from gear): check the selection is exactly
+    -- what was meant before anything is sold - a slot that did not take the
+    -- click, or one picked by mistake, stops the sale.
+    if bySlots and sigBase then
+        S(0.4)
+        local want, wrong = {}, 0
+        for _, p in ipairs(picked) do if p.slot then want[p.slot] = true end end
+        for _, s in ipairs(slots) do
+            local on = Sell.SlotSig(s) ~= sigBase[s]
+            if on ~= (want[s] == true) then wrong = wrong + 1 end
+        end
+        if wrong > 0 then
+            print(("[DQR] Sell: %d slot(s) are not selected the way they should be - NOT selling. "
+                .. "Run DQR_SellDump() with the shop open and send it."):format(wrong))
+            local _, deselect = Sell.RarityButtons()
+            if deselect then ClickButton(deselect) end
+            S(0.3)
+            Sell.Close(gui)
+            return
+        end
+    end
     if CONFIG.SellDryRun then
         print("[DQR] Sell: SellDryRun is on - NOT pressing Sell. Check the list above, then set "
             .. "SellDryRun = false.")
@@ -11877,7 +12050,8 @@ function Sell.Dump()
         local cands = Candidates(s)
         local r, how = Sell.SlotRarity(s)
         local label, why = Sell.Pick(s)
-        print(("%s | names: %s | rarity: %s | %s"):format(s:GetFullName(),
+        print(("%s%s | names: %s | rarity: %s | %s"):format(s:GetFullName(),
+            Sell.IsSpell(s) and " [SPELL]" or "",
             #cands > 0 and table.concat(cands, " / ") or "(none)",
             r and (r .. " (" .. how .. ")") or "unreadable",
             label and "WOULD SELL" or ("kept: " .. tostring(why))))
@@ -12742,7 +12916,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.46 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.47 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
