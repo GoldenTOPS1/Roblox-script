@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.43
+--  DQR AUTO FARM v13.44
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -2171,10 +2171,31 @@ local function ButtonsAtPoint(x, y)
     return out
 end
 
-local function ClickButton(btn)
+-- `how` (optional): {signals = true} skips the mouse and fires the button's
+-- own connections; {dy = n} clicks n pixels below the middle (Farm.ClickSure
+-- retries with these).
+local function ClickButton(btn, how)
     if Farm.dead then return false end               -- self-destructed: no clicks
-    if VisibleOnScreen(btn) then
+    how = how or {}
+    if VisibleOnScreen(btn) and not how.signals then
+        -- v13.44: wait for it to stop moving first. A panel that pops or
+        -- slides in was clicked mid-animation - a little above the "Return
+        -- to Lobby?" panel's YES, which then never left the dungeon.
+        local lx, ly, still = nil, nil, 0
+        for _ = 1, 20 do
+            local p, sz = btn.AbsolutePosition, btn.AbsoluteSize
+            local cx, cy = p.X + sz.X / 2, p.Y + sz.Y / 2
+            if lx and math.abs(cx - lx) < 1 and math.abs(cy - ly) < 1 then
+                still = still + 1
+                if still >= 2 then break end
+            else
+                still = 0
+            end
+            lx, ly = cx, cy
+            S(0.05)
+        end
         local x, y = ScreenPointOf(btn)
+        y = y + (how.dy or 0)
         local wasOpen = LogGui and LogGui.Enabled
         if wasOpen then LogGui.Enabled = false end
         local hit  = ButtonsAtPoint(x, y)[1]
@@ -12080,7 +12101,9 @@ function Farm.BonusWatcher()
                     print(("[DQR] Bonus boss vote: pressing %s%s."):format(
                         stay and "Fight!" or "Return",
                         (want == "fight" and Farm.parked) and (" (" .. Farm.parked .. " - not staying)") or ""))
-                    ClickButton(btn)
+                    -- A retry fires the button directly (the click may be
+                    -- landing off it - see Farm.ClickSure).
+                    ClickButton(btn, tries >= 2 and {signals = true} or nil)
                 elseif tries == 0 then
                     tries = 4
                     print(("[DQR] Bonus boss vote is up but no %s button was found - vote by hand.")
@@ -12161,6 +12184,37 @@ function Farm.LobbyYes()
 end
 
 -- Door -> YES -> wait for the real lobby. True when there.
+-- A click that has to land (v13.44). Clicked; if `stillThere()` (default:
+-- the button still on screen) after 1.5s, its connections are fired
+-- directly; then clicks a little below, at the inset, and a little above
+-- the middle - in case the screen position is off. True once it is gone.
+function Farm.ClickSure(btn, stillThere)
+    stillThere = stillThere or function()
+        return btn.Parent ~= nil and VisibleOnScreen(btn)
+    end
+    local function Took(secs)
+        local w = 0
+        repeat S(0.25) w = w + 0.25 until not stillThere() or w >= secs or Farm.dead
+        return not stillThere()
+    end
+    ClickButton(btn)
+    if Took(1.5) then return true end
+    print(("[DQR]   %s did not react to the click - firing it directly."):format(btn.Name))
+    ClickButton(btn, {signals = true})
+    if Took(1.5) then return true end
+    local h = btn.AbsoluteSize.Y
+    local inset = GuiService:GetGuiInset().Y
+    for _, dy in ipairs({math.floor(h * 0.35), inset, -math.floor(h * 0.35)}) do
+        if dy ~= 0 and not Farm.dead then
+            print(("[DQR]   still there - clicking %d px %s its middle."):format(math.abs(dy),
+                dy > 0 and "below" or "above"))
+            ClickButton(btn, {dy = dy})
+            if Took(1.5) then return true end
+        end
+    end
+    return false
+end
+
 function Farm.ReturnToLobby()
     if Farm.dead then return false end
     print("[DQR] Leaving for the lobby to sell (door button, then YES).")
@@ -12169,17 +12223,17 @@ function Farm.ReturnToLobby()
         local door = Farm.LobbyDoor()
         if door then
             print("[DQR]   door button: " .. door:GetFullName())
-            ClickButton(door)
-            local t = 0
-            repeat
-                S(0.25) t = t + 0.25
-                yes = Farm.LobbyYes()
-            until (yes and VisibleOnScreen(yes)) or t > 3 or Farm.dead
+            -- Made sure of too: it took once the panel's YES is up.
+            Farm.ClickSure(door, function()
+                local y = Farm.LobbyYes()
+                return not (y and VisibleOnScreen(y))
+            end)
+            yes = Farm.LobbyYes()
         else
             print("[DQR]   no door button found - trying the panel's YES directly.")
         end
     end
-    if not yes then
+    if not yes or not VisibleOnScreen(yes) then
         print("[DQR] Return to lobby: no 'Return to Lobby?' YES button found - the door button "
             .. "was not recognised. The buttons on screen now (send these lines):")
         -- Once per session: what is at the bottom right, so the door's path
@@ -12190,7 +12244,12 @@ function Farm.ReturnToLobby()
         end
         return false
     end
-    ClickButton(yes)
+    -- v13.44: made sure of - one click once landed just above YES and the
+    -- panel sat there. (The panel going away = it took.)
+    if not Farm.ClickSure(yes) then
+        print("[DQR] Return to lobby: YES would not take (mouse or signal) - giving up this time.")
+        return false
+    end
     local t = 0
     repeat S(1) t = t + 1 until Farm.RealLobby() or Farm.dead or t > 60
     if Farm.RealLobby() then
@@ -12556,7 +12615,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.43 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.44 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
