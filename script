@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.44
+--  DQR AUTO FARM v13.45
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -11367,6 +11367,9 @@ end
 
 -- Sell this slot? Returns the label to log (name, and rarity when that
 -- is why), or nil and the reason it is kept.
+-- Selling by rarity: SellByRarity, or a sell asked for with nothing set
+-- (Sell.fallback - see Sell.Flow).
+function Sell.ByRarity() return CONFIG.SellByRarity or Sell.fallback == true end
 function Sell.Pick(slot)
     local cands = Candidates(slot)
     local why = Sell.Protected(slot, cands)
@@ -11374,7 +11377,7 @@ function Sell.Pick(slot)
     for _, c in ipairs(cands) do
         if Sell.Match(c) then return c end
     end
-    if CONFIG.SellByRarity then
+    if Sell.ByRarity() then
         local r, how = Sell.SlotRarity(slot)
         if r and (CONFIG.SellRarities or {})[r] then
             return ("%s [%s by %s]"):format(cands[1] or "item", r, how)
@@ -11558,9 +11561,23 @@ function Sell.Close(gui)
 end
 
 function Sell.Flow(force)
+    Sell.fallback = nil
     if #(CONFIG.SellNames or {}) == 0 and not CONFIG.SellByRarity then
-        print("[DQR] Sell: SellNames is empty and SellByRarity is off - nothing to look for.")
-        return
+        if not force then
+            print("[DQR] Sell: SellNames is empty and SellByRarity is off - nothing to look for.")
+            return
+        end
+        -- v13.45: a sell was ASKED for (!sellnow, SellAfterRuns) with nothing
+        -- set to sell - it used to give up on the spot and the bot queued
+        -- the next run as if nothing had happened. By rarity, then
+        -- (SellRarities - Common and Uncommon unless changed).
+        Sell.fallback = true
+        local on = {}
+        for _, tier in ipairs({"Common", "Uncommon", "Rare", "Epic", "Legendary", "Ultimate"}) do
+            if (CONFIG.SellRarities or {})[tier] then on[#on + 1] = tier end
+        end
+        print(("[DQR] Sell: SellByRarity is off and SellNames is empty - selling by rarity "
+            .. "anyway (%s), since a sell was asked for."):format(#on > 0 and table.concat(on, ", ") or "none on"))
     end
     -- The title splash first: the lobby is behind it.
     local intro = PathVisible(UI.IntroPlay)
@@ -11571,7 +11588,7 @@ function Sell.Flow(force)
     end
     -- Nothing to sell? Say so and save the walk. (By name only: a rarity
     -- can only be read off the shop screen.)
-    local have = not CONFIG.SellByRarity and Sell.InventoryNames()
+    local have = not Sell.ByRarity() and Sell.InventoryNames()
     if have then
         local want = {}
         for _, n in ipairs(have) do if Sell.Match(n) then want[#want + 1] = n end end
@@ -11608,7 +11625,7 @@ function Sell.Flow(force)
     -- no readable tier, so those buttons are the way: Deselect All, then
     -- each rarity switched on in SellRarities that has any.
     local byButtons = false
-    if CONFIG.SellByRarity then
+    if Sell.ByRarity() then
         local rb, deselect = Sell.RarityButtons()
         if next(rb) then
             byButtons = true
@@ -11645,7 +11662,7 @@ function Sell.Flow(force)
     for why, n in pairs(kept) do keptTxt[#keptTxt + 1] = ("%d %s"):format(n, why) end
     if #keptTxt > 0 then print("[DQR] Sell: kept " .. table.concat(keptTxt, ", ") .. ".") end
     if #picked == 0 then
-        if #slots > 0 and named == 0 and not CONFIG.SellByRarity then
+        if #slots > 0 and named == 0 and not Sell.ByRarity() then
             print(("[DQR] Sell: %d item slot(s) on the shop screen, but none carries a name I "
                 .. "can read. Run DQR_SellDump() with the shop open and send the output."):format(#slots))
         else
@@ -12270,12 +12287,10 @@ end
 function Farm.SellNow(say)
     say = say or print
     local note = ""
-    if #(CONFIG.SellNames or {}) == 0 and not CONFIG.SellByRarity then
-        note = " Note: SellByRarity is off and SellNames is empty - nothing is set to be sold."
-    elseif CONFIG.SellDryRun then
+    if CONFIG.SellDryRun then
         note = " Note: SellDryRun is on - it opens the shop and picks, but does NOT press Sell."
     end
-    if Farm.RealLobby() then
+    if Farm.lobbyServer or Farm.RealLobby() then
         if lobbyFlowActive or Farm.selling then
             Farm.sellNow = true
             pcall(Farm.SaveRuns)
@@ -12563,7 +12578,19 @@ local function Supervisor()
             -- button, YES), and sell on the next pass, in the lobby. If
             -- leaving fails it replays without selling and tries next run.
             local sellDue = Farm.SellDue()
-            if (sellDue or CONFIG.AutoSell) and not Farm.RealLobby() and not Sell.leaveFailed then
+            -- v13.45: which side are we on? The dungeon's end shows its
+            -- Replay button; any other lobby screen is the real lobby. This
+            -- used to ask Farm.RealLobby() alone - which misses the lobby
+            -- while its screens are still coming up - and then "left" for
+            -- the lobby from the lobby, failed, and queued a run unsold.
+            local atLobby = Farm.lobbyServer or Farm.RealLobby() or not PathVisible(UI.Replay)
+            if sellDue and atLobby and not Farm.RealLobby() then
+                -- The lobby's own screens are not up yet: give them a moment
+                -- (the title splash is clicked through by the sell itself).
+                local w = 0
+                repeat S(1) w = w + 1 until Farm.RealLobby() or w >= 10 or Farm.dead
+            end
+            if (sellDue or CONFIG.AutoSell) and not atLobby and not Sell.leaveFailed then
                 if Farm.ReturnToLobby() then
                     Farm.leaveFailed = nil
                     continue
@@ -12572,14 +12599,14 @@ local function Supervisor()
                 Farm.leaveFailed = true               -- shown in the status post
                 Farm.statusNow = true
                 print("[DQR] Could not get to the lobby - replaying without selling.")
-            elseif sellDue and Farm.RealLobby() then
+            elseif sellDue and atLobby then
                 print(Farm.sellNow and "[DQR] Selling now (!sellnow) before the next run."
                     or ("[DQR] %d run(s) since the last sell - selling before the next run.")
                     :format(Farm.runsDone - Farm.soldAtRun))
                 Farm.soldAtRun, Farm.sellNow = Farm.runsDone, nil
                 pcall(Farm.SaveRuns)                  -- the next server knows it sold
                 Sell.Run(true)
-            elseif CONFIG.AutoSell and Farm.RealLobby() then
+            elseif CONFIG.AutoSell and atLobby then
                 Sell.Run()
             end
             local replay = PathVisible(UI.Replay)
@@ -12615,7 +12642,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.44 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.45 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
