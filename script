@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.45
+--  DQR AUTO FARM v13.46
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -92,7 +92,7 @@ local CONFIG = {
     SellRarities   = {
         Common    = true,
         Uncommon  = true,
-        Rare      = true,
+        Rare      = false,
         Epic      = false,
         Legendary = false,
         Ultimate  = false,
@@ -10145,26 +10145,121 @@ function Hud.ItemInfo(id, slot)
     return info
 end
 
--- "12/300": a slots counter somewhere under an inventory / bag GUI.
+-- BAG: "used/capacity" (the loot card and, v13.46, the status embed).
+-- A short "12/300" or "Slots: 12 / 300" (capacity 20+) on a label under
+-- an inventory / bag GUI, or named like a capacity counter. Found once
+-- and kept - re-found only if it goes. Else a capacity number kept on the
+-- player (attribute or value object), with the used count beside it.
+Hud.BAG_WORDS = {"inventor", "bag", "backpack", "storage", "capacity", "slots", "space"}
+function Hud.BagNamed(o, pg)
+    local n, depth = o, 0
+    while n and n ~= pg and depth < 9 do
+        local l = n.Name:lower()
+        for _, w in ipairs(Hud.BAG_WORDS) do
+            if l:find(w, 1, true) then return true end
+        end
+        n, depth = n.Parent, depth + 1
+    end
+    return false
+end
+function Hud.BagRead(text)
+    if type(text) ~= "string" or #text > 40 then return nil end
+    local a, b = text:match("(%d[%d,]*)%s*/%s*(%d[%d,]*)")
+    a, b = tonumber(((a or ""):gsub(",", ""))), tonumber(((b or ""):gsub(",", "")))
+    if a and b and b >= 20 and a <= b * 2 then return a, b end
+    return nil
+end
 function Hud.BagText()
     local pg = LP:FindFirstChildOfClass("PlayerGui")
+    if not pg then return nil end
+    local l = Hud.bagLabel
+    if not (l and l.Parent and l:IsDescendantOf(pg) and Hud.BagRead(l.Text)) then
+        l, Hud.bagLabel = nil, nil
+        -- Every candidate, then the likeliest: one that names itself a
+        -- counter ("slots", "capacity"...) beats one that only sits in the
+        -- inventory, and a label repeated on every item (an upgrade "15/50")
+        -- is not the bag's.
+        local cands, seen = {}, {}
+        for _, o in ipairs(pg:GetDescendants()) do
+            if (o:IsA("TextLabel") or o:IsA("TextButton"))
+            and not (LogGui and o:IsDescendantOf(LogGui))
+            and Hud.BagRead(o.Text) and Hud.BagNamed(o, pg) then
+                cands[#cands + 1] = o
+                seen[o.Name] = (seen[o.Name] or 0) + 1
+            end
+        end
+        local best = -math.huge
+        for _, o in ipairs(cands) do
+            local own = (o.Name .. " " .. o.Text):lower()
+            local s = 0
+            for _, w in ipairs(Hud.BAG_WORDS) do
+                if own:find(w, 1, true) then s = s + 2 break end
+            end
+            if seen[o.Name] >= 3 then s = s - 3 end
+            if s > best then best, l = s, o end
+        end
+        if best < 0 then l = nil end                -- only per-item counters
+        Hud.bagLabel = l
+    end
+    local a, b
+    if l then
+        a, b = Hud.BagRead(l.Text)
+    else
+        -- A capacity number on the player (attribute / value object).
+        local function Pick(name, v)
+            local n = tostring(name):lower()
+            v = tonumber(v)
+            if not v then return end
+            if not b and (n:find("max", 1, true) or n:find("capacity", 1, true) or n:find("size", 1, true)
+                          or n:find("slots", 1, true))
+            and (n:find("inv", 1, true) or n:find("bag", 1, true) or n:find("item", 1, true)
+                 or n:find("storage", 1, true) or n:find("capacity", 1, true)) then
+                b = v
+            elseif not a and (n:find("inv", 1, true) or n:find("bag", 1, true))
+            and (n:find("count", 1, true) or n:find("used", 1, true) or n:find("amount", 1, true)) then
+                a = v
+            end
+        end
+        pcall(function()
+            for k, v in pairs(LP:GetAttributes()) do Pick(k, v) end
+            for _, d in ipairs(LP:GetDescendants()) do
+                if d:IsA("IntValue") or d:IsA("NumberValue") then Pick(d.Name, d.Value) end
+            end
+        end)
+        if not b or b < 1 then return nil end
+    end
+    if not b then return nil end
+    if not a then return ("? / %d"):format(b) end
+    local pct = a / b * 100
+    return ("%d / %d  (%d%%)%s"):format(a, b, math.floor(pct),
+        a >= b and " - FULL" or pct >= 90 and " - nearly full" or "")
+end
+-- DQR_BagDump(): every short "x/y" on screen and every capacity-like
+-- number on the player - for when the Bag field does not show.
+function Hud.BagDump()
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    print("[DQR] === BAG DUMP (open your inventory first) ===")
+    print("[DQR] Bag now: " .. tostring(Hud.BagText()))
     for _, o in ipairs(pg and pg:GetDescendants() or {}) do
-        if o:IsA("TextLabel") then
-            local a, b = o.Text:match("^%s*(%d+)%s*/%s*(%d+)%s*$")
-            if a and tonumber(b) >= 20 then
-                local n, depth = o.Parent, 0
-                while n and n ~= pg and depth < 8 do
-                    local l = n.Name:lower()
-                    if l:find("inventor", 1, true) or l:find("bag", 1, true)
-                    or l:find("backpack", 1, true) or l:find("storage", 1, true) then
-                        return ("%s/%s"):format(a, b)
-                    end
-                    n, depth = n.Parent, depth + 1
+        if (o:IsA("TextLabel") or o:IsA("TextButton")) and not (LogGui and o:IsDescendantOf(LogGui))
+        and #o.Text <= 40 and o.Text:match("%d%s*/%s*%d") then
+            print(("  %s | '%s' | visible=%s"):format(o:GetFullName(), o.Text,
+                tostring(VisibleOnScreen(o))))
+        end
+    end
+    pcall(function()
+        for k, v in pairs(LP:GetAttributes()) do print(("  attribute %s = %s"):format(k, tostring(v))) end
+        for _, d in ipairs(LP:GetDescendants()) do
+            if d:IsA("ValueBase") and not d:IsA("ObjectValue") then
+                local n = d.Name:lower()
+                if n:find("inv", 1, true) or n:find("bag", 1, true) or n:find("slot", 1, true)
+                or n:find("capac", 1, true) or n:find("storage", 1, true) or n:find("item", 1, true) then
+                    print(("  value %s = %s"):format(d:GetFullName(), tostring(d.Value)))
                 end
             end
         end
-    end
-    return nil
+    end)
+    print("[DQR] === END BAG DUMP ===")
 end
 
 -- Post the run. One card, laid out like:
@@ -10786,6 +10881,9 @@ function Farm.StatusWatcher()
                 end
                 F("Gold",  Hud.Num(Hud.Real("gold")))
                 F("Gems",  Hud.Num(Hud.Real("gem") or Hud.Real("diamond")))
+                -- Bag: used / capacity (v13.46) - left out until it is found.
+                local okBag, bag = pcall(Hud.BagText)
+                F("Bag", okBag and bag or nil)
                 -- Runs finished since the script started, and when the next
                 -- every-N-runs sell is due.
                 local runs = ("%d"):format(Farm.runsDone or 0)
@@ -11048,6 +11146,8 @@ function Hud.StatusText()
     end
     local g = Hud.Real("gold")
     if g then lines[#lines + 1] = "**Gold:** " .. (tonumber(g) and Hud.Short(tonumber(g)) or g) end
+    local okBag, bag = pcall(Hud.BagText)
+    if okBag and bag then lines[#lines + 1] = "**Bag:** " .. bag end
     return table.concat(lines, "\n")
 end
 
@@ -12642,7 +12742,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.45 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.46 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -13007,6 +13107,9 @@ getgenv().DQR_Sell       = function() task.spawn(Sell.Run, true) end
 -- DQR_SellNow() / "sellnow": to the lobby now (mid-run too), sell, then
 -- carry on farming - the same as !sellnow in Discord.
 getgenv().DQR_SellNow    = function() print("[DQR] " .. Farm.SellNow()) end
+-- DQR_BagDump() / "bagdump": what the Bag field could be read from (open
+-- your inventory first) - send it if Bag does not show on the status.
+getgenv().DQR_BagDump    = function() Hud.BagDump() end
 getgenv().DQR_BossBar    = function() return Mobs.BossBar() end
 getgenv().DQR_Profile    = function() Prof.Apply() return Prof.name end
 -- DQR_Map("off") puts the map back; DQR_Map("flat") / ("hide") applies it.
