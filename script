@@ -125,7 +125,7 @@ local CONFIG = {
     -- DQR_LobbyDump() at the end of a run prints the buttons there - put
     -- the door's path in LobbyButtonPath. DQR_ToLobby() tries it by hand.
     SellAfterRuns  = true,
-    SellEveryRuns  = 30,
+    SellEveryRuns  = 50,
     -- The run count (status webhook, SellEveryRuns) is saved to a file,
     -- so it carries on across servers - every Replay is a new one. It
     -- starts again from 0 after this many hours with no run (0 = never).
