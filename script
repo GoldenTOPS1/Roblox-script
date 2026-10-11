@@ -92,8 +92,8 @@ local CONFIG = {
     SellRarities   = {
         Common    = true,
         Uncommon  = true,
-        Rare      = false,
-        Epic      = false,
+        Rare      = true,
+        Epic      = true,
         Legendary = false,
         Ultimate  = false,
     },
@@ -131,7 +131,7 @@ local CONFIG = {
     -- SellDryRun = true: walks there, opens the shop and clicks the items,
     -- but does NOT press Sell - the log lists what it would have sold.
     -- Run it like that once and check the list before switching it off.
-    SellDryRun     = true,
+    SellDryRun     = false,
     -- Where the sell area is, if it is not found by itself (the log will
     -- say): a Vector3, e.g. Vector3.new(120, 5, -40). nil = find it.
     -- (The lobby's sell area, read with selldump on 2026-10-08: the shop
