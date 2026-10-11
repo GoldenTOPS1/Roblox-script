@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.49
+--  DQR AUTO FARM v13.50
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -10875,7 +10875,11 @@ function Farm.StatusWatcher()
                 elseif Farm.breakUntil and os.time() < Farm.breakUntil then
                     doing = ("On a break - back in %s"):format(Hud.Clock(Farm.breakUntil - os.time()))
                 elseif dead then               doing = "Dead - waiting to respawn"
-                elseif Farm.leaving then       doing = "Leaving for the lobby to sell (!sellnow)"
+                elseif Farm.leaving then
+                    doing = Farm.leaving == "sell" and "Leaving for the lobby to sell"
+                        or Farm.leaving == "break" and "Leaving for the lobby - break time"
+                        or type(Farm.leaving) == "string" and ("Leaving for the lobby - " .. Farm.leaving)
+                        or "Leaving for the lobby to sell (!sellnow)"
                 elseif Farm.selling then       doing = "Selling (!sellnow)"
                 elseif InLobby() then          doing = "In the lobby"
                 elseif lobbyFlowActive then    doing = "Queueing a dungeon"
@@ -12582,6 +12586,83 @@ function Farm.ReturnToLobby()
     return false
 end
 
+-- LEAVING WHEN DUE, FROM THE DUNGEON (v13.50). Selling (SellAfterRuns,
+-- AutoSell), a break and a rare-drop park were only ever started from the
+-- end-of-run Replay screen - but the game replays by itself ("Auto replay
+-- in 3 seconds"), so that screen never stayed up long enough: the status
+-- said "sell in 0" and the runs went on. Now, when one is due, the bot
+-- leaves for the lobby (door, YES) from the dungeon at one of two safe
+-- moments: the "Auto replay" countdown is up (the run is over), or - if
+-- that was missed - the next run has not met its first mob yet (START is
+-- held meanwhile). Never in the middle of a run. The lobby side then does
+-- the rest (the Supervisor: sell / break / park).
+-- What is due, or nil: "sell", "break", a park's reason - or "stop" for
+-- RareDropStop without RareDropLobby (stopped where it is).
+function Farm.LeaveWhy()
+    if Farm.parked then
+        if CONFIG.RareDropLobby and not Farm.parkLeaveTried then return Farm.parked end
+        if CONFIG.RareDropStop then return "stop" end
+    end
+    if CONFIG.TakeBreaks and ((Farm.breakUntil and os.time() < Farm.breakUntil) or Farm.BreakDue()) then
+        return "break"
+    end
+    -- AutoSell: a run finished since the last sell (or it would leave at
+    -- the start of every run, straight after selling).
+    local auto = CONFIG.AutoSell and (Farm.runsDone or 0) > (Farm.soldAtRun or 0)
+    if (Farm.SellDue() or auto) and not Sell.leaveFailed then return "sell" end
+    return nil
+end
+-- The game's "Auto replay in N seconds" countdown on screen.
+function Farm.AutoReplayUp()
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    for _, o in ipairs(pg and pg:GetDescendants() or {}) do
+        if (o:IsA("TextLabel") or o:IsA("TextButton")) and Norm(o.Text):find("autoreplay", 1, true)
+        and not (LogGui and o:IsDescendantOf(LogGui)) and VisibleOnScreen(o) then
+            return true
+        end
+    end
+    return false
+end
+function Farm.LeaveNow(why)
+    if Farm.leaving or Farm.dead then return end
+    Farm.leaving = tostring(why)                  -- what for (the status says)
+    if Farm.Running then Farm.Stop() end
+    print(("[DQR] %s due - leaving for the lobby from the dungeon (the game replays by itself)."):format(
+        why == "sell" and "Sell" or why == "break" and "Break" or tostring(why)))
+    local ok, went = pcall(Farm.ReturnToLobby)
+    Farm.leaving = nil
+    if not (ok and went) and not Farm.dead then
+        Farm.leaveTriedHere = true                -- not again on this server
+        Farm.leaveFailed, Farm.statusNow = true, true
+        print("[DQR] Could not leave for the lobby - carrying on here; trying again next run.")
+    end
+end
+function Farm.LeaveWatcher()
+    while not Farm.dead do
+        S(1)
+        if Farm.paused or Farm.leaving or Farm.selling or Farm.leaveTriedHere or Farm.lobbyServer
+        or lobbyFlowActive then
+            continue
+        end
+        local why = Farm.LeaveWhy()
+        if not why or Farm.RealLobby() then continue end   -- lobby side: the Supervisor
+        -- Certainly a dungeon: its START was seen on this server, or it is
+        -- known by its server, or mobs are about.
+        local dungeon = DungeonStartButton() ~= nil or Farm.startSeenAt ~= nil
+            or Farm.dungeonServer or IsInDungeon()
+        if not dungeon then continue end
+        local fresh = Farm.runOpen and not Brain.mobSeen
+        local over = not Farm.runOpen and Farm.AutoReplayUp()
+        if fresh or over then
+            if why == "stop" then
+                pcall(Farm.HandleParked)              -- RareDropStop: stops here
+            else
+                Farm.LeaveNow(why)
+            end
+        end
+    end
+end
+
 -- SELL NOW (v13.43: !sellnow in Discord, "sellnow" in the command box).
 -- To the lobby now - mid-run too - sell, then carry on farming. The
 -- lobby is another server where the script starts afresh, so the order
@@ -12807,6 +12888,14 @@ local function StartWatcher()
         -- Never the lobby party screen's start: see DungeonStartButton.
         -- Not while paused either.
         local b = not Farm.paused and DungeonStartButton()
+        -- v13.50: a sell / break / park is due - hold START while the bot
+        -- leaves for the lobby (Farm.LeaveWatcher). At most 20s, unless it
+        -- is already on its way out.
+        if b and (Farm.leaving or (not Farm.leaveTriedHere and Farm.LeaveWhy()
+                  and tick() - (Farm.holdStartSince or tick()) < 20)) then
+            Farm.holdStartSince = Farm.holdStartSince or tick()
+            b = nil
+        end
         if b then
             print("[DQR] In-dungeon START visible - clicking.")
             ClickButton(b)
@@ -12912,6 +13001,10 @@ local function Supervisor()
                 pcall(Farm.SaveRuns)                  -- the next server knows it sold
                 Sell.Run(true)
             elseif CONFIG.AutoSell and atLobby then
+                -- Sold up to here (Farm.LeaveWhy: no leaving again until
+                -- another run has finished).
+                Farm.soldAtRun = Farm.runsDone
+                pcall(Farm.SaveRuns)
                 Sell.Run()
             end
             local replay = PathVisible(UI.Replay)
@@ -12947,7 +13040,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.49 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.50 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
@@ -12980,6 +13073,7 @@ task.spawn(function()
     task.spawn(LootWatcher)
     task.spawn(Farm.FailWatcher)
     task.spawn(Farm.BonusWatcher)                     -- "Stay and fight the bonus boss?"
+    task.spawn(Farm.LeaveWatcher)                     -- sell / break / park due: out to the lobby
     task.spawn(Hud.CommandWatcher)                    -- Discord commands (if set up)
 
     -- PlayerGui is still filling in right after injection: sample for
