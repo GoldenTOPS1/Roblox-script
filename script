@@ -1,5 +1,5 @@
 -- ============================================================
---  DQR AUTO FARM v13.50
+--  DQR AUTO FARM v13.51
 --  Change version number every time you update the script.
 --  v13: Q held up as an always-on buff (BuffQ), E cast only with a
 --  mob in range; green cast-range circle on the floor; smart A*
@@ -154,6 +154,13 @@ local CONFIG = {
     -- (The lobby's sell area, read with selldump on 2026-10-08: the shop
     -- opens when you walk in - there is no prompt to find it by.)
     SellSpot       = Vector3.new(-77, 4, 1010),
+    -- Walking to the shop in the lobby (other players about): true = turn
+    -- like a player - the way it walks swings round LobbyTurnRate degrees
+    -- a second and the body turns itself to it - instead of the instant
+    -- snap turns it makes in a run. false = snap turns there too.
+    LobbySmoothTurn = true,
+    LobbyTurnRate   = 300,
+
 
     -- ---- DISCORD -----------------------------------------------
     -- Loot: each finished run posts its drops here. "" = off.
@@ -7701,7 +7708,10 @@ local function Heartbeat(dt)
         ShowDest(nil, nil)
         return
     end
-    if human.AutoRotate then human.AutoRotate = false end
+    -- Smooth lobby walking (Nav.smooth, see below): the body turns itself,
+    -- like a player's. Otherwise we set its facing ourselves.
+    local wantAuto = Nav.smooth == true
+    if human.AutoRotate ~= wantAuto then human.AutoRotate = wantAuto end
     -- A minimum, never a cap: forcing 19 every frame slowed down a
     -- character the game (gear, buffs) had made faster.
     if CONFIG.SetWalkSpeed and human.WalkSpeed < CONFIG.WalkSpeed then
@@ -7776,6 +7786,29 @@ local function Heartbeat(dt)
     if step then
         local d = Vector3.new(step.X - pos.X, 0, step.Z - pos.Z)
         if d.Magnitude > 1 then dir = d.Unit end
+    end
+    -- LOBBY TURNS (v13.51, CONFIG.LobbySmoothTurn): walking to the shop,
+    -- the way we walk swings round at LobbyTurnRate degrees a second
+    -- instead of snapping to each new heading - starting from the way the
+    -- body faces - and the body turns to it by itself (AutoRotate above),
+    -- the way a player's does. Turning right round is done faster, so it
+    -- does not circle a waypoint.
+    if Nav.smooth and dir then
+        local cur = Nav.smoothDir
+        if not cur then
+            local lv = root.CFrame.LookVector
+            cur = Vector3.new(lv.X, 0, lv.Z)
+            cur = cur.Magnitude > 0.1 and cur.Unit or dir
+        end
+        local a0, a1 = math.atan2(cur.Z, cur.X), math.atan2(dir.Z, dir.X)
+        local da = (a1 - a0 + math.pi) % (2 * math.pi) - math.pi
+        local maxTurn = math.rad(CONFIG.LobbyTurnRate or 300) * dt
+        if math.abs(da) > math.rad(100) then maxTurn = maxTurn * 3 end
+        local a = a0 + math.clamp(da, -maxTurn, maxTurn)
+        dir = Vector3.new(math.cos(a), 0, math.sin(a))
+        Nav.smoothDir = dir
+    elseif not dir then
+        Nav.smoothDir = nil
     end
     if dir then
         if cmdSince == 0 then cmdSince = now end
@@ -7864,7 +7897,8 @@ local function Heartbeat(dt)
         if d.Magnitude > 0.5 then look = d.Unit end
     end
     if not look and dir then look = dir end
-    if look then root.CFrame = CFrame.lookAt(pos, pos + look) end
+    -- (Smooth lobby walking: the body turns itself - no snapping it round.)
+    if look and not Nav.smooth then root.CFrame = CFrame.lookAt(pos, pos + look) end
 
     local cam = workspace.CurrentCamera
     if cam then
@@ -7886,6 +7920,7 @@ function Nav.Start()
     if conn then conn:Disconnect() end
     ClearPath()
     Nav.goal, Nav.face, Nav.force = nil, nil, false
+    Nav.smooth, Nav.smoothDir = nil, nil             -- farming: snap turns (Sell.WalkTo sets it)
     Nav.steer, Nav.unstick, Nav.unstickUntil = nil, nil, 0
     stuckAt, stuckCount, wpStuck, clearStreak = nil, 0, 0, 0
     mode, cmdSince, diagCount = "humanoid", 0, 0
@@ -7930,6 +7965,7 @@ function Nav.Stop()
     pcall(Nav.DrawPath, false)
     if Haz.HideTags then pcall(Haz.HideTags) end
     Nav.goal, Nav.face = nil, nil
+    Nav.smooth, Nav.smoothDir = nil, nil
     local h = GetHuman()
     if h then pcall(function() h:Move(Vector3.zero, false) h.AutoRotate = true end) end
     if h then pcall(function() h:SetStateEnabled(Enum.HumanoidStateType.Jumping, true) end) end
@@ -11609,6 +11645,8 @@ end
 -- Walk there with the farm's own mover. True when we got within 6 studs.
 function Sell.WalkTo(pos)
     Nav.Start()
+    -- Lobby walking looks like a player's (CONFIG.LobbySmoothTurn).
+    Nav.smooth = CONFIG.LobbySmoothTurn == true or nil
     Nav.goal = pos
     local t0, reached = tick(), false
     while tick() - t0 < 40 do
@@ -13040,7 +13078,7 @@ end
 --  BOOT
 -- ============================================================
 task.spawn(function()
-    print("[DQR] v13.50 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
+    print("[DQR] v13.51 loaded.  F5 farm  F6 gui dump  F7 log  F8 mob diag  F9 hazard diag  F10 loot panel")
     print("[DQR] DQR_Copy() copies the whole log to the clipboard.")
     -- The status feed first: it is how you check on the bot, so it has
     -- to be running even if the queue stalls.
